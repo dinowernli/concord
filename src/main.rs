@@ -1,6 +1,9 @@
 mod raft;
 mod raft_grpc;
 
+use log::info;
+
+use env_logger::Env;
 use futures::executor;
 use std::thread;
 
@@ -27,7 +30,7 @@ impl Raft for RaftImpl {
         _request: ServerRequestSingle<VoteRequest>,
         response: ServerResponseUnarySink<VoteResponse>,
     ) -> grpc::Result<()> {
-        println!("Vote request not implemented");
+        info!("Processed vote rpc");
         response.finish(VoteResponse::new())
     }
 
@@ -37,12 +40,14 @@ impl Raft for RaftImpl {
         _request: ServerRequestSingle<AppendRequest>,
         response: ServerResponseUnarySink<AppendResponse>,
     ) -> grpc::Result<()> {
-        println!("Append request not implemented");
+        info!("Processed append rpc");
         response.finish(AppendResponse::new())
     }
 }
 
 fn main() {
+    env_logger::from_env(Env::default().default_filter_or("concord=info")).init();
+
     let port = 12345;
     let mut server_builder = grpc::ServerBuilder::new_plain();
     server_builder.add_service(RaftServer::new_service_def(RaftImpl));
@@ -50,15 +55,15 @@ fn main() {
 
     // Give this a name so it doesn't get immediately destroyed.
     let _server = server_builder.build().expect("server");
-    println!("Started server on port {}", port);
+    info!("Started server on port {}", port);
 
     let client_conf = Default::default();
     let client = RaftClient::new_plain("::1", port, client_conf).unwrap();
     let response = client
         .append(grpc::RequestOptions::new(), AppendRequest::new())
         .join_metadata_result();
-    println!("Made rpc to server");
-    println!("{:?}", executor::block_on(response));
+    info!("Made rpc to server");
+    info!("{:?}", executor::block_on(response));
 
     loop {
         thread::park();
