@@ -8,6 +8,7 @@ edition = "2018"
 grpc = "0.8"
 protobuf = "2.15.0"
 grpc-protobuf = "0.8"
+futures = "0.3.5"
 
 [build-dependencies]
 protoc-rust-grpc = "0.8"
