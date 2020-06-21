@@ -509,10 +509,10 @@ impl ::protobuf::reflect::ProtobufValue for AppendResponse {
 
 static file_descriptor_proto_data: &'static [u8] = b"\
     \n\x0esrc/raft.proto\x12\x04raft\"\r\n\x0bVoteRequest\"\x0e\n\x0cVoteRes\
-    ponse\"\x0f\n\rAppendRequest\"\x10\n\x0eAppendResponse2t\n\nRaftServer\
-    \x12/\n\x04Vote\x12\x11.raft.VoteRequest\x1a\x12.raft.VoteResponse\"\0\
-    \x125\n\x06Append\x12\x13.raft.AppendRequest\x1a\x14.raft.AppendResponse\
-    \"\0b\x06proto3\
+    ponse\"\x0f\n\rAppendRequest\"\x10\n\x0eAppendResponse2n\n\x04Raft\x12/\
+    \n\x04Vote\x12\x11.raft.VoteRequest\x1a\x12.raft.VoteResponse\"\0\x125\n\
+    \x06Append\x12\x13.raft.AppendRequest\x1a\x14.raft.AppendResponse\"\0b\
+    \x06proto3\
 ";
 
 static mut file_descriptor_proto_lazy: ::protobuf::lazy::Lazy<::protobuf::descriptor::FileDescriptorProto> = ::protobuf::lazy::Lazy::INIT;

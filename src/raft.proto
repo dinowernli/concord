@@ -14,7 +14,7 @@ message AppendRequest {
 message AppendResponse {
 }
 
-service RaftServer {
+service Raft {
   rpc Vote (VoteRequest) returns (VoteResponse) {}
   rpc Append (AppendRequest) returns (AppendResponse) {}
 }
