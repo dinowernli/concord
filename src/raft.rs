@@ -1104,6 +1104,7 @@ pub struct AppendRequest {
     pub leader: ::protobuf::SingularPtrField<Server>,
     pub previous: ::protobuf::SingularPtrField<EntryId>,
     pub entries: ::protobuf::RepeatedField<Entry>,
+    pub committed: i64,
     // special fields
     pub unknown_fields: ::protobuf::UnknownFields,
     pub cached_size: ::protobuf::CachedSize,
@@ -1225,6 +1226,21 @@ impl AppendRequest {
     pub fn take_entries(&mut self) -> ::protobuf::RepeatedField<Entry> {
         ::std::mem::replace(&mut self.entries, ::protobuf::RepeatedField::new())
     }
+
+    // int64 committed = 5;
+
+
+    pub fn get_committed(&self) -> i64 {
+        self.committed
+    }
+    pub fn clear_committed(&mut self) {
+        self.committed = 0;
+    }
+
+    // Param is passed by value, moved
+    pub fn set_committed(&mut self, v: i64) {
+        self.committed = v;
+    }
 }
 
 impl ::protobuf::Message for AppendRequest {
@@ -1267,6 +1283,13 @@ impl ::protobuf::Message for AppendRequest {
                 4 => {
                     ::protobuf::rt::read_repeated_message_into(wire_type, is, &mut self.entries)?;
                 },
+                5 => {
+                    if wire_type != ::protobuf::wire_format::WireTypeVarint {
+                        return ::std::result::Result::Err(::protobuf::rt::unexpected_wire_type(wire_type));
+                    }
+                    let tmp = is.read_int64()?;
+                    self.committed = tmp;
+                },
                 _ => {
                     ::protobuf::rt::read_unknown_or_skip_group(field_number, wire_type, is, self.mut_unknown_fields())?;
                 },
@@ -1294,6 +1317,9 @@ impl ::protobuf::Message for AppendRequest {
             let len = value.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint32_size(len) + len;
         };
+        if self.committed != 0 {
+            my_size += ::protobuf::rt::value_size(5, self.committed, ::protobuf::wire_format::WireTypeVarint);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.get_unknown_fields());
         self.cached_size.set(my_size);
         my_size
@@ -1318,6 +1344,9 @@ impl ::protobuf::Message for AppendRequest {
             os.write_raw_varint32(v.get_cached_size())?;
             v.write_to_with_cached_sizes(os)?;
         };
+        if self.committed != 0 {
+            os.write_int64(5, self.committed)?;
+        }
         os.write_unknown_fields(self.get_unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -1377,6 +1406,11 @@ impl ::protobuf::Message for AppendRequest {
                     |m: &AppendRequest| { &m.entries },
                     |m: &mut AppendRequest| { &mut m.entries },
                 ));
+                fields.push(::protobuf::reflect::accessor::make_simple_field_accessor::<_, ::protobuf::types::ProtobufTypeInt64>(
+                    "committed",
+                    |m: &AppendRequest| { &m.committed },
+                    |m: &mut AppendRequest| { &mut m.committed },
+                ));
                 ::protobuf::reflect::MessageDescriptor::new_pb_name::<AppendRequest>(
                     "AppendRequest",
                     fields,
@@ -1400,6 +1434,7 @@ impl ::protobuf::Clear for AppendRequest {
         self.leader.clear();
         self.previous.clear();
         self.entries.clear();
+        self.committed = 0;
         self.unknown_fields.clear();
     }
 }
@@ -1617,15 +1652,16 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x01\x20\x01(\x03R\x04term\x12*\n\tcandidate\x18\x02\x20\x01(\x0b2\x0c.r\
     aft.ServerR\tcandidate\x12!\n\x04last\x18\x03\x20\x01(\x0b2\r.raft.Entry\
     IdR\x04last\"<\n\x0cVoteResponse\x12\x12\n\x04term\x18\x01\x20\x01(\x03R\
-    \x04term\x12\x18\n\x07granted\x18\x02\x20\x01(\x08R\x07granted\"\x9b\x01\
+    \x04term\x12\x18\n\x07granted\x18\x02\x20\x01(\x08R\x07granted\"\xb9\x01\
     \n\rAppendRequest\x12\x12\n\x04term\x18\x01\x20\x01(\x03R\x04term\x12$\n\
     \x06leader\x18\x02\x20\x01(\x0b2\x0c.raft.ServerR\x06leader\x12)\n\x08pr\
     evious\x18\x03\x20\x01(\x0b2\r.raft.EntryIdR\x08previous\x12%\n\x07entri\
-    es\x18\x04\x20\x03(\x0b2\x0b.raft.EntryR\x07entries\">\n\x0eAppendRespon\
-    se\x12\x12\n\x04term\x18\x01\x20\x01(\x03R\x04term\x12\x18\n\x07success\
-    \x18\x02\x20\x01(\x08R\x07success2n\n\x04Raft\x12/\n\x04Vote\x12\x11.raf\
-    t.VoteRequest\x1a\x12.raft.VoteResponse\"\0\x125\n\x06Append\x12\x13.raf\
-    t.AppendRequest\x1a\x14.raft.AppendResponse\"\0b\x06proto3\
+    es\x18\x04\x20\x03(\x0b2\x0b.raft.EntryR\x07entries\x12\x1c\n\tcommitted\
+    \x18\x05\x20\x01(\x03R\tcommitted\">\n\x0eAppendResponse\x12\x12\n\x04te\
+    rm\x18\x01\x20\x01(\x03R\x04term\x12\x18\n\x07success\x18\x02\x20\x01(\
+    \x08R\x07success2n\n\x04Raft\x12/\n\x04Vote\x12\x11.raft.VoteRequest\x1a\
+    \x12.raft.VoteResponse\"\0\x125\n\x06Append\x12\x13.raft.AppendRequest\
+    \x1a\x14.raft.AppendResponse\"\0b\x06proto3\
 ";
 
 static mut file_descriptor_proto_lazy: ::protobuf::lazy::Lazy<::protobuf::descriptor::FileDescriptorProto> = ::protobuf::lazy::Lazy::INIT;

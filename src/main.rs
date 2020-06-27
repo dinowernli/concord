@@ -5,7 +5,9 @@ use log::info;
 
 use env_logger::Env;
 use futures::executor;
+use std::cmp::min;
 use std::convert::TryInto;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use grpc::ClientStubExt;
@@ -15,6 +17,7 @@ use grpc::ServerResponseUnarySink;
 
 use raft::AppendRequest;
 use raft::AppendResponse;
+use raft::Entry;
 use raft::Server;
 use raft::VoteRequest;
 use raft::VoteResponse;
@@ -23,7 +26,48 @@ use raft_grpc::Raft;
 use raft_grpc::RaftClient;
 use raft_grpc::RaftServer;
 
-struct RaftImpl;
+enum RaftRole {
+    Follower,
+    Candidate,
+    Leader,
+}
+
+struct RaftState {
+    // Persistent raft state.
+    term: i64,
+    voted_for: Option<Server>,
+    entries: Vec<Entry>,
+
+    // Volatile raft state.
+    committed: i64,
+    applied: i64,
+    role: RaftRole,
+}
+
+struct RaftImpl {
+    state: Arc<Mutex<RaftState>>,
+
+    // Cluster membership.
+    address: Server,
+    cluster: Vec<Server>,
+}
+
+impl RaftImpl {
+    fn new(server: &Server, all: &Vec<Server>) -> RaftImpl {
+        RaftImpl {
+            address: server.clone(),
+            cluster: all.clone(),
+            state: Arc::new(Mutex::new(RaftState {
+                term: 0,
+                voted_for: None,
+                entries: Vec::new(),
+                committed: 0,
+                applied: 0,
+                role: RaftRole::Follower,
+            })),
+        }
+    }
+}
 
 impl Raft for RaftImpl {
     fn vote(
@@ -32,18 +76,55 @@ impl Raft for RaftImpl {
         _request: ServerRequestSingle<VoteRequest>,
         response: ServerResponseUnarySink<VoteResponse>,
     ) -> grpc::Result<()> {
-        info!("Processed vote rpc");
+        info!("Processed vote rpc on port {}", self.address.get_port());
         response.finish(VoteResponse::new())
     }
 
     fn append(
         &self,
         _: ServerHandlerContext,
-        _request: ServerRequestSingle<AppendRequest>,
-        response: ServerResponseUnarySink<AppendResponse>,
+        req: ServerRequestSingle<AppendRequest>,
+        sink: ServerResponseUnarySink<AppendResponse>,
     ) -> grpc::Result<()> {
-        info!("Processed append rpc");
-        response.finish(AppendResponse::new())
+        info!("Processed append rpc on port {}", self.address.get_port());
+        let request = req.message;
+        let mut state = self.state.lock().unwrap();
+
+        let mut result = AppendResponse::new();
+        result.set_term(state.term);
+
+        if state.term > request.get_term() {
+            result.set_success(false);
+            return sink.finish(result);
+        }
+
+        // Make sure we have the previous log index sent.
+        let pindex = request.get_previous().get_index() as usize;
+        let pterm = request.get_previous().get_term();
+        if pindex >= state.entries.len() || state.entries[pindex].get_id().get_term() != pterm {
+            result.set_success(false);
+            return sink.finish(result);
+        }
+
+        let mut last_written = state.entries.len() - 1;
+        for entry in request.get_entries() {
+            let index = entry.get_id().get_index() as usize;
+            if index == state.entries.len() {
+                state.entries.push(entry.clone());
+            } else {
+                state.entries[index] = entry.clone();
+            }
+            last_written = index;
+        }
+        state.entries.truncate(last_written + 1);
+
+        let leader_commit = request.get_committed();
+        if leader_commit > state.committed {
+            state.committed = min(leader_commit, last_written as i64);
+        }
+
+        result.set_success(true);
+        return sink.finish(result);
     }
 }
 
@@ -54,9 +135,9 @@ fn server(host: &str, port: i32) -> Server {
     return result;
 }
 
-fn start_node(address: &Server) -> grpc::Server {
+fn start_node(address: &Server, all: &Vec<Server>) -> grpc::Server {
     let mut server_builder = grpc::ServerBuilder::new_plain();
-    server_builder.add_service(RaftServer::new_service_def(RaftImpl));
+    server_builder.add_service(RaftServer::new_service_def(RaftImpl::new(address, all)));
     server_builder
         .http
         .set_port(address.get_port().try_into().unwrap());
@@ -74,7 +155,7 @@ fn main() {
 
     let mut servers = Vec::<grpc::Server>::new();
     for address in &addresses {
-        servers.push(start_node(&address));
+        servers.push(start_node(&address, &addresses));
         info!("Started server on port {}", address.get_port());
     }
 
@@ -85,8 +166,10 @@ fn main() {
         client_conf,
     )
     .unwrap();
+    let mut request = AppendRequest::new();
+    request.set_term(1);
     let response = client
-        .append(grpc::RequestOptions::new(), AppendRequest::new())
+        .append(grpc::RequestOptions::new(), request)
         .join_metadata_result();
     info!("Made rpc to server");
     info!("{:?}", executor::block_on(response));

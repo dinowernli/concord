@@ -53,6 +53,9 @@ message AppendRequest {
 
   // The entries to append to the recipient's log.
   repeated Entry entries = 4;
+
+  // Index of the last committed entry on the leader.
+  int64 committed = 5;
 }
 
 message AppendResponse {
