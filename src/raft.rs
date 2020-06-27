@@ -28,7 +28,620 @@ use protobuf::ProtobufEnum as ProtobufEnum_imported_for_functions;
 // const _PROTOBUF_VERSION_CHECK: () = ::protobuf::VERSION_2_15_0;
 
 #[derive(PartialEq,Clone,Default)]
+pub struct Server {
+    // message fields
+    pub host: ::std::string::String,
+    pub port: i32,
+    // special fields
+    pub unknown_fields: ::protobuf::UnknownFields,
+    pub cached_size: ::protobuf::CachedSize,
+}
+
+impl<'a> ::std::default::Default for &'a Server {
+    fn default() -> &'a Server {
+        <Server as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl Server {
+    pub fn new() -> Server {
+        ::std::default::Default::default()
+    }
+
+    // string host = 1;
+
+
+    pub fn get_host(&self) -> &str {
+        &self.host
+    }
+    pub fn clear_host(&mut self) {
+        self.host.clear();
+    }
+
+    // Param is passed by value, moved
+    pub fn set_host(&mut self, v: ::std::string::String) {
+        self.host = v;
+    }
+
+    // Mutable pointer to the field.
+    // If field is not initialized, it is initialized with default value first.
+    pub fn mut_host(&mut self) -> &mut ::std::string::String {
+        &mut self.host
+    }
+
+    // Take field
+    pub fn take_host(&mut self) -> ::std::string::String {
+        ::std::mem::replace(&mut self.host, ::std::string::String::new())
+    }
+
+    // int32 port = 2;
+
+
+    pub fn get_port(&self) -> i32 {
+        self.port
+    }
+    pub fn clear_port(&mut self) {
+        self.port = 0;
+    }
+
+    // Param is passed by value, moved
+    pub fn set_port(&mut self, v: i32) {
+        self.port = v;
+    }
+}
+
+impl ::protobuf::Message for Server {
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::ProtobufResult<()> {
+        while !is.eof()? {
+            let (field_number, wire_type) = is.read_tag_unpack()?;
+            match field_number {
+                1 => {
+                    ::protobuf::rt::read_singular_proto3_string_into(wire_type, is, &mut self.host)?;
+                },
+                2 => {
+                    if wire_type != ::protobuf::wire_format::WireTypeVarint {
+                        return ::std::result::Result::Err(::protobuf::rt::unexpected_wire_type(wire_type));
+                    }
+                    let tmp = is.read_int32()?;
+                    self.port = tmp;
+                },
+                _ => {
+                    ::protobuf::rt::read_unknown_or_skip_group(field_number, wire_type, is, self.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u32 {
+        let mut my_size = 0;
+        if !self.host.is_empty() {
+            my_size += ::protobuf::rt::string_size(1, &self.host);
+        }
+        if self.port != 0 {
+            my_size += ::protobuf::rt::value_size(2, self.port, ::protobuf::wire_format::WireTypeVarint);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.get_unknown_fields());
+        self.cached_size.set(my_size);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::ProtobufResult<()> {
+        if !self.host.is_empty() {
+            os.write_string(1, &self.host)?;
+        }
+        if self.port != 0 {
+            os.write_int32(2, self.port)?;
+        }
+        os.write_unknown_fields(self.get_unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn get_cached_size(&self) -> u32 {
+        self.cached_size.get()
+    }
+
+    fn get_unknown_fields(&self) -> &::protobuf::UnknownFields {
+        &self.unknown_fields
+    }
+
+    fn mut_unknown_fields(&mut self) -> &mut ::protobuf::UnknownFields {
+        &mut self.unknown_fields
+    }
+
+    fn as_any(&self) -> &dyn (::std::any::Any) {
+        self as &dyn (::std::any::Any)
+    }
+    fn as_any_mut(&mut self) -> &mut dyn (::std::any::Any) {
+        self as &mut dyn (::std::any::Any)
+    }
+    fn into_any(self: Box<Self>) -> ::std::boxed::Box<dyn (::std::any::Any)> {
+        self
+    }
+
+    fn descriptor(&self) -> &'static ::protobuf::reflect::MessageDescriptor {
+        Self::descriptor_static()
+    }
+
+    fn new() -> Server {
+        Server::new()
+    }
+
+    fn descriptor_static() -> &'static ::protobuf::reflect::MessageDescriptor {
+        static mut descriptor: ::protobuf::lazy::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::lazy::Lazy::INIT;
+        unsafe {
+            descriptor.get(|| {
+                let mut fields = ::std::vec::Vec::new();
+                fields.push(::protobuf::reflect::accessor::make_simple_field_accessor::<_, ::protobuf::types::ProtobufTypeString>(
+                    "host",
+                    |m: &Server| { &m.host },
+                    |m: &mut Server| { &mut m.host },
+                ));
+                fields.push(::protobuf::reflect::accessor::make_simple_field_accessor::<_, ::protobuf::types::ProtobufTypeInt32>(
+                    "port",
+                    |m: &Server| { &m.port },
+                    |m: &mut Server| { &mut m.port },
+                ));
+                ::protobuf::reflect::MessageDescriptor::new_pb_name::<Server>(
+                    "Server",
+                    fields,
+                    file_descriptor_proto()
+                )
+            })
+        }
+    }
+
+    fn default_instance() -> &'static Server {
+        static mut instance: ::protobuf::lazy::Lazy<Server> = ::protobuf::lazy::Lazy::INIT;
+        unsafe {
+            instance.get(Server::new)
+        }
+    }
+}
+
+impl ::protobuf::Clear for Server {
+    fn clear(&mut self) {
+        self.host.clear();
+        self.port = 0;
+        self.unknown_fields.clear();
+    }
+}
+
+impl ::std::fmt::Debug for Server {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for Server {
+    fn as_ref(&self) -> ::protobuf::reflect::ReflectValueRef {
+        ::protobuf::reflect::ReflectValueRef::Message(self)
+    }
+}
+
+#[derive(PartialEq,Clone,Default)]
+pub struct EntryId {
+    // message fields
+    pub term: i64,
+    pub index: i64,
+    // special fields
+    pub unknown_fields: ::protobuf::UnknownFields,
+    pub cached_size: ::protobuf::CachedSize,
+}
+
+impl<'a> ::std::default::Default for &'a EntryId {
+    fn default() -> &'a EntryId {
+        <EntryId as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl EntryId {
+    pub fn new() -> EntryId {
+        ::std::default::Default::default()
+    }
+
+    // int64 term = 1;
+
+
+    pub fn get_term(&self) -> i64 {
+        self.term
+    }
+    pub fn clear_term(&mut self) {
+        self.term = 0;
+    }
+
+    // Param is passed by value, moved
+    pub fn set_term(&mut self, v: i64) {
+        self.term = v;
+    }
+
+    // int64 index = 2;
+
+
+    pub fn get_index(&self) -> i64 {
+        self.index
+    }
+    pub fn clear_index(&mut self) {
+        self.index = 0;
+    }
+
+    // Param is passed by value, moved
+    pub fn set_index(&mut self, v: i64) {
+        self.index = v;
+    }
+}
+
+impl ::protobuf::Message for EntryId {
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::ProtobufResult<()> {
+        while !is.eof()? {
+            let (field_number, wire_type) = is.read_tag_unpack()?;
+            match field_number {
+                1 => {
+                    if wire_type != ::protobuf::wire_format::WireTypeVarint {
+                        return ::std::result::Result::Err(::protobuf::rt::unexpected_wire_type(wire_type));
+                    }
+                    let tmp = is.read_int64()?;
+                    self.term = tmp;
+                },
+                2 => {
+                    if wire_type != ::protobuf::wire_format::WireTypeVarint {
+                        return ::std::result::Result::Err(::protobuf::rt::unexpected_wire_type(wire_type));
+                    }
+                    let tmp = is.read_int64()?;
+                    self.index = tmp;
+                },
+                _ => {
+                    ::protobuf::rt::read_unknown_or_skip_group(field_number, wire_type, is, self.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u32 {
+        let mut my_size = 0;
+        if self.term != 0 {
+            my_size += ::protobuf::rt::value_size(1, self.term, ::protobuf::wire_format::WireTypeVarint);
+        }
+        if self.index != 0 {
+            my_size += ::protobuf::rt::value_size(2, self.index, ::protobuf::wire_format::WireTypeVarint);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.get_unknown_fields());
+        self.cached_size.set(my_size);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::ProtobufResult<()> {
+        if self.term != 0 {
+            os.write_int64(1, self.term)?;
+        }
+        if self.index != 0 {
+            os.write_int64(2, self.index)?;
+        }
+        os.write_unknown_fields(self.get_unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn get_cached_size(&self) -> u32 {
+        self.cached_size.get()
+    }
+
+    fn get_unknown_fields(&self) -> &::protobuf::UnknownFields {
+        &self.unknown_fields
+    }
+
+    fn mut_unknown_fields(&mut self) -> &mut ::protobuf::UnknownFields {
+        &mut self.unknown_fields
+    }
+
+    fn as_any(&self) -> &dyn (::std::any::Any) {
+        self as &dyn (::std::any::Any)
+    }
+    fn as_any_mut(&mut self) -> &mut dyn (::std::any::Any) {
+        self as &mut dyn (::std::any::Any)
+    }
+    fn into_any(self: Box<Self>) -> ::std::boxed::Box<dyn (::std::any::Any)> {
+        self
+    }
+
+    fn descriptor(&self) -> &'static ::protobuf::reflect::MessageDescriptor {
+        Self::descriptor_static()
+    }
+
+    fn new() -> EntryId {
+        EntryId::new()
+    }
+
+    fn descriptor_static() -> &'static ::protobuf::reflect::MessageDescriptor {
+        static mut descriptor: ::protobuf::lazy::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::lazy::Lazy::INIT;
+        unsafe {
+            descriptor.get(|| {
+                let mut fields = ::std::vec::Vec::new();
+                fields.push(::protobuf::reflect::accessor::make_simple_field_accessor::<_, ::protobuf::types::ProtobufTypeInt64>(
+                    "term",
+                    |m: &EntryId| { &m.term },
+                    |m: &mut EntryId| { &mut m.term },
+                ));
+                fields.push(::protobuf::reflect::accessor::make_simple_field_accessor::<_, ::protobuf::types::ProtobufTypeInt64>(
+                    "index",
+                    |m: &EntryId| { &m.index },
+                    |m: &mut EntryId| { &mut m.index },
+                ));
+                ::protobuf::reflect::MessageDescriptor::new_pb_name::<EntryId>(
+                    "EntryId",
+                    fields,
+                    file_descriptor_proto()
+                )
+            })
+        }
+    }
+
+    fn default_instance() -> &'static EntryId {
+        static mut instance: ::protobuf::lazy::Lazy<EntryId> = ::protobuf::lazy::Lazy::INIT;
+        unsafe {
+            instance.get(EntryId::new)
+        }
+    }
+}
+
+impl ::protobuf::Clear for EntryId {
+    fn clear(&mut self) {
+        self.term = 0;
+        self.index = 0;
+        self.unknown_fields.clear();
+    }
+}
+
+impl ::std::fmt::Debug for EntryId {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for EntryId {
+    fn as_ref(&self) -> ::protobuf::reflect::ReflectValueRef {
+        ::protobuf::reflect::ReflectValueRef::Message(self)
+    }
+}
+
+#[derive(PartialEq,Clone,Default)]
+pub struct Entry {
+    // message fields
+    pub id: ::protobuf::SingularPtrField<EntryId>,
+    pub payload: ::std::vec::Vec<u8>,
+    // special fields
+    pub unknown_fields: ::protobuf::UnknownFields,
+    pub cached_size: ::protobuf::CachedSize,
+}
+
+impl<'a> ::std::default::Default for &'a Entry {
+    fn default() -> &'a Entry {
+        <Entry as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl Entry {
+    pub fn new() -> Entry {
+        ::std::default::Default::default()
+    }
+
+    // .raft.EntryId id = 1;
+
+
+    pub fn get_id(&self) -> &EntryId {
+        self.id.as_ref().unwrap_or_else(|| EntryId::default_instance())
+    }
+    pub fn clear_id(&mut self) {
+        self.id.clear();
+    }
+
+    pub fn has_id(&self) -> bool {
+        self.id.is_some()
+    }
+
+    // Param is passed by value, moved
+    pub fn set_id(&mut self, v: EntryId) {
+        self.id = ::protobuf::SingularPtrField::some(v);
+    }
+
+    // Mutable pointer to the field.
+    // If field is not initialized, it is initialized with default value first.
+    pub fn mut_id(&mut self) -> &mut EntryId {
+        if self.id.is_none() {
+            self.id.set_default();
+        }
+        self.id.as_mut().unwrap()
+    }
+
+    // Take field
+    pub fn take_id(&mut self) -> EntryId {
+        self.id.take().unwrap_or_else(|| EntryId::new())
+    }
+
+    // bytes payload = 2;
+
+
+    pub fn get_payload(&self) -> &[u8] {
+        &self.payload
+    }
+    pub fn clear_payload(&mut self) {
+        self.payload.clear();
+    }
+
+    // Param is passed by value, moved
+    pub fn set_payload(&mut self, v: ::std::vec::Vec<u8>) {
+        self.payload = v;
+    }
+
+    // Mutable pointer to the field.
+    // If field is not initialized, it is initialized with default value first.
+    pub fn mut_payload(&mut self) -> &mut ::std::vec::Vec<u8> {
+        &mut self.payload
+    }
+
+    // Take field
+    pub fn take_payload(&mut self) -> ::std::vec::Vec<u8> {
+        ::std::mem::replace(&mut self.payload, ::std::vec::Vec::new())
+    }
+}
+
+impl ::protobuf::Message for Entry {
+    fn is_initialized(&self) -> bool {
+        for v in &self.id {
+            if !v.is_initialized() {
+                return false;
+            }
+        };
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::ProtobufResult<()> {
+        while !is.eof()? {
+            let (field_number, wire_type) = is.read_tag_unpack()?;
+            match field_number {
+                1 => {
+                    ::protobuf::rt::read_singular_message_into(wire_type, is, &mut self.id)?;
+                },
+                2 => {
+                    ::protobuf::rt::read_singular_proto3_bytes_into(wire_type, is, &mut self.payload)?;
+                },
+                _ => {
+                    ::protobuf::rt::read_unknown_or_skip_group(field_number, wire_type, is, self.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u32 {
+        let mut my_size = 0;
+        if let Some(ref v) = self.id.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint32_size(len) + len;
+        }
+        if !self.payload.is_empty() {
+            my_size += ::protobuf::rt::bytes_size(2, &self.payload);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.get_unknown_fields());
+        self.cached_size.set(my_size);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::ProtobufResult<()> {
+        if let Some(ref v) = self.id.as_ref() {
+            os.write_tag(1, ::protobuf::wire_format::WireTypeLengthDelimited)?;
+            os.write_raw_varint32(v.get_cached_size())?;
+            v.write_to_with_cached_sizes(os)?;
+        }
+        if !self.payload.is_empty() {
+            os.write_bytes(2, &self.payload)?;
+        }
+        os.write_unknown_fields(self.get_unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn get_cached_size(&self) -> u32 {
+        self.cached_size.get()
+    }
+
+    fn get_unknown_fields(&self) -> &::protobuf::UnknownFields {
+        &self.unknown_fields
+    }
+
+    fn mut_unknown_fields(&mut self) -> &mut ::protobuf::UnknownFields {
+        &mut self.unknown_fields
+    }
+
+    fn as_any(&self) -> &dyn (::std::any::Any) {
+        self as &dyn (::std::any::Any)
+    }
+    fn as_any_mut(&mut self) -> &mut dyn (::std::any::Any) {
+        self as &mut dyn (::std::any::Any)
+    }
+    fn into_any(self: Box<Self>) -> ::std::boxed::Box<dyn (::std::any::Any)> {
+        self
+    }
+
+    fn descriptor(&self) -> &'static ::protobuf::reflect::MessageDescriptor {
+        Self::descriptor_static()
+    }
+
+    fn new() -> Entry {
+        Entry::new()
+    }
+
+    fn descriptor_static() -> &'static ::protobuf::reflect::MessageDescriptor {
+        static mut descriptor: ::protobuf::lazy::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::lazy::Lazy::INIT;
+        unsafe {
+            descriptor.get(|| {
+                let mut fields = ::std::vec::Vec::new();
+                fields.push(::protobuf::reflect::accessor::make_singular_ptr_field_accessor::<_, ::protobuf::types::ProtobufTypeMessage<EntryId>>(
+                    "id",
+                    |m: &Entry| { &m.id },
+                    |m: &mut Entry| { &mut m.id },
+                ));
+                fields.push(::protobuf::reflect::accessor::make_simple_field_accessor::<_, ::protobuf::types::ProtobufTypeBytes>(
+                    "payload",
+                    |m: &Entry| { &m.payload },
+                    |m: &mut Entry| { &mut m.payload },
+                ));
+                ::protobuf::reflect::MessageDescriptor::new_pb_name::<Entry>(
+                    "Entry",
+                    fields,
+                    file_descriptor_proto()
+                )
+            })
+        }
+    }
+
+    fn default_instance() -> &'static Entry {
+        static mut instance: ::protobuf::lazy::Lazy<Entry> = ::protobuf::lazy::Lazy::INIT;
+        unsafe {
+            instance.get(Entry::new)
+        }
+    }
+}
+
+impl ::protobuf::Clear for Entry {
+    fn clear(&mut self) {
+        self.id.clear();
+        self.payload.clear();
+        self.unknown_fields.clear();
+    }
+}
+
+impl ::std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for Entry {
+    fn as_ref(&self) -> ::protobuf::reflect::ReflectValueRef {
+        ::protobuf::reflect::ReflectValueRef::Message(self)
+    }
+}
+
+#[derive(PartialEq,Clone,Default)]
 pub struct VoteRequest {
+    // message fields
+    pub term: i64,
+    pub candidate: ::protobuf::SingularPtrField<Server>,
+    pub last: ::protobuf::SingularPtrField<EntryId>,
     // special fields
     pub unknown_fields: ::protobuf::UnknownFields,
     pub cached_size: ::protobuf::CachedSize,
@@ -44,10 +657,101 @@ impl VoteRequest {
     pub fn new() -> VoteRequest {
         ::std::default::Default::default()
     }
+
+    // int64 term = 1;
+
+
+    pub fn get_term(&self) -> i64 {
+        self.term
+    }
+    pub fn clear_term(&mut self) {
+        self.term = 0;
+    }
+
+    // Param is passed by value, moved
+    pub fn set_term(&mut self, v: i64) {
+        self.term = v;
+    }
+
+    // .raft.Server candidate = 2;
+
+
+    pub fn get_candidate(&self) -> &Server {
+        self.candidate.as_ref().unwrap_or_else(|| Server::default_instance())
+    }
+    pub fn clear_candidate(&mut self) {
+        self.candidate.clear();
+    }
+
+    pub fn has_candidate(&self) -> bool {
+        self.candidate.is_some()
+    }
+
+    // Param is passed by value, moved
+    pub fn set_candidate(&mut self, v: Server) {
+        self.candidate = ::protobuf::SingularPtrField::some(v);
+    }
+
+    // Mutable pointer to the field.
+    // If field is not initialized, it is initialized with default value first.
+    pub fn mut_candidate(&mut self) -> &mut Server {
+        if self.candidate.is_none() {
+            self.candidate.set_default();
+        }
+        self.candidate.as_mut().unwrap()
+    }
+
+    // Take field
+    pub fn take_candidate(&mut self) -> Server {
+        self.candidate.take().unwrap_or_else(|| Server::new())
+    }
+
+    // .raft.EntryId last = 3;
+
+
+    pub fn get_last(&self) -> &EntryId {
+        self.last.as_ref().unwrap_or_else(|| EntryId::default_instance())
+    }
+    pub fn clear_last(&mut self) {
+        self.last.clear();
+    }
+
+    pub fn has_last(&self) -> bool {
+        self.last.is_some()
+    }
+
+    // Param is passed by value, moved
+    pub fn set_last(&mut self, v: EntryId) {
+        self.last = ::protobuf::SingularPtrField::some(v);
+    }
+
+    // Mutable pointer to the field.
+    // If field is not initialized, it is initialized with default value first.
+    pub fn mut_last(&mut self) -> &mut EntryId {
+        if self.last.is_none() {
+            self.last.set_default();
+        }
+        self.last.as_mut().unwrap()
+    }
+
+    // Take field
+    pub fn take_last(&mut self) -> EntryId {
+        self.last.take().unwrap_or_else(|| EntryId::new())
+    }
 }
 
 impl ::protobuf::Message for VoteRequest {
     fn is_initialized(&self) -> bool {
+        for v in &self.candidate {
+            if !v.is_initialized() {
+                return false;
+            }
+        };
+        for v in &self.last {
+            if !v.is_initialized() {
+                return false;
+            }
+        };
         true
     }
 
@@ -55,6 +759,19 @@ impl ::protobuf::Message for VoteRequest {
         while !is.eof()? {
             let (field_number, wire_type) = is.read_tag_unpack()?;
             match field_number {
+                1 => {
+                    if wire_type != ::protobuf::wire_format::WireTypeVarint {
+                        return ::std::result::Result::Err(::protobuf::rt::unexpected_wire_type(wire_type));
+                    }
+                    let tmp = is.read_int64()?;
+                    self.term = tmp;
+                },
+                2 => {
+                    ::protobuf::rt::read_singular_message_into(wire_type, is, &mut self.candidate)?;
+                },
+                3 => {
+                    ::protobuf::rt::read_singular_message_into(wire_type, is, &mut self.last)?;
+                },
                 _ => {
                     ::protobuf::rt::read_unknown_or_skip_group(field_number, wire_type, is, self.mut_unknown_fields())?;
                 },
@@ -67,12 +784,36 @@ impl ::protobuf::Message for VoteRequest {
     #[allow(unused_variables)]
     fn compute_size(&self) -> u32 {
         let mut my_size = 0;
+        if self.term != 0 {
+            my_size += ::protobuf::rt::value_size(1, self.term, ::protobuf::wire_format::WireTypeVarint);
+        }
+        if let Some(ref v) = self.candidate.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint32_size(len) + len;
+        }
+        if let Some(ref v) = self.last.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint32_size(len) + len;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.get_unknown_fields());
         self.cached_size.set(my_size);
         my_size
     }
 
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::ProtobufResult<()> {
+        if self.term != 0 {
+            os.write_int64(1, self.term)?;
+        }
+        if let Some(ref v) = self.candidate.as_ref() {
+            os.write_tag(2, ::protobuf::wire_format::WireTypeLengthDelimited)?;
+            os.write_raw_varint32(v.get_cached_size())?;
+            v.write_to_with_cached_sizes(os)?;
+        }
+        if let Some(ref v) = self.last.as_ref() {
+            os.write_tag(3, ::protobuf::wire_format::WireTypeLengthDelimited)?;
+            os.write_raw_varint32(v.get_cached_size())?;
+            v.write_to_with_cached_sizes(os)?;
+        }
         os.write_unknown_fields(self.get_unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -111,7 +852,22 @@ impl ::protobuf::Message for VoteRequest {
         static mut descriptor: ::protobuf::lazy::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::lazy::Lazy::INIT;
         unsafe {
             descriptor.get(|| {
-                let fields = ::std::vec::Vec::new();
+                let mut fields = ::std::vec::Vec::new();
+                fields.push(::protobuf::reflect::accessor::make_simple_field_accessor::<_, ::protobuf::types::ProtobufTypeInt64>(
+                    "term",
+                    |m: &VoteRequest| { &m.term },
+                    |m: &mut VoteRequest| { &mut m.term },
+                ));
+                fields.push(::protobuf::reflect::accessor::make_singular_ptr_field_accessor::<_, ::protobuf::types::ProtobufTypeMessage<Server>>(
+                    "candidate",
+                    |m: &VoteRequest| { &m.candidate },
+                    |m: &mut VoteRequest| { &mut m.candidate },
+                ));
+                fields.push(::protobuf::reflect::accessor::make_singular_ptr_field_accessor::<_, ::protobuf::types::ProtobufTypeMessage<EntryId>>(
+                    "last",
+                    |m: &VoteRequest| { &m.last },
+                    |m: &mut VoteRequest| { &mut m.last },
+                ));
                 ::protobuf::reflect::MessageDescriptor::new_pb_name::<VoteRequest>(
                     "VoteRequest",
                     fields,
@@ -131,6 +887,9 @@ impl ::protobuf::Message for VoteRequest {
 
 impl ::protobuf::Clear for VoteRequest {
     fn clear(&mut self) {
+        self.term = 0;
+        self.candidate.clear();
+        self.last.clear();
         self.unknown_fields.clear();
     }
 }
@@ -149,6 +908,9 @@ impl ::protobuf::reflect::ProtobufValue for VoteRequest {
 
 #[derive(PartialEq,Clone,Default)]
 pub struct VoteResponse {
+    // message fields
+    pub term: i64,
+    pub granted: bool,
     // special fields
     pub unknown_fields: ::protobuf::UnknownFields,
     pub cached_size: ::protobuf::CachedSize,
@@ -164,6 +926,36 @@ impl VoteResponse {
     pub fn new() -> VoteResponse {
         ::std::default::Default::default()
     }
+
+    // int64 term = 1;
+
+
+    pub fn get_term(&self) -> i64 {
+        self.term
+    }
+    pub fn clear_term(&mut self) {
+        self.term = 0;
+    }
+
+    // Param is passed by value, moved
+    pub fn set_term(&mut self, v: i64) {
+        self.term = v;
+    }
+
+    // bool granted = 2;
+
+
+    pub fn get_granted(&self) -> bool {
+        self.granted
+    }
+    pub fn clear_granted(&mut self) {
+        self.granted = false;
+    }
+
+    // Param is passed by value, moved
+    pub fn set_granted(&mut self, v: bool) {
+        self.granted = v;
+    }
 }
 
 impl ::protobuf::Message for VoteResponse {
@@ -175,6 +967,20 @@ impl ::protobuf::Message for VoteResponse {
         while !is.eof()? {
             let (field_number, wire_type) = is.read_tag_unpack()?;
             match field_number {
+                1 => {
+                    if wire_type != ::protobuf::wire_format::WireTypeVarint {
+                        return ::std::result::Result::Err(::protobuf::rt::unexpected_wire_type(wire_type));
+                    }
+                    let tmp = is.read_int64()?;
+                    self.term = tmp;
+                },
+                2 => {
+                    if wire_type != ::protobuf::wire_format::WireTypeVarint {
+                        return ::std::result::Result::Err(::protobuf::rt::unexpected_wire_type(wire_type));
+                    }
+                    let tmp = is.read_bool()?;
+                    self.granted = tmp;
+                },
                 _ => {
                     ::protobuf::rt::read_unknown_or_skip_group(field_number, wire_type, is, self.mut_unknown_fields())?;
                 },
@@ -187,12 +993,24 @@ impl ::protobuf::Message for VoteResponse {
     #[allow(unused_variables)]
     fn compute_size(&self) -> u32 {
         let mut my_size = 0;
+        if self.term != 0 {
+            my_size += ::protobuf::rt::value_size(1, self.term, ::protobuf::wire_format::WireTypeVarint);
+        }
+        if self.granted != false {
+            my_size += 2;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.get_unknown_fields());
         self.cached_size.set(my_size);
         my_size
     }
 
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::ProtobufResult<()> {
+        if self.term != 0 {
+            os.write_int64(1, self.term)?;
+        }
+        if self.granted != false {
+            os.write_bool(2, self.granted)?;
+        }
         os.write_unknown_fields(self.get_unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -231,7 +1049,17 @@ impl ::protobuf::Message for VoteResponse {
         static mut descriptor: ::protobuf::lazy::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::lazy::Lazy::INIT;
         unsafe {
             descriptor.get(|| {
-                let fields = ::std::vec::Vec::new();
+                let mut fields = ::std::vec::Vec::new();
+                fields.push(::protobuf::reflect::accessor::make_simple_field_accessor::<_, ::protobuf::types::ProtobufTypeInt64>(
+                    "term",
+                    |m: &VoteResponse| { &m.term },
+                    |m: &mut VoteResponse| { &mut m.term },
+                ));
+                fields.push(::protobuf::reflect::accessor::make_simple_field_accessor::<_, ::protobuf::types::ProtobufTypeBool>(
+                    "granted",
+                    |m: &VoteResponse| { &m.granted },
+                    |m: &mut VoteResponse| { &mut m.granted },
+                ));
                 ::protobuf::reflect::MessageDescriptor::new_pb_name::<VoteResponse>(
                     "VoteResponse",
                     fields,
@@ -251,6 +1079,8 @@ impl ::protobuf::Message for VoteResponse {
 
 impl ::protobuf::Clear for VoteResponse {
     fn clear(&mut self) {
+        self.term = 0;
+        self.granted = false;
         self.unknown_fields.clear();
     }
 }
@@ -269,6 +1099,11 @@ impl ::protobuf::reflect::ProtobufValue for VoteResponse {
 
 #[derive(PartialEq,Clone,Default)]
 pub struct AppendRequest {
+    // message fields
+    pub term: i64,
+    pub leader: ::protobuf::SingularPtrField<Server>,
+    pub previous: ::protobuf::SingularPtrField<EntryId>,
+    pub entries: ::protobuf::RepeatedField<Entry>,
     // special fields
     pub unknown_fields: ::protobuf::UnknownFields,
     pub cached_size: ::protobuf::CachedSize,
@@ -284,10 +1119,131 @@ impl AppendRequest {
     pub fn new() -> AppendRequest {
         ::std::default::Default::default()
     }
+
+    // int64 term = 1;
+
+
+    pub fn get_term(&self) -> i64 {
+        self.term
+    }
+    pub fn clear_term(&mut self) {
+        self.term = 0;
+    }
+
+    // Param is passed by value, moved
+    pub fn set_term(&mut self, v: i64) {
+        self.term = v;
+    }
+
+    // .raft.Server leader = 2;
+
+
+    pub fn get_leader(&self) -> &Server {
+        self.leader.as_ref().unwrap_or_else(|| Server::default_instance())
+    }
+    pub fn clear_leader(&mut self) {
+        self.leader.clear();
+    }
+
+    pub fn has_leader(&self) -> bool {
+        self.leader.is_some()
+    }
+
+    // Param is passed by value, moved
+    pub fn set_leader(&mut self, v: Server) {
+        self.leader = ::protobuf::SingularPtrField::some(v);
+    }
+
+    // Mutable pointer to the field.
+    // If field is not initialized, it is initialized with default value first.
+    pub fn mut_leader(&mut self) -> &mut Server {
+        if self.leader.is_none() {
+            self.leader.set_default();
+        }
+        self.leader.as_mut().unwrap()
+    }
+
+    // Take field
+    pub fn take_leader(&mut self) -> Server {
+        self.leader.take().unwrap_or_else(|| Server::new())
+    }
+
+    // .raft.EntryId previous = 3;
+
+
+    pub fn get_previous(&self) -> &EntryId {
+        self.previous.as_ref().unwrap_or_else(|| EntryId::default_instance())
+    }
+    pub fn clear_previous(&mut self) {
+        self.previous.clear();
+    }
+
+    pub fn has_previous(&self) -> bool {
+        self.previous.is_some()
+    }
+
+    // Param is passed by value, moved
+    pub fn set_previous(&mut self, v: EntryId) {
+        self.previous = ::protobuf::SingularPtrField::some(v);
+    }
+
+    // Mutable pointer to the field.
+    // If field is not initialized, it is initialized with default value first.
+    pub fn mut_previous(&mut self) -> &mut EntryId {
+        if self.previous.is_none() {
+            self.previous.set_default();
+        }
+        self.previous.as_mut().unwrap()
+    }
+
+    // Take field
+    pub fn take_previous(&mut self) -> EntryId {
+        self.previous.take().unwrap_or_else(|| EntryId::new())
+    }
+
+    // repeated .raft.Entry entries = 4;
+
+
+    pub fn get_entries(&self) -> &[Entry] {
+        &self.entries
+    }
+    pub fn clear_entries(&mut self) {
+        self.entries.clear();
+    }
+
+    // Param is passed by value, moved
+    pub fn set_entries(&mut self, v: ::protobuf::RepeatedField<Entry>) {
+        self.entries = v;
+    }
+
+    // Mutable pointer to the field.
+    pub fn mut_entries(&mut self) -> &mut ::protobuf::RepeatedField<Entry> {
+        &mut self.entries
+    }
+
+    // Take field
+    pub fn take_entries(&mut self) -> ::protobuf::RepeatedField<Entry> {
+        ::std::mem::replace(&mut self.entries, ::protobuf::RepeatedField::new())
+    }
 }
 
 impl ::protobuf::Message for AppendRequest {
     fn is_initialized(&self) -> bool {
+        for v in &self.leader {
+            if !v.is_initialized() {
+                return false;
+            }
+        };
+        for v in &self.previous {
+            if !v.is_initialized() {
+                return false;
+            }
+        };
+        for v in &self.entries {
+            if !v.is_initialized() {
+                return false;
+            }
+        };
         true
     }
 
@@ -295,6 +1251,22 @@ impl ::protobuf::Message for AppendRequest {
         while !is.eof()? {
             let (field_number, wire_type) = is.read_tag_unpack()?;
             match field_number {
+                1 => {
+                    if wire_type != ::protobuf::wire_format::WireTypeVarint {
+                        return ::std::result::Result::Err(::protobuf::rt::unexpected_wire_type(wire_type));
+                    }
+                    let tmp = is.read_int64()?;
+                    self.term = tmp;
+                },
+                2 => {
+                    ::protobuf::rt::read_singular_message_into(wire_type, is, &mut self.leader)?;
+                },
+                3 => {
+                    ::protobuf::rt::read_singular_message_into(wire_type, is, &mut self.previous)?;
+                },
+                4 => {
+                    ::protobuf::rt::read_repeated_message_into(wire_type, is, &mut self.entries)?;
+                },
                 _ => {
                     ::protobuf::rt::read_unknown_or_skip_group(field_number, wire_type, is, self.mut_unknown_fields())?;
                 },
@@ -307,12 +1279,45 @@ impl ::protobuf::Message for AppendRequest {
     #[allow(unused_variables)]
     fn compute_size(&self) -> u32 {
         let mut my_size = 0;
+        if self.term != 0 {
+            my_size += ::protobuf::rt::value_size(1, self.term, ::protobuf::wire_format::WireTypeVarint);
+        }
+        if let Some(ref v) = self.leader.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint32_size(len) + len;
+        }
+        if let Some(ref v) = self.previous.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint32_size(len) + len;
+        }
+        for value in &self.entries {
+            let len = value.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint32_size(len) + len;
+        };
         my_size += ::protobuf::rt::unknown_fields_size(self.get_unknown_fields());
         self.cached_size.set(my_size);
         my_size
     }
 
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::ProtobufResult<()> {
+        if self.term != 0 {
+            os.write_int64(1, self.term)?;
+        }
+        if let Some(ref v) = self.leader.as_ref() {
+            os.write_tag(2, ::protobuf::wire_format::WireTypeLengthDelimited)?;
+            os.write_raw_varint32(v.get_cached_size())?;
+            v.write_to_with_cached_sizes(os)?;
+        }
+        if let Some(ref v) = self.previous.as_ref() {
+            os.write_tag(3, ::protobuf::wire_format::WireTypeLengthDelimited)?;
+            os.write_raw_varint32(v.get_cached_size())?;
+            v.write_to_with_cached_sizes(os)?;
+        }
+        for v in &self.entries {
+            os.write_tag(4, ::protobuf::wire_format::WireTypeLengthDelimited)?;
+            os.write_raw_varint32(v.get_cached_size())?;
+            v.write_to_with_cached_sizes(os)?;
+        };
         os.write_unknown_fields(self.get_unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -351,7 +1356,27 @@ impl ::protobuf::Message for AppendRequest {
         static mut descriptor: ::protobuf::lazy::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::lazy::Lazy::INIT;
         unsafe {
             descriptor.get(|| {
-                let fields = ::std::vec::Vec::new();
+                let mut fields = ::std::vec::Vec::new();
+                fields.push(::protobuf::reflect::accessor::make_simple_field_accessor::<_, ::protobuf::types::ProtobufTypeInt64>(
+                    "term",
+                    |m: &AppendRequest| { &m.term },
+                    |m: &mut AppendRequest| { &mut m.term },
+                ));
+                fields.push(::protobuf::reflect::accessor::make_singular_ptr_field_accessor::<_, ::protobuf::types::ProtobufTypeMessage<Server>>(
+                    "leader",
+                    |m: &AppendRequest| { &m.leader },
+                    |m: &mut AppendRequest| { &mut m.leader },
+                ));
+                fields.push(::protobuf::reflect::accessor::make_singular_ptr_field_accessor::<_, ::protobuf::types::ProtobufTypeMessage<EntryId>>(
+                    "previous",
+                    |m: &AppendRequest| { &m.previous },
+                    |m: &mut AppendRequest| { &mut m.previous },
+                ));
+                fields.push(::protobuf::reflect::accessor::make_repeated_field_accessor::<_, ::protobuf::types::ProtobufTypeMessage<Entry>>(
+                    "entries",
+                    |m: &AppendRequest| { &m.entries },
+                    |m: &mut AppendRequest| { &mut m.entries },
+                ));
                 ::protobuf::reflect::MessageDescriptor::new_pb_name::<AppendRequest>(
                     "AppendRequest",
                     fields,
@@ -371,6 +1396,10 @@ impl ::protobuf::Message for AppendRequest {
 
 impl ::protobuf::Clear for AppendRequest {
     fn clear(&mut self) {
+        self.term = 0;
+        self.leader.clear();
+        self.previous.clear();
+        self.entries.clear();
         self.unknown_fields.clear();
     }
 }
@@ -389,6 +1418,9 @@ impl ::protobuf::reflect::ProtobufValue for AppendRequest {
 
 #[derive(PartialEq,Clone,Default)]
 pub struct AppendResponse {
+    // message fields
+    pub term: i64,
+    pub success: bool,
     // special fields
     pub unknown_fields: ::protobuf::UnknownFields,
     pub cached_size: ::protobuf::CachedSize,
@@ -404,6 +1436,36 @@ impl AppendResponse {
     pub fn new() -> AppendResponse {
         ::std::default::Default::default()
     }
+
+    // int64 term = 1;
+
+
+    pub fn get_term(&self) -> i64 {
+        self.term
+    }
+    pub fn clear_term(&mut self) {
+        self.term = 0;
+    }
+
+    // Param is passed by value, moved
+    pub fn set_term(&mut self, v: i64) {
+        self.term = v;
+    }
+
+    // bool success = 2;
+
+
+    pub fn get_success(&self) -> bool {
+        self.success
+    }
+    pub fn clear_success(&mut self) {
+        self.success = false;
+    }
+
+    // Param is passed by value, moved
+    pub fn set_success(&mut self, v: bool) {
+        self.success = v;
+    }
 }
 
 impl ::protobuf::Message for AppendResponse {
@@ -415,6 +1477,20 @@ impl ::protobuf::Message for AppendResponse {
         while !is.eof()? {
             let (field_number, wire_type) = is.read_tag_unpack()?;
             match field_number {
+                1 => {
+                    if wire_type != ::protobuf::wire_format::WireTypeVarint {
+                        return ::std::result::Result::Err(::protobuf::rt::unexpected_wire_type(wire_type));
+                    }
+                    let tmp = is.read_int64()?;
+                    self.term = tmp;
+                },
+                2 => {
+                    if wire_type != ::protobuf::wire_format::WireTypeVarint {
+                        return ::std::result::Result::Err(::protobuf::rt::unexpected_wire_type(wire_type));
+                    }
+                    let tmp = is.read_bool()?;
+                    self.success = tmp;
+                },
                 _ => {
                     ::protobuf::rt::read_unknown_or_skip_group(field_number, wire_type, is, self.mut_unknown_fields())?;
                 },
@@ -427,12 +1503,24 @@ impl ::protobuf::Message for AppendResponse {
     #[allow(unused_variables)]
     fn compute_size(&self) -> u32 {
         let mut my_size = 0;
+        if self.term != 0 {
+            my_size += ::protobuf::rt::value_size(1, self.term, ::protobuf::wire_format::WireTypeVarint);
+        }
+        if self.success != false {
+            my_size += 2;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.get_unknown_fields());
         self.cached_size.set(my_size);
         my_size
     }
 
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::ProtobufResult<()> {
+        if self.term != 0 {
+            os.write_int64(1, self.term)?;
+        }
+        if self.success != false {
+            os.write_bool(2, self.success)?;
+        }
         os.write_unknown_fields(self.get_unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -471,7 +1559,17 @@ impl ::protobuf::Message for AppendResponse {
         static mut descriptor: ::protobuf::lazy::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::lazy::Lazy::INIT;
         unsafe {
             descriptor.get(|| {
-                let fields = ::std::vec::Vec::new();
+                let mut fields = ::std::vec::Vec::new();
+                fields.push(::protobuf::reflect::accessor::make_simple_field_accessor::<_, ::protobuf::types::ProtobufTypeInt64>(
+                    "term",
+                    |m: &AppendResponse| { &m.term },
+                    |m: &mut AppendResponse| { &mut m.term },
+                ));
+                fields.push(::protobuf::reflect::accessor::make_simple_field_accessor::<_, ::protobuf::types::ProtobufTypeBool>(
+                    "success",
+                    |m: &AppendResponse| { &m.success },
+                    |m: &mut AppendResponse| { &mut m.success },
+                ));
                 ::protobuf::reflect::MessageDescriptor::new_pb_name::<AppendResponse>(
                     "AppendResponse",
                     fields,
@@ -491,6 +1589,8 @@ impl ::protobuf::Message for AppendResponse {
 
 impl ::protobuf::Clear for AppendResponse {
     fn clear(&mut self) {
+        self.term = 0;
+        self.success = false;
         self.unknown_fields.clear();
     }
 }
@@ -508,11 +1608,24 @@ impl ::protobuf::reflect::ProtobufValue for AppendResponse {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x0esrc/raft.proto\x12\x04raft\"\r\n\x0bVoteRequest\"\x0e\n\x0cVoteRes\
-    ponse\"\x0f\n\rAppendRequest\"\x10\n\x0eAppendResponse2n\n\x04Raft\x12/\
-    \n\x04Vote\x12\x11.raft.VoteRequest\x1a\x12.raft.VoteResponse\"\0\x125\n\
-    \x06Append\x12\x13.raft.AppendRequest\x1a\x14.raft.AppendResponse\"\0b\
-    \x06proto3\
+    \n\x0esrc/raft.proto\x12\x04raft\"0\n\x06Server\x12\x12\n\x04host\x18\
+    \x01\x20\x01(\tR\x04host\x12\x12\n\x04port\x18\x02\x20\x01(\x05R\x04port\
+    \"3\n\x07EntryId\x12\x12\n\x04term\x18\x01\x20\x01(\x03R\x04term\x12\x14\
+    \n\x05index\x18\x02\x20\x01(\x03R\x05index\"@\n\x05Entry\x12\x1d\n\x02id\
+    \x18\x01\x20\x01(\x0b2\r.raft.EntryIdR\x02id\x12\x18\n\x07payload\x18\
+    \x02\x20\x01(\x0cR\x07payload\"p\n\x0bVoteRequest\x12\x12\n\x04term\x18\
+    \x01\x20\x01(\x03R\x04term\x12*\n\tcandidate\x18\x02\x20\x01(\x0b2\x0c.r\
+    aft.ServerR\tcandidate\x12!\n\x04last\x18\x03\x20\x01(\x0b2\r.raft.Entry\
+    IdR\x04last\"<\n\x0cVoteResponse\x12\x12\n\x04term\x18\x01\x20\x01(\x03R\
+    \x04term\x12\x18\n\x07granted\x18\x02\x20\x01(\x08R\x07granted\"\x9b\x01\
+    \n\rAppendRequest\x12\x12\n\x04term\x18\x01\x20\x01(\x03R\x04term\x12$\n\
+    \x06leader\x18\x02\x20\x01(\x0b2\x0c.raft.ServerR\x06leader\x12)\n\x08pr\
+    evious\x18\x03\x20\x01(\x0b2\r.raft.EntryIdR\x08previous\x12%\n\x07entri\
+    es\x18\x04\x20\x03(\x0b2\x0b.raft.EntryR\x07entries\">\n\x0eAppendRespon\
+    se\x12\x12\n\x04term\x18\x01\x20\x01(\x03R\x04term\x12\x18\n\x07success\
+    \x18\x02\x20\x01(\x08R\x07success2n\n\x04Raft\x12/\n\x04Vote\x12\x11.raf\
+    t.VoteRequest\x1a\x12.raft.VoteResponse\"\0\x125\n\x06Append\x12\x13.raf\
+    t.AppendRequest\x1a\x14.raft.AppendResponse\"\0b\x06proto3\
 ";
 
 static mut file_descriptor_proto_lazy: ::protobuf::lazy::Lazy<::protobuf::descriptor::FileDescriptorProto> = ::protobuf::lazy::Lazy::INIT;

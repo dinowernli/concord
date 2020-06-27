@@ -2,16 +2,65 @@ syntax = "proto3";
 
 package raft;
 
+message Server {
+  string host = 1;
+  int32 port = 2;
+}
+
+// Identifies an entry in a given log.
+message EntryId {
+  int64 term = 1;
+  int64 index = 2;
+}
+
+// Represents an entry in a server's log.
+message Entry {
+  EntryId id = 1;
+  bytes payload = 2;
+}
+
 message VoteRequest {
+  // Term of the rpc originator.
+  int64 term = 1;
+
+  // Candidate for whom we are requesting the vote. Always the
+  // originator of the rpc.
+  Server candidate = 2;
+
+  // Information about the last log entry on the candidate.
+  EntryId last = 3;
 }
 
 message VoteResponse {
+  // Term of the rpc recipient.
+  int64 term = 1;
+  
+  // Whether the recipient of the request has decided to grant
+  // their vote to the requester.
+  bool granted = 2;
 }
 
 message AppendRequest {
+  // Term of the rpc originator.
+  int64 term = 1;
+
+  // Current leader. Always the originator of the rpc.
+  Server leader = 2;
+
+  // Information about the entry immediately preceding the entries
+  // to append.
+  EntryId previous = 3;
+
+  // The entries to append to the recipient's log.
+  repeated Entry entries = 4;
 }
 
 message AppendResponse {
+  // Term of the rpc recipient.
+  int64 term = 1;
+
+  // Indicates whether or not the entries were appended successfully.
+  bool success = 2;
 }
 
 service Raft {

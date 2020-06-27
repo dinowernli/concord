@@ -5,6 +5,7 @@ use log::info;
 
 use env_logger::Env;
 use futures::executor;
+use std::convert::TryInto;
 use std::thread;
 
 use grpc::ClientStubExt;
@@ -14,6 +15,7 @@ use grpc::ServerResponseUnarySink;
 
 use raft::AppendRequest;
 use raft::AppendResponse;
+use raft::Server;
 use raft::VoteRequest;
 use raft::VoteResponse;
 
@@ -45,20 +47,44 @@ impl Raft for RaftImpl {
     }
 }
 
+fn server(host: &str, port: i32) -> Server {
+    let mut result = Server::new();
+    result.set_host(host.to_string());
+    result.set_port(port);
+    return result;
+}
+
+fn start_node(address: &Server) -> grpc::Server {
+    let mut server_builder = grpc::ServerBuilder::new_plain();
+    server_builder.add_service(RaftServer::new_service_def(RaftImpl));
+    server_builder
+        .http
+        .set_port(address.get_port().try_into().unwrap());
+    server_builder.build().expect("server")
+}
+
 fn main() {
     env_logger::from_env(Env::default().default_filter_or("concord=info")).init();
 
-    let port = 12345;
-    let mut server_builder = grpc::ServerBuilder::new_plain();
-    server_builder.add_service(RaftServer::new_service_def(RaftImpl));
-    server_builder.http.set_port(port);
+    let addresses = vec![
+        server("::1", 12345),
+        server("::1", 12346),
+        server("::1", 12347),
+    ];
 
-    // Give this a name so it doesn't get immediately destroyed.
-    let _server = server_builder.build().expect("server");
-    info!("Started server on port {}", port);
+    let mut servers = Vec::<grpc::Server>::new();
+    for address in &addresses {
+        servers.push(start_node(&address));
+        info!("Started server on port {}", address.get_port());
+    }
 
     let client_conf = Default::default();
-    let client = RaftClient::new_plain("::1", port, client_conf).unwrap();
+    let client = RaftClient::new_plain(
+        "::1",
+        addresses[0].get_port().try_into().unwrap(),
+        client_conf,
+    )
+    .unwrap();
     let response = client
         .append(grpc::RequestOptions::new(), AppendRequest::new())
         .join_metadata_result();
