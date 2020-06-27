@@ -73,11 +73,46 @@ impl Raft for RaftImpl {
     fn vote(
         &self,
         _: ServerHandlerContext,
-        _request: ServerRequestSingle<VoteRequest>,
-        response: ServerResponseUnarySink<VoteResponse>,
+        req: ServerRequestSingle<VoteRequest>,
+        sink: ServerResponseUnarySink<VoteResponse>,
     ) -> grpc::Result<()> {
-        info!("Processed vote rpc on port {}", self.address.get_port());
-        response.finish(VoteResponse::new())
+        info!(
+            "[{:?}] handling vote request: [{:?}]",
+            self.address, req.message
+        );
+        let request = req.message;
+        let mut state = self.state.lock().unwrap();
+
+        let mut result = VoteResponse::new();
+        result.set_term(state.term);
+
+        if state.term > request.get_term() {
+            result.set_granted(false);
+            return sink.finish(result);
+        }
+
+        let candidate = request.get_candidate();
+        if candidate == state.voted_for.as_ref().unwrap_or(candidate) {
+            // Only approve if the candidate's log is at least as up-to-date
+            // as ours.
+            let rlast = request.get_last();
+            let last = state
+                .entries
+                .last()
+                .map_or(rlast.clone(), |x| x.get_id().clone());
+            if rlast.get_term() > last.get_term()
+                || rlast.get_term() == last.get_term() && rlast.get_index() >= last.get_index()
+            {
+                state.voted_for = Some(candidate.clone());
+                result.set_granted(true);
+            } else {
+                result.set_granted(false);
+            }
+            return sink.finish(result);
+        }
+
+        result.set_granted(false);
+        sink.finish(result)
     }
 
     fn append(
@@ -86,7 +121,10 @@ impl Raft for RaftImpl {
         req: ServerRequestSingle<AppendRequest>,
         sink: ServerResponseUnarySink<AppendResponse>,
     ) -> grpc::Result<()> {
-        info!("Processed append rpc on port {}", self.address.get_port());
+        info!(
+            "[{:?}] handling vote request: [{:?}]",
+            self.address, req.message
+        );
         let request = req.message;
         let mut state = self.state.lock().unwrap();
 
