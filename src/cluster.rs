@@ -1,3 +1,6 @@
+extern crate chrono;
+extern crate timer;
+
 #[path = "generated/raft.rs"]
 pub mod raft;
 
@@ -5,9 +8,10 @@ pub mod raft;
 pub mod raft_grpc;
 
 use log::info;
-
 use std::cmp::min;
 use std::sync::{Arc, Mutex};
+use timer::Guard;
+use timer::Timer;
 
 use grpc::ServerHandlerContext;
 use grpc::ServerRequestSingle;
@@ -55,6 +59,9 @@ struct RaftState {
     committed: i64,
     applied: i64,
     role: RaftRole,
+
+    timer: Timer,
+    timer_guard: Option<Guard>,
 }
 
 pub struct RaftImpl {
@@ -77,8 +84,24 @@ impl RaftImpl {
                 committed: 0,
                 applied: 0,
                 role: RaftRole::Follower,
+
+                timer: Timer::new(),
+                timer_guard: None,
             })),
         }
+    }
+
+    fn become_follower(&self, state: &mut RaftState) {
+        state.role = RaftRole::Follower;
+        info!("[{:?}] becoming follower", self.address);
+
+        let address = self.address.clone();
+        state.timer_guard = Some(state.timer.schedule_with_delay(
+            chrono::Duration::seconds(3),
+            move || {
+                info!("[{:?}] follower timeout", address);
+            },
+        ));
     }
 }
 
@@ -95,9 +118,14 @@ impl Raft for RaftImpl {
         );
         let request = req.message;
         let mut state = self.state.lock().unwrap();
-
         let mut result = VoteResponse::new();
         result.set_term(state.term);
+
+        if request.get_term() > state.term {
+            self.become_follower(&mut state);
+            result.set_granted(false);
+            return sink.finish(result);
+        }
 
         if state.term > request.get_term() {
             result.set_granted(false);
@@ -131,9 +159,14 @@ impl Raft for RaftImpl {
         );
         let request = req.message;
         let mut state = self.state.lock().unwrap();
-
         let mut result = AppendResponse::new();
         result.set_term(state.term);
+
+        if request.get_term() > state.term {
+            self.become_follower(&mut state);
+            result.set_success(false);
+            return sink.finish(result);
+        }
 
         if state.term > request.get_term() {
             result.set_success(false);

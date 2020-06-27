@@ -31,6 +31,19 @@ fn start_node(address: &Server, all: &Vec<Server>) -> grpc::Server {
     server_builder.build().expect("server")
 }
 
+fn make_append(address: &Server, term: i64) {
+    let client_conf = Default::default();
+    let client =
+        RaftClient::new_plain("::1", address.get_port().try_into().unwrap(), client_conf).unwrap();
+    let mut request = AppendRequest::new();
+    request.set_term(term);
+    let response = client
+        .append(grpc::RequestOptions::new(), request)
+        .join_metadata_result();
+    info!("Made rpc to server");
+    info!("{:?}", executor::block_on(response));
+}
+
 fn main() {
     env_logger::from_env(Env::default().default_filter_or("concord=info")).init();
 
@@ -46,20 +59,8 @@ fn main() {
         info!("Started server on port {}", address.get_port());
     }
 
-    let client_conf = Default::default();
-    let client = RaftClient::new_plain(
-        "::1",
-        addresses[0].get_port().try_into().unwrap(),
-        client_conf,
-    )
-    .unwrap();
-    let mut request = AppendRequest::new();
-    request.set_term(1);
-    let response = client
-        .append(grpc::RequestOptions::new(), request)
-        .join_metadata_result();
-    info!("Made rpc to server");
-    info!("{:?}", executor::block_on(response));
+    make_append(&addresses[0], 2);
+    make_append(&addresses[0], 17);
 
     loop {
         thread::park();
