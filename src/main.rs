@@ -18,6 +18,7 @@ use grpc::ServerResponseUnarySink;
 use raft::AppendRequest;
 use raft::AppendResponse;
 use raft::Entry;
+use raft::EntryId;
 use raft::Server;
 use raft::VoteRequest;
 use raft::VoteResponse;
@@ -25,6 +26,22 @@ use raft::VoteResponse;
 use raft_grpc::Raft;
 use raft_grpc::RaftClient;
 use raft_grpc::RaftServer;
+
+// Returns true if the supplied latest entry id is at least as
+// up-to-date as the supplied log.
+fn is_up_to_date(last: &EntryId, log: &Vec<Entry>) -> bool {
+    if log.is_empty() {
+        return true;
+    }
+
+    let log_last = log.last().unwrap().get_id();
+    if log_last.get_term() != last.get_term() {
+        return last.get_term() > last.get_term();
+    }
+
+    // Terms are equal, last index decides.
+    return last.get_index() >= log_last.get_index();
+}
 
 enum RaftRole {
     Follower,
@@ -93,16 +110,7 @@ impl Raft for RaftImpl {
 
         let candidate = request.get_candidate();
         if candidate == state.voted_for.as_ref().unwrap_or(candidate) {
-            // Only approve if the candidate's log is at least as up-to-date
-            // as ours.
-            let rlast = request.get_last();
-            let last = state
-                .entries
-                .last()
-                .map_or(rlast.clone(), |x| x.get_id().clone());
-            if rlast.get_term() > last.get_term()
-                || rlast.get_term() == last.get_term() && rlast.get_index() >= last.get_index()
-            {
+            if is_up_to_date(request.get_last(), &state.entries) {
                 state.voted_for = Some(candidate.clone());
                 result.set_granted(true);
             } else {
