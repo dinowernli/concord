@@ -1,5 +1,9 @@
+#[path = "generated/raft.rs"]
 mod raft;
+
+#[path = "generated/raft_grpc.rs"]
 mod raft_grpc;
+
 
 use log::info;
 
