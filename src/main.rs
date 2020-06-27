@@ -2,23 +2,18 @@ mod cluster;
 
 use cluster::raft;
 use cluster::raft_grpc;
-
-use log::info;
-
-use env_logger::Env;
-use futures::executor;
-use std::convert::TryInto;
-use std::thread;
-
-use grpc::ClientStubExt;
-
+use cluster::RaftImpl;
 use raft::AppendRequest;
 use raft::Server;
-
 use raft_grpc::RaftClient;
 use raft_grpc::RaftServer;
 
-use cluster::RaftImpl;
+use env_logger::Env;
+use futures::executor;
+use grpc::ClientStubExt;
+use log::info;
+use std::convert::TryInto;
+use std::thread;
 
 fn server(host: &str, port: i32) -> Server {
     let mut result = Server::new();
