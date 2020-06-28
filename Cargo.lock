@@ -101,6 +101,7 @@ dependencies = [
  "log",
  "protobuf",
  "protoc-rust-grpc",
+ "rand 0.7.3",
  "timer",
 ]
 

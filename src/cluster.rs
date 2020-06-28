@@ -1,4 +1,5 @@
 extern crate chrono;
+extern crate rand;
 extern crate timer;
 
 #[path = "generated/raft.rs"]
@@ -9,18 +10,18 @@ pub mod raft_grpc;
 
 use futures::executor;
 use futures::future::join_all;
-use log::info;
-use std::cmp::min;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use timer::Guard;
-use timer::Timer;
-
 use grpc::ClientStubExt;
 use grpc::GrpcFuture;
 use grpc::ServerHandlerContext;
 use grpc::ServerRequestSingle;
 use grpc::ServerResponseUnarySink;
+use log::info;
+use rand::{thread_rng, Rng};
+use std::cmp::min;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use timer::Guard;
+use timer::Timer;
 
 use raft::AppendRequest;
 use raft::AppendResponse;
@@ -29,7 +30,6 @@ use raft::EntryId;
 use raft::Server;
 use raft::VoteRequest;
 use raft::VoteResponse;
-
 use raft_grpc::Raft;
 use raft_grpc::RaftClient;
 
@@ -120,21 +120,24 @@ impl RaftImpl {
 
     pub fn start(&self) {
         let mut s = self.state.lock().unwrap();
-        info!("[{:?}] starting", s.address.clone());
+        info!("[{:?}] Starting", s.address.clone());
         self.become_follower(&mut s);
     }
 
     fn become_follower(&self, state: &mut RaftState) {
-        info!("[{:?}] becoming follower", state.address);
+        info!("[{:?}] Becoming follower", state.address);
         state.role = RaftRole::Follower;
         state.voted_for = None;
+
+        let mut rng = rand::thread_rng();
+        let delay_ms = 2000 + rng.gen_range(1000, 2000);
 
         let s = self.state.clone();
         let a = state.address.clone();
         state.timer_guard = Some(state.timer.schedule_with_delay(
-            chrono::Duration::seconds(3),
+            chrono::Duration::milliseconds(delay_ms),
             move || {
-                info!("[{:?}] follower timeout", a);
+                info!("[{:?}] Follower timeout", a);
                 RaftImpl::become_candidate(s.clone());
             },
         ));
@@ -143,7 +146,7 @@ impl RaftImpl {
     fn become_candidate(arc_state: Arc<Mutex<RaftState>>) {
         let mut state = arc_state.lock().unwrap();
 
-        info!("[{:?}] becoming candidate", state.address);
+        info!("[{:?}] Becoming candidate", state.address);
         state.role = RaftRole::Candidate;
         state.term = state.term + 1;
         state.voted_for = Some(state.address.clone());
@@ -153,7 +156,7 @@ impl RaftImpl {
         state.timer_guard = Some(state.timer.schedule_with_delay(
             chrono::Duration::seconds(3),
             move || {
-                info!("[{:?}] election timed out, trying agin", &a);
+                info!("[{:?}] Election timed out, trying again", &a);
                 RaftImpl::become_candidate(s.clone());
             },
         ));
@@ -180,8 +183,12 @@ impl RaftImpl {
                     .drop_metadata(),
             );
         }
+
+        // TODO(dino): This blocking call is problematic, and can cause everything
+        // to lock up. Probably want to declare this whole method async and make
+        // sure nothing anywhere needs to block.
         let results = executor::block_on(join_all(results));
-        info!("[{:?}] Done waiting for results", &source);
+        info!("[{:?}] Done waiting for vote requests", &source);
 
         let mut votes = 0;
         let b = state.address.clone();
@@ -189,18 +196,18 @@ impl RaftImpl {
             match r {
                 Ok(message) => {
                     if message.get_granted() {
-                        info!("[{:?}] got vote granted", &b);
+                        info!("[{:?}] Got vote granted", &b);
                         votes = votes + 1;
                     } else {
-                        info!("[{:?}] got vote denied", &b);
+                        info!("[{:?}] Got vote denied", &b);
                     }
                 }
                 Err(message) => {
-                    info!("[{:?}] rpc to request votes failed: {:?}", &b, message);
+                    info!("[{:?}] Vote request: {:?}", &b, message);
                 }
             }
         }
-        info!("[{:?}] got {} votes", &b, votes);
+        info!("[{:?}] Got {} votes", &b, votes);
     }
 }
 
@@ -213,26 +220,19 @@ impl Raft for RaftImpl {
     ) -> grpc::Result<()> {
         let request = req.message;
         info!(
-            "[{:?}] handling vote request: [{:?}]",
+            "[{:?}] Handling vote request: [{:?}]",
             self.address, request
         );
 
         let mut state = self.state.lock().unwrap();
-        info!("[{:?}] acquired lock in vote request", self.address);
+        info!("[{:?}] Acquired lock in vote request", self.address);
 
         let mut result = VoteResponse::new();
         result.set_term(state.term);
 
-        if request.get_term() > state.term {
-            info!("[{:?}] request term higher than ours", self.address);
-            self.become_follower(&mut state);
-            result.set_granted(false);
-            return sink.finish(result);
-        }
-
         if state.term > request.get_term() {
             info!(
-                "[{:?}] our term higher than incoming request term",
+                "[{:?}] Our term higher than incoming request term",
                 self.address
             );
             result.set_granted(false);
@@ -243,16 +243,16 @@ impl Raft for RaftImpl {
         if candidate == state.voted_for.as_ref().unwrap_or(candidate) {
             if is_up_to_date(request.get_last(), &state.entries) {
                 state.voted_for = Some(candidate.clone());
-                info!("[{:?}] granted vote", self.address);
+                info!("[{:?}] Granted vote", self.address);
                 result.set_granted(true);
             } else {
-                info!("[{:?}] denied vote", self.address);
+                info!("[{:?}] Denied vote", self.address);
                 result.set_granted(false);
             }
             return sink.finish(result);
         }
 
-        info!("[{:?}] defaulting to false in vote request", self.address);
+        info!("[{:?}] Defaulting to false in vote request", self.address);
         result.set_granted(false);
         sink.finish(result)
     }
@@ -265,7 +265,7 @@ impl Raft for RaftImpl {
     ) -> grpc::Result<()> {
         let request = req.message;
         info!(
-            "[{:?}] handling append request: [{:?}]",
+            "[{:?}] Handling append request: [{:?}]",
             self.address, request
         );
 
