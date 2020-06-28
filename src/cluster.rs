@@ -55,11 +55,17 @@ fn rpc_request_vote(
 ) -> GrpcFuture<VoteResponse> {
     let client_conf = Default::default();
     let port = address.get_port() as u16;
-    info!("Making vote rpc from [{:?}] to [{:?}]", &source, &address);
+    info!("[{:?}] Making vote rpc to [{:?}]", &source, &address);
     let client = RaftClient::new_plain(address.get_host(), port, client_conf).unwrap();
-    client
+    let result = client
         .vote(grpc::RequestOptions::new(), request.clone())
-        .drop_metadata()
+        .drop_metadata();
+
+    info!("[{:?}] Going to sleep", &source);
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    info!("[{:?}] Done sleeping", &source);
+
+    result
 }
 
 fn rpc_request_vote_sync(source: &Server, address: &Server, request: &VoteRequest) {
@@ -173,16 +179,20 @@ impl RaftImpl {
 
         // Start an election and request votes from all servers.
         let mut results = Vec::<GrpcFuture<VoteResponse>>::new();
+
         let mut request = VoteRequest::new();
         let source = state.address.clone();
+
         request.set_term(state.term);
+        request.set_candidate(source.clone());
+
         for server in &state.cluster {
             if server == &state.address {
                 continue;
             }
 
             // TODO: For debugging, remove.
-            rpc_request_vote_sync(&source, &server, &request);
+            // rpc_request_vote_sync(&source, &server, &request);
 
             results.push(rpc_request_vote(&source, &server, &request));
         }
@@ -223,6 +233,8 @@ impl Raft for RaftImpl {
         );
 
         let mut state = self.state.lock().unwrap();
+        info!("[{:?}] acquired lock in vote request", self.address);
+
         let mut result = VoteResponse::new();
         result.set_term(state.term);
 
@@ -249,7 +261,10 @@ impl Raft for RaftImpl {
         }
 
         result.set_granted(false);
-        sink.finish(result)
+        let x = sink.finish(result);
+
+        info!("[{:?}] done processing vote request", self.address);
+        x
     }
 
     fn append(
