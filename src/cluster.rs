@@ -12,6 +12,7 @@ use futures::future::join_all;
 use log::info;
 use std::cmp::min;
 use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 use timer::Guard;
 use timer::Timer;
 
@@ -48,26 +49,6 @@ fn is_up_to_date(last: &EntryId, log: &Vec<Entry>) -> bool {
     return last.get_index() >= log_last.get_index();
 }
 
-fn rpc_request_vote(
-    source: &Server,
-    address: &Server,
-    request: &VoteRequest,
-) -> GrpcFuture<VoteResponse> {
-    let client_conf = Default::default();
-    let port = address.get_port() as u16;
-    info!("[{:?}] Making vote rpc to [{:?}]", &source, &address);
-    let client = RaftClient::new_plain(address.get_host(), port, client_conf).unwrap();
-    let result = client
-        .vote(grpc::RequestOptions::new(), request.clone())
-        .drop_metadata();
-
-    info!("[{:?}] Going to sleep", &source);
-    std::thread::sleep(std::time::Duration::from_millis(1000));
-    info!("[{:?}] Done sleeping", &source);
-
-    result
-}
-
 fn rpc_request_vote_sync(source: &Server, address: &Server, request: &VoteRequest) {
     let client_conf = Default::default();
     let port = address.get_port() as u16;
@@ -83,6 +64,10 @@ fn rpc_request_vote_sync(source: &Server, address: &Server, request: &VoteReques
         ">>>>>>> Finished sync vote rpc, got response {:?}",
         executor::block_on(response)
     );
+}
+
+fn address_key(address: &Server) -> String {
+    format!("{}:{}", address.get_host(), address.get_port())
 }
 
 #[derive(PartialEq)]
@@ -109,6 +94,18 @@ struct RaftState {
     // Cluster membership.
     address: Server,
     cluster: Vec<Server>,
+    clients: HashMap<String, RaftClient>,
+}
+
+impl RaftState {
+    fn get_client(&mut self, address: &Server) -> &mut RaftClient {
+        let key = address_key(address);
+        self.clients.entry(key).or_insert_with(|| {
+            let client_conf = Default::default();
+            let port = address.get_port() as u16;
+            RaftClient::new_plain(address.get_host(), port, client_conf).unwrap()
+        })
+    }
 }
 
 pub struct RaftImpl {
@@ -133,6 +130,7 @@ impl RaftImpl {
 
                 address: server.clone(),
                 cluster: all.clone(),
+                clients: HashMap::new(),
             })),
         }
     }
@@ -186,17 +184,23 @@ impl RaftImpl {
         request.set_term(state.term);
         request.set_candidate(source.clone());
 
-        for server in &state.cluster {
-            if server == &state.address {
+        for server in state.cluster.clone() {
+            if server == state.address {
                 continue;
             }
+
+            let client = state.get_client(&server);
 
             // TODO: For debugging, remove.
             // rpc_request_vote_sync(&source, &server, &request);
 
-            results.push(rpc_request_vote(&source, &server, &request));
+            info!("[{:?}] Making vote rpc to [{:?}]", &source, &server);
+            results.push(client
+                .vote(grpc::RequestOptions::new(), request.clone())
+                .drop_metadata());
         }
 
+        /*
         let result = executor::block_on(join_all(results));
         let mut votes = 0;
         let b = state.address.clone();
@@ -216,6 +220,7 @@ impl RaftImpl {
             }
         }
         info!("[{:?}] get {} votes", &b, votes);
+        */
     }
 }
 
