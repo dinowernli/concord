@@ -7,18 +7,19 @@ pub mod raft;
 #[path = "generated/raft_grpc.rs"]
 pub mod raft_grpc;
 
+use futures::executor;
+use futures::future::join_all;
 use log::info;
 use std::cmp::min;
 use std::sync::{Arc, Mutex};
 use timer::Guard;
 use timer::Timer;
-use futures::future::join_all;
 
+use grpc::ClientStubExt;
+use grpc::GrpcFuture;
 use grpc::ServerHandlerContext;
 use grpc::ServerRequestSingle;
 use grpc::ServerResponseUnarySink;
-use grpc::ClientStubExt;
-use grpc::GrpcFuture;
 
 use raft::AppendRequest;
 use raft::AppendResponse;
@@ -47,11 +48,35 @@ fn is_up_to_date(last: &EntryId, log: &Vec<Entry>) -> bool {
     return last.get_index() >= log_last.get_index();
 }
 
-fn rpc_request_vote(server: &Server, request: &VoteRequest) -> GrpcFuture<VoteResponse> {
+fn rpc_request_vote(
+    source: &Server,
+    address: &Server,
+    request: &VoteRequest,
+) -> GrpcFuture<VoteResponse> {
     let client_conf = Default::default();
-    let client =
-        RaftClient::new_plain(server.get_host(), server.get_port() as u16, client_conf).unwrap();
-    client.vote(grpc::RequestOptions::new(), request.clone()).drop_metadata()
+    let port = address.get_port() as u16;
+    info!("Making vote rpc from [{:?}] to [{:?}]", &source, &address);
+    let client = RaftClient::new_plain(address.get_host(), port, client_conf).unwrap();
+    client
+        .vote(grpc::RequestOptions::new(), request.clone())
+        .drop_metadata()
+}
+
+fn rpc_request_vote_sync(source: &Server, address: &Server, request: &VoteRequest) {
+    let client_conf = Default::default();
+    let port = address.get_port() as u16;
+    info!(
+        ">>>>>>> Making sync vote rpc from [{:?}] to [{:?}]",
+        &source, &address
+    );
+    let client = RaftClient::new_plain(address.get_host(), port, client_conf).unwrap();
+    let response = client
+        .vote(grpc::RequestOptions::new(), request.clone())
+        .join_metadata_result();
+    info!(
+        ">>>>>>> Finished sync vote rpc, got response {:?}",
+        executor::block_on(response)
+    );
 }
 
 #[derive(PartialEq)]
@@ -74,21 +99,21 @@ struct RaftState {
 
     timer: Timer,
     timer_guard: Option<Guard>,
-}
-
-pub struct RaftImpl {
-    state: Arc<Mutex<RaftState>>,
 
     // Cluster membership.
     address: Server,
     cluster: Vec<Server>,
 }
 
+pub struct RaftImpl {
+    address: Server,
+    state: Arc<Mutex<RaftState>>,
+}
+
 impl RaftImpl {
     pub fn new(server: &Server, all: &Vec<Server>) -> RaftImpl {
         RaftImpl {
             address: server.clone(),
-            cluster: all.clone(),
             state: Arc::new(Mutex::new(RaftState {
                 term: 0,
                 voted_for: None,
@@ -99,57 +124,88 @@ impl RaftImpl {
 
                 timer: Timer::new(),
                 timer_guard: None,
+
+                address: server.clone(),
+                cluster: all.clone(),
             })),
         }
     }
 
+    pub fn start(&self) {
+        let mut s = self.state.lock().unwrap();
+        info!("[{:?}] starting", s.address.clone());
+        self.become_follower(&mut s);
+    }
+
     fn become_follower(&self, state: &mut RaftState) {
-        info!("[{:?}] becoming follower", self.address);
+        info!("[{:?}] becoming follower", state.address);
         state.role = RaftRole::Follower;
         state.voted_for = None;
-        let a = self.address.clone();
+
+        let s = self.state.clone();
+        let a = state.address.clone();
         state.timer_guard = Some(state.timer.schedule_with_delay(
             chrono::Duration::seconds(3),
             move || {
                 info!("[{:?}] follower timeout", a);
-                //self.become_candidate();
+                RaftImpl::become_candidate(s.clone());
             },
         ));
     }
 
-    fn become_candidate(&self) {
-        let mut state = self.state.lock().unwrap();
-        if state.role != RaftRole::Follower {
-            // Stale callback, do nothing.
-            return;
-        }
+    fn become_candidate(arc_state: Arc<Mutex<RaftState>>) {
+        let mut state = arc_state.lock().unwrap();
 
-        info!("[{:?}] becoming candidate", self.address);
+        info!("[{:?}] becoming candidate", state.address);
         state.role = RaftRole::Candidate;
         state.term = state.term + 1;
-        state.voted_for = Some(self.address.clone());
+        state.voted_for = Some(state.address.clone());
 
-        /*
+        let s = arc_state.clone();
+        let a = state.address.clone();
         state.timer_guard = Some(state.timer.schedule_with_delay(
             chrono::Duration::seconds(3),
             move || {
-                info!("[{:?}] election timed out, trying agin", self.address);
-                self.become_candidate();
+                info!("[{:?}] election timed out, trying agin", &a);
+                RaftImpl::become_candidate(s.clone());
             },
         ));
-        */
 
-        // TODO(dino): Send RequestVote rpcs to all other members.
-        let votes = 0;
+        // Start an election and request votes from all servers.
         let mut results = Vec::<GrpcFuture<VoteResponse>>::new();
-        let request = VoteRequest::new();
-        for server in &self.cluster {
-            if server == &self.address {
+        let mut request = VoteRequest::new();
+        let source = state.address.clone();
+        request.set_term(state.term);
+        for server in &state.cluster {
+            if server == &state.address {
                 continue;
             }
-            results.push(rpc_request_vote(&server, &request));
+
+            // TODO: For debugging, remove.
+            rpc_request_vote_sync(&source, &server, &request);
+
+            results.push(rpc_request_vote(&source, &server, &request));
         }
-        join_all(results);
+
+        let result = executor::block_on(join_all(results));
+        let mut votes = 0;
+        let b = state.address.clone();
+        for r in result {
+            match r {
+                Ok(message) => {
+                    if message.get_granted() {
+                        info!("[{:?}] got vote granted", &b);
+                        votes = votes + 1;
+                    } else {
+                        info!("[{:?}] got vote denied", &b);
+                    }
+                }
+                Err(message) => {
+                    info!("[{:?}] rpc to request votes failed: {:?}", &b, message);
+                }
+            }
+        }
+        info!("[{:?}] get {} votes", &b, votes);
     }
 }
 
@@ -160,11 +216,12 @@ impl Raft for RaftImpl {
         req: ServerRequestSingle<VoteRequest>,
         sink: ServerResponseUnarySink<VoteResponse>,
     ) -> grpc::Result<()> {
+        let request = req.message;
         info!(
             "[{:?}] handling vote request: [{:?}]",
-            self.address, req.message
+            self.address, request
         );
-        let request = req.message;
+
         let mut state = self.state.lock().unwrap();
         let mut result = VoteResponse::new();
         result.set_term(state.term);
@@ -201,11 +258,12 @@ impl Raft for RaftImpl {
         req: ServerRequestSingle<AppendRequest>,
         sink: ServerResponseUnarySink<AppendResponse>,
     ) -> grpc::Result<()> {
-        info!(
-            "[{:?}] handling vote request: [{:?}]",
-            self.address, req.message
-        );
         let request = req.message;
+        info!(
+            "[{:?}] handling append request: [{:?}]",
+            self.address, request
+        );
+
         let mut state = self.state.lock().unwrap();
         let mut result = AppendResponse::new();
         result.set_term(state.term);
