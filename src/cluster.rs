@@ -12,10 +12,13 @@ use std::cmp::min;
 use std::sync::{Arc, Mutex};
 use timer::Guard;
 use timer::Timer;
+use futures::future::join_all;
 
 use grpc::ServerHandlerContext;
 use grpc::ServerRequestSingle;
 use grpc::ServerResponseUnarySink;
+use grpc::ClientStubExt;
+use grpc::GrpcFuture;
 
 use raft::AppendRequest;
 use raft::AppendResponse;
@@ -26,6 +29,7 @@ use raft::VoteRequest;
 use raft::VoteResponse;
 
 use raft_grpc::Raft;
+use raft_grpc::RaftClient;
 
 // Returns true if the supplied latest entry id is at least as
 // up-to-date as the supplied log.
@@ -43,6 +47,14 @@ fn is_up_to_date(last: &EntryId, log: &Vec<Entry>) -> bool {
     return last.get_index() >= log_last.get_index();
 }
 
+fn rpc_request_vote(server: &Server, request: &VoteRequest) -> GrpcFuture<VoteResponse> {
+    let client_conf = Default::default();
+    let client =
+        RaftClient::new_plain(server.get_host(), server.get_port() as u16, client_conf).unwrap();
+    client.vote(grpc::RequestOptions::new(), request.clone()).drop_metadata()
+}
+
+#[derive(PartialEq)]
 enum RaftRole {
     Follower,
     Candidate,
@@ -92,16 +104,52 @@ impl RaftImpl {
     }
 
     fn become_follower(&self, state: &mut RaftState) {
-        state.role = RaftRole::Follower;
         info!("[{:?}] becoming follower", self.address);
-
-        let address = self.address.clone();
+        state.role = RaftRole::Follower;
+        state.voted_for = None;
+        let a = self.address.clone();
         state.timer_guard = Some(state.timer.schedule_with_delay(
             chrono::Duration::seconds(3),
             move || {
-                info!("[{:?}] follower timeout", address);
+                info!("[{:?}] follower timeout", a);
+                //self.become_candidate();
             },
         ));
+    }
+
+    fn become_candidate(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.role != RaftRole::Follower {
+            // Stale callback, do nothing.
+            return;
+        }
+
+        info!("[{:?}] becoming candidate", self.address);
+        state.role = RaftRole::Candidate;
+        state.term = state.term + 1;
+        state.voted_for = Some(self.address.clone());
+
+        /*
+        state.timer_guard = Some(state.timer.schedule_with_delay(
+            chrono::Duration::seconds(3),
+            move || {
+                info!("[{:?}] election timed out, trying agin", self.address);
+                self.become_candidate();
+            },
+        ));
+        */
+
+        // TODO(dino): Send RequestVote rpcs to all other members.
+        let votes = 0;
+        let mut results = Vec::<GrpcFuture<VoteResponse>>::new();
+        let request = VoteRequest::new();
+        for server in &self.cluster {
+            if server == &self.address {
+                continue;
+            }
+            results.push(rpc_request_vote(&server, &request));
+        }
+        join_all(results);
     }
 }
 
