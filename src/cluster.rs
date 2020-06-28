@@ -11,8 +11,8 @@ use futures::executor;
 use futures::future::join_all;
 use log::info;
 use std::cmp::min;
-use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use timer::Guard;
 use timer::Timer;
 
@@ -47,23 +47,6 @@ fn is_up_to_date(last: &EntryId, log: &Vec<Entry>) -> bool {
 
     // Terms are equal, last index decides.
     return last.get_index() >= log_last.get_index();
-}
-
-fn rpc_request_vote_sync(source: &Server, address: &Server, request: &VoteRequest) {
-    let client_conf = Default::default();
-    let port = address.get_port() as u16;
-    info!(
-        ">>>>>>> Making sync vote rpc from [{:?}] to [{:?}]",
-        &source, &address
-    );
-    let client = RaftClient::new_plain(address.get_host(), port, client_conf).unwrap();
-    let response = client
-        .vote(grpc::RequestOptions::new(), request.clone())
-        .join_metadata_result();
-    info!(
-        ">>>>>>> Finished sync vote rpc, got response {:?}",
-        executor::block_on(response)
-    );
 }
 
 fn address_key(address: &Server) -> String {
@@ -175,12 +158,12 @@ impl RaftImpl {
             },
         ));
 
+        let source = state.address.clone();
+
         // Start an election and request votes from all servers.
         let mut results = Vec::<GrpcFuture<VoteResponse>>::new();
 
         let mut request = VoteRequest::new();
-        let source = state.address.clone();
-
         request.set_term(state.term);
         request.set_candidate(source.clone());
 
@@ -190,21 +173,19 @@ impl RaftImpl {
             }
 
             let client = state.get_client(&server);
-
-            // TODO: For debugging, remove.
-            // rpc_request_vote_sync(&source, &server, &request);
-
             info!("[{:?}] Making vote rpc to [{:?}]", &source, &server);
-            results.push(client
-                .vote(grpc::RequestOptions::new(), request.clone())
-                .drop_metadata());
+            results.push(
+                client
+                    .vote(grpc::RequestOptions::new(), request.clone())
+                    .drop_metadata(),
+            );
         }
+        let results = executor::block_on(join_all(results));
+        info!("[{:?}] Done waiting for results", &source);
 
-        /*
-        let result = executor::block_on(join_all(results));
         let mut votes = 0;
         let b = state.address.clone();
-        for r in result {
+        for r in results {
             match r {
                 Ok(message) => {
                     if message.get_granted() {
@@ -219,8 +200,7 @@ impl RaftImpl {
                 }
             }
         }
-        info!("[{:?}] get {} votes", &b, votes);
-        */
+        info!("[{:?}] got {} votes", &b, votes);
     }
 }
 
@@ -244,12 +224,17 @@ impl Raft for RaftImpl {
         result.set_term(state.term);
 
         if request.get_term() > state.term {
+            info!("[{:?}] request term higher than ours", self.address);
             self.become_follower(&mut state);
             result.set_granted(false);
             return sink.finish(result);
         }
 
         if state.term > request.get_term() {
+            info!(
+                "[{:?}] our term higher than incoming request term",
+                self.address
+            );
             result.set_granted(false);
             return sink.finish(result);
         }
@@ -258,18 +243,18 @@ impl Raft for RaftImpl {
         if candidate == state.voted_for.as_ref().unwrap_or(candidate) {
             if is_up_to_date(request.get_last(), &state.entries) {
                 state.voted_for = Some(candidate.clone());
+                info!("[{:?}] granted vote", self.address);
                 result.set_granted(true);
             } else {
+                info!("[{:?}] denied vote", self.address);
                 result.set_granted(false);
             }
             return sink.finish(result);
         }
 
+        info!("[{:?}] defaulting to false in vote request", self.address);
         result.set_granted(false);
-        let x = sink.finish(result);
-
-        info!("[{:?}] done processing vote request", self.address);
-        x
+        sink.finish(result)
     }
 
     fn append(
