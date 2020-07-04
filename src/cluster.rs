@@ -18,8 +18,8 @@ use grpc::ServerRequestSingle;
 use grpc::ServerResponseUnarySink;
 use log::info;
 use math::round::floor;
+use protobuf::RepeatedField;
 use rand::Rng;
-use std::cmp::min;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use timer::Guard;
@@ -55,6 +55,18 @@ fn address_key(address: &Server) -> String {
     format!("{}:{}", address.get_host(), address.get_port())
 }
 
+fn sentinel_entry_id() -> EntryId {
+    let mut result = EntryId::new();
+    result.set_term(-1);
+    result.set_index(-1);
+    return result;
+}
+
+struct FollowerPosition {
+    next_index: i64,
+    match_index: i64,
+}
+
 #[derive(PartialEq)]
 enum RaftRole {
     Follower,
@@ -72,6 +84,7 @@ struct RaftState {
     committed: i64,
     applied: i64,
     role: RaftRole,
+    followers: HashMap<String, FollowerPosition>,
 
     timer: Timer,
     timer_guard: Option<Guard>,
@@ -91,6 +104,76 @@ impl RaftState {
             RaftClient::new_plain(address.get_host(), port, client_conf).unwrap()
         })
     }
+
+    fn get_others(&self) -> Vec<Server> {
+        self.cluster
+            .clone()
+            .into_iter()
+            .filter(|server| server != &self.address)
+            .collect()
+    }
+
+    fn create_follower_positions(&self) -> HashMap<String, FollowerPosition> {
+        let mut result = HashMap::new();
+        for server in self.get_others() {
+            result.insert(
+                address_key(&server),
+                FollowerPosition {
+                    // Next log entry to send to the follower.
+                    next_index: self.entries.len() as i64,
+
+                    // Highest index known to be replicated on the follower.
+                    match_index: -1,
+                },
+            );
+        }
+        result
+    }
+
+    fn check_present(&self, entry_id: &EntryId) -> bool {
+        if entry_id == &sentinel_entry_id() {
+            return true;
+        }
+        match self.entries.get(entry_id.index as usize) {
+            None => false,
+            Some(entry) => entry.get_id().get_term() == entry_id.term,
+        }
+    }
+
+    // Returns all entries strictly after the supplied id.
+    fn get_entries_after(&self, entry_id: &EntryId) -> Vec<Entry> {
+        if entry_id == &sentinel_entry_id() {
+            return self.entries.clone();
+        }
+        let mut result = Vec::new();
+        let idx = entry_id.index as usize;
+        result.clone_from_slice(self.entries[idx..].as_ref());
+        result
+    }
+
+    // Returns the next append request to send to this follower. Must only be called
+    // while assuming the role of leader for the cluster.
+    fn create_append_request(&self, follower: &Server) -> AppendRequest {
+        // Construct the id of the last known index to be replicated on the follower.
+        let position = self.followers.get(address_key(&follower).as_str()).unwrap();
+        let previous = if position.next_index > 0 {
+            self.entries
+                .get(position.next_index as usize - 1)
+                .unwrap()
+                .get_id()
+                .clone()
+        } else {
+            sentinel_entry_id()
+        };
+
+        let mut request = AppendRequest::new();
+        request.set_term(self.term);
+        request.set_leader(self.address.clone());
+        request.set_previous(previous.clone());
+        request.set_entries(RepeatedField::from(self.get_entries_after(&previous)));
+        request.set_committed(self.committed);
+        request
+    }
 }
 
 pub struct RaftImpl {
@@ -109,6 +192,7 @@ impl RaftImpl {
                 committed: 0,
                 applied: 0,
                 role: RaftRole::Follower,
+                followers: HashMap::new(),
 
                 timer: Timer::new(),
                 timer_guard: None,
@@ -147,10 +231,13 @@ impl RaftImpl {
     fn become_candidate(arc_state: Arc<Mutex<RaftState>>) {
         let mut state = arc_state.lock().unwrap();
 
-        info!("[{:?}] Becoming candidate", state.address);
         state.role = RaftRole::Candidate;
         state.term = state.term + 1;
         state.voted_for = Some(state.address.clone());
+        info!(
+            "[{:?}] Becoming candidate for term {}",
+            state.address, state.term
+        );
 
         let s = arc_state.clone();
         let a = state.address.clone();
@@ -175,11 +262,7 @@ impl RaftImpl {
             .last()
             .map(|entry| request.set_last(entry.id.clone().unwrap()));
 
-        for server in state.cluster.clone() {
-            if server == state.address {
-                continue;
-            }
-
+        for server in state.get_others() {
             let client = state.get_client(&server);
             info!("[{:?}] Making vote rpc to [{:?}]", &source, &server);
             results.push(
@@ -197,33 +280,39 @@ impl RaftImpl {
 
         let mut votes = 0;
         let me = state.address.clone();
-        for r in &results {
-            match r {
+        for response in &results {
+            match response {
                 Ok(message) => {
+                    if message.get_term() > state.term {
+                        info!("[{:?}] Detected higher term {}", &me, message.get_term());
+                        state.term = message.get_term();
+                        RaftImpl::become_follower(&mut state, arc_state.clone());
+                        return;
+                    }
                     if message.get_granted() {
-                        info!("[{:?}] Got vote granted", &me);
                         votes = votes + 1;
-                    } else {
-                        info!("[{:?}] Got vote denied", &me);
                     }
                 }
-                Err(message) => {
-                    info!("[{:?}] Vote request: {:?}", &me, message);
-                }
+                Err(message) => info!("[{:?}] Vote request error: {:?}", &me, message),
             }
         }
 
-        info!("[{:?}] Got {} votes", &me, votes);
         let arc_state_copy = arc_state.clone();
         if votes > floor(results.len() as f64 / 2.0, 0) as i32 {
-            info!("[{:?}] Won election, becoming leader", &me);
+            info!(
+                "[{:?}] Won election with {} votes, becoming leader for term {}",
+                &me, votes, state.term
+            );
             state.role = RaftRole::Leader;
+            state.followers = state.create_follower_positions();
             state.timer_guard = Some(state.timer.schedule_with_delay(
                 chrono::Duration::milliseconds(500),
                 move || {
                     RaftImpl::replicate_entries(arc_state_copy.clone());
                 },
             ));
+        } else {
+            info!("[{:?}] Lost election with {} votes", &me, votes);
         }
     }
 
@@ -237,29 +326,40 @@ impl RaftImpl {
         }
 
         info!("[{:?}] Replicating entries", &state.address);
-
         let mut results = Vec::<GrpcFuture<AppendResponse>>::new();
-        let mut request = AppendRequest::new();
-        let source = state.address.clone();
-        request.set_term(state.term);
-        request.set_leader(source.clone());
-        for server in state.cluster.clone() {
-            if server == state.address {
-                continue;
-            }
-
+        for server in state.get_others() {
+            let request = state.create_append_request(&server);
             let client = state.get_client(&server);
-            info!("[{:?}] Making append rpc to [{:?}]", &source, &server);
             results.push(
                 client
-                    .append(grpc::RequestOptions::new(), request.clone())
+                    .append(grpc::RequestOptions::new(), request)
                     .drop_metadata(),
             );
         }
 
         // TODO(dino): Probably want to declare this async instead.
-        executor::block_on(join_all(results));
-
+        for result in executor::block_on(join_all(results)) {
+            match result {
+                Err(message) => info!("[{:?}] Append request failed: {}", &state.address, message),
+                Ok(message) => {
+                    if message.get_term() > state.term {
+                        info!(
+                            "[{:?}] Detected higher term {}",
+                            &state.address,
+                            message.get_term()
+                        );
+                        state.term = message.get_term();
+                        RaftImpl::become_follower(&mut state, arc_state.clone());
+                        return;
+                    }
+                    if message.get_success() {
+                        // TODO(dinow): Update next index and match index for follower
+                    } else {
+                        // TODO(dinow): Decrement next index for follower and try again
+                    }
+                }
+            }
+        }
         info!("[{:?}] Done replicating entries", &state.address);
 
         // Schedule the next run.
@@ -287,8 +387,6 @@ impl Raft for RaftImpl {
         );
 
         let mut state = self.state.lock().unwrap();
-        info!("[{:?}] Acquired lock in vote request", self.address);
-
         let mut result = VoteResponse::new();
         result.set_term(state.term);
 
@@ -312,11 +410,15 @@ impl Raft for RaftImpl {
                 result.set_granted(false);
             }
             return sink.finish(result);
+        } else {
+            info!(
+                "[{:?}] Rejecting, already voted for candidate [{:?}]",
+                self.address,
+                state.voted_for.as_ref()
+            );
+            result.set_granted(false);
+            sink.finish(result)
         }
-
-        info!("[{:?}] Defaulting to false in vote request", self.address);
-        result.set_granted(false);
-        sink.finish(result)
     }
 
     fn append(
@@ -347,14 +449,11 @@ impl Raft for RaftImpl {
         }
 
         // Make sure we have the previous log index sent.
-        let pindex = request.get_previous().get_index() as usize;
-        let pterm = request.get_previous().get_term();
-        if pindex >= state.entries.len() || state.entries[pindex].get_id().get_term() != pterm {
+        if !state.check_present(request.get_previous()) {
             result.set_success(false);
             return sink.finish(result);
         }
 
-        let mut last_written = state.entries.len() - 1;
         for entry in request.get_entries() {
             let index = entry.get_id().get_index() as usize;
             if index == state.entries.len() {
@@ -362,13 +461,16 @@ impl Raft for RaftImpl {
             } else {
                 state.entries[index] = entry.clone();
             }
-            last_written = index;
         }
-        state.entries.truncate(last_written + 1);
+        match request.get_entries().last() {
+            Some(entry) => state.entries.truncate(entry.get_id().index as usize + 1),
+            None => (),
+        }
 
         let leader_commit = request.get_committed();
         if leader_commit > state.committed {
-            state.committed = min(leader_commit, last_written as i64);
+            state.committed = leader_commit;
+            // TODO(dinow): Apply here?
         }
 
         // Reset the election timer
@@ -381,6 +483,8 @@ impl Raft for RaftImpl {
                 RaftImpl::become_candidate(s.clone());
             },
         ));
+
+        info!("[{:?}] Successfully processed heartbeat", &state.address);
 
         result.set_success(true);
         return sink.finish(result);
