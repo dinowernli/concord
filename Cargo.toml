@@ -14,6 +14,7 @@ env_logger = "0.7.1"
 timer = "0.2.0"
 chrono = "0.4.11"
 rand = "0.7.3"
+libmath = "0.2.1"
 
 [build-dependencies]
 protoc-rust-grpc = "0.8"

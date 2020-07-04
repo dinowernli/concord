@@ -1,4 +1,5 @@
 extern crate chrono;
+extern crate math;
 extern crate rand;
 extern crate timer;
 
@@ -16,7 +17,8 @@ use grpc::ServerHandlerContext;
 use grpc::ServerRequestSingle;
 use grpc::ServerResponseUnarySink;
 use log::info;
-use rand::{thread_rng, Rng};
+use math::round::floor;
+use rand::Rng;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -121,10 +123,10 @@ impl RaftImpl {
     pub fn start(&self) {
         let mut s = self.state.lock().unwrap();
         info!("[{:?}] Starting", s.address.clone());
-        self.become_follower(&mut s);
+        RaftImpl::become_follower(&mut s, self.state.clone());
     }
 
-    fn become_follower(&self, state: &mut RaftState) {
+    fn become_follower(state: &mut RaftState, arc_state: Arc<Mutex<RaftState>>) {
         info!("[{:?}] Becoming follower", state.address);
         state.role = RaftRole::Follower;
         state.voted_for = None;
@@ -132,13 +134,12 @@ impl RaftImpl {
         let mut rng = rand::thread_rng();
         let delay_ms = 2000 + rng.gen_range(1000, 2000);
 
-        let s = self.state.clone();
-        let a = state.address.clone();
+        let me = state.address.clone();
         state.timer_guard = Some(state.timer.schedule_with_delay(
             chrono::Duration::milliseconds(delay_ms),
             move || {
-                info!("[{:?}] Follower timeout", a);
-                RaftImpl::become_candidate(s.clone());
+                info!("[{:?}] Follower timeout", me);
+                RaftImpl::become_candidate(arc_state.clone());
             },
         ));
     }
@@ -169,6 +170,10 @@ impl RaftImpl {
         let mut request = VoteRequest::new();
         request.set_term(state.term);
         request.set_candidate(source.clone());
+        state
+            .entries
+            .last()
+            .map(|entry| request.set_last(entry.id.clone().unwrap()));
 
         for server in state.cluster.clone() {
             if server == state.address {
@@ -191,23 +196,80 @@ impl RaftImpl {
         info!("[{:?}] Done waiting for vote requests", &source);
 
         let mut votes = 0;
-        let b = state.address.clone();
-        for r in results {
+        let me = state.address.clone();
+        for r in &results {
             match r {
                 Ok(message) => {
                     if message.get_granted() {
-                        info!("[{:?}] Got vote granted", &b);
+                        info!("[{:?}] Got vote granted", &me);
                         votes = votes + 1;
                     } else {
-                        info!("[{:?}] Got vote denied", &b);
+                        info!("[{:?}] Got vote denied", &me);
                     }
                 }
                 Err(message) => {
-                    info!("[{:?}] Vote request: {:?}", &b, message);
+                    info!("[{:?}] Vote request: {:?}", &me, message);
                 }
             }
         }
-        info!("[{:?}] Got {} votes", &b, votes);
+
+        info!("[{:?}] Got {} votes", &me, votes);
+        let arc_state_copy = arc_state.clone();
+        if votes > floor(results.len() as f64 / 2.0, 0) as i32 {
+            info!("[{:?}] Won election, becoming leader", &me);
+            state.role = RaftRole::Leader;
+            state.timer_guard = Some(state.timer.schedule_with_delay(
+                chrono::Duration::milliseconds(500),
+                move || {
+                    RaftImpl::replicate_entries(arc_state_copy.clone());
+                },
+            ));
+        }
+    }
+
+    fn replicate_entries(arc_state: Arc<Mutex<RaftState>>) {
+        let mut state = arc_state.lock().unwrap();
+
+        if state.role != RaftRole::Leader {
+            info!("[{:?}] No longer leader", state.address);
+            RaftImpl::become_follower(&mut state, arc_state.clone());
+            return;
+        }
+
+        info!("[{:?}] Replicating entries", &state.address);
+
+        let mut results = Vec::<GrpcFuture<AppendResponse>>::new();
+        let mut request = AppendRequest::new();
+        let source = state.address.clone();
+        request.set_term(state.term);
+        request.set_leader(source.clone());
+        for server in state.cluster.clone() {
+            if server == state.address {
+                continue;
+            }
+
+            let client = state.get_client(&server);
+            info!("[{:?}] Making append rpc to [{:?}]", &source, &server);
+            results.push(
+                client
+                    .append(grpc::RequestOptions::new(), request.clone())
+                    .drop_metadata(),
+            );
+        }
+
+        // TODO(dino): Probably want to declare this async instead.
+        executor::block_on(join_all(results));
+
+        info!("[{:?}] Done replicating entries", &state.address);
+
+        // Schedule the next run.
+        let arc_state_copy = arc_state.clone();
+        state.timer_guard = Some(state.timer.schedule_with_delay(
+            chrono::Duration::milliseconds(500),
+            move || {
+                RaftImpl::replicate_entries(arc_state_copy.clone());
+            },
+        ));
     }
 }
 
@@ -274,7 +336,7 @@ impl Raft for RaftImpl {
         result.set_term(state.term);
 
         if request.get_term() > state.term {
-            self.become_follower(&mut state);
+            RaftImpl::become_follower(&mut state, self.state.clone());
             result.set_success(false);
             return sink.finish(result);
         }
@@ -308,6 +370,17 @@ impl Raft for RaftImpl {
         if leader_commit > state.committed {
             state.committed = min(leader_commit, last_written as i64);
         }
+
+        // Reset the election timer
+        let s = self.state.clone();
+        let a = state.address.clone();
+        state.timer_guard = Some(state.timer.schedule_with_delay(
+            chrono::Duration::seconds(3),
+            move || {
+                info!("[{:?}] Timed out waiting for leader heartbeat", &a);
+                RaftImpl::become_candidate(s.clone());
+            },
+        ));
 
         result.set_success(true);
         return sink.finish(result);
