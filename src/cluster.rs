@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use timer::Guard;
 use timer::Timer;
 
+use crate::cluster::raft::{CommitRequest, CommitResponse, Status};
 use raft::AppendRequest;
 use raft::AppendResponse;
 use raft::Entry;
@@ -34,6 +35,7 @@ use raft::VoteRequest;
 use raft::VoteResponse;
 use raft_grpc::Raft;
 use raft_grpc::RaftClient;
+use std::time;
 
 // Returns true if the supplied latest entry id is at least as
 // up-to-date as the supplied log.
@@ -63,7 +65,10 @@ fn sentinel_entry_id() -> EntryId {
 }
 
 struct FollowerPosition {
+    // Next log entry to send to the follower.
     next_index: i64,
+
+    // Highest index known to be replicated on the follower.
     match_index: i64,
 }
 
@@ -96,6 +101,7 @@ struct RaftState {
 }
 
 impl RaftState {
+    // Returns an rpc client which can be used to contact the supplied peer.
     fn get_client(&mut self, address: &Server) -> &mut RaftClient {
         let key = address_key(address);
         self.clients.entry(key).or_insert_with(|| {
@@ -105,6 +111,7 @@ impl RaftState {
         })
     }
 
+    // Returns the peers in the cluster (ourself excluded).
     fn get_others(&self) -> Vec<Server> {
         self.cluster
             .clone()
@@ -113,16 +120,15 @@ impl RaftState {
             .collect()
     }
 
+    // Returns a suitable initial map of follower positions. Meant to be called
+    // by a new leader initializing itself.
     fn create_follower_positions(&self) -> HashMap<String, FollowerPosition> {
         let mut result = HashMap::new();
         for server in self.get_others() {
             result.insert(
                 address_key(&server),
                 FollowerPosition {
-                    // Next log entry to send to the follower.
                     next_index: self.entries.len() as i64,
-
-                    // Highest index known to be replicated on the follower.
                     match_index: -1,
                 },
             );
@@ -130,7 +136,8 @@ impl RaftState {
         result
     }
 
-    fn check_present(&self, entry_id: &EntryId) -> bool {
+    // Returns whether or not the supplied entry id exists in the log.
+    fn has_entry(&self, entry_id: &EntryId) -> bool {
         if entry_id == &sentinel_entry_id() {
             return true;
         }
@@ -140,7 +147,8 @@ impl RaftState {
         }
     }
 
-    // Returns all entries strictly after the supplied id.
+    // Returns all entries strictly after the supplied id. Must only be called
+    // if the supplied entry id is present in the log.
     fn get_entries_after(&self, entry_id: &EntryId) -> Vec<Entry> {
         if entry_id == &sentinel_entry_id() {
             return self.entries.clone();
@@ -469,7 +477,7 @@ impl Raft for RaftImpl {
         }
 
         // Make sure we have the previous log index sent.
-        if !state.check_present(request.get_previous()) {
+        if !state.has_entry(request.get_previous()) {
             result.set_success(false);
             return sink.finish(result);
         }
@@ -508,5 +516,70 @@ impl Raft for RaftImpl {
 
         result.set_success(true);
         return sink.finish(result);
+    }
+
+    fn commit(
+        &self,
+        _: ServerHandlerContext,
+        req: ServerRequestSingle<CommitRequest>,
+        sink: ServerResponseUnarySink<CommitResponse>,
+    ) -> grpc::Result<()> {
+        let request = req.message;
+        info!("[{:?}] Handling commit request", self.address);
+
+        let mut state = self.state.lock().unwrap();
+        if state.role != RaftRole::Leader {
+            let mut result = CommitResponse::new();
+            result.set_status(Status::NOT_LEADER);
+            // TODO(dino): Track leader and add here.
+            return sink.finish(result);
+        }
+
+        let mut entry_id = EntryId::new();
+        entry_id.set_term(state.term);
+        entry_id.set_index(state.entries.len() as i64);
+
+        let mut entry = Entry::new();
+        entry.set_id(entry_id.clone());
+        entry.set_payload(request.payload);
+
+        state.entries.push(entry);
+
+        // Make sure the regular operations can continue while we wait.
+        drop(state);
+
+        // TODO(dino): Turn this into a more efficient future-based wait (or,
+        // even better, something entirely async).
+        loop {
+            let mut state = self.state.lock().unwrap();
+
+            // Even if we're no longer the leader, we may have managed to
+            // get the entry committed while we were. Let the state of the
+            // replicated log and commit state be the source of truth.
+            if state.committed >= entry_id.index {
+                let mut result = CommitResponse::new();
+                result.set_status(if state.has_entry(&entry_id) {
+                    Status::SUCCESS
+                } else {
+                    Status::NOT_LEADER
+                });
+                // TODO(dino): Track leader and add here.
+                return sink.finish(result);
+            }
+
+            // We know the log hasn't caught up. If the term has changed,
+            // chances are we the entry we appended earlier has been replaced
+            // by the new leader.
+            if state.term > entry_id.term {
+                let mut result = CommitResponse::new();
+                result.set_status(Status::NOT_LEADER);
+                // TODO(dino): Track leader and add here.
+                return sink.finish(result);
+            }
+
+            // Now we're still in the same term and we just haven't managed to
+            // commit the entry yet. Check again in the next iteration.
+            std::thread::sleep(time::Duration::from_millis(10));
+        }
     }
 }

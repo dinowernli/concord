@@ -1,3 +1,4 @@
+mod client;
 mod cluster;
 
 use cluster::raft;
