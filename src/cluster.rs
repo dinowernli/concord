@@ -211,7 +211,10 @@ impl RaftImpl {
     }
 
     fn become_follower(state: &mut RaftState, arc_state: Arc<Mutex<RaftState>>) {
-        info!("[{:?}] Becoming follower", state.address);
+        info!(
+            "[{:?}] Becoming follower for term {}",
+            state.address, state.term
+        );
         state.role = RaftRole::Follower;
         state.voted_for = None;
 
@@ -222,6 +225,7 @@ impl RaftImpl {
         state.timer_guard = Some(state.timer.schedule_with_delay(
             chrono::Duration::milliseconds(delay_ms),
             move || {
+                // TODO(dino): Only do this if we're still in the same term.
                 info!("[{:?}] Follower timeout", me);
                 RaftImpl::become_candidate(arc_state.clone());
             },
@@ -387,17 +391,30 @@ impl Raft for RaftImpl {
         );
 
         let mut state = self.state.lock().unwrap();
-        let mut result = VoteResponse::new();
-        result.set_term(state.term);
 
+        // Reject anything from an outdated term.
         if state.term > request.get_term() {
             info!(
-                "[{:?}] Our term higher than incoming request term",
-                self.address
+                "[{:?}] Our term {} is higher than incoming request term {}",
+                self.address,
+                state.term,
+                request.get_term(),
             );
+            let mut result = VoteResponse::new();
+            result.set_term(state.term);
             result.set_granted(false);
             return sink.finish(result);
         }
+
+        // If we're in an outdated term, we revert to follower in the new later
+        // term and may still grant the requesting candidate our vote.
+        if request.get_term() > state.term {
+            state.term = request.get_term();
+            RaftImpl::become_follower(&mut state, self.state.clone());
+        }
+
+        let mut result = VoteResponse::new();
+        result.set_term(state.term);
 
         let candidate = request.get_candidate();
         if candidate == state.voted_for.as_ref().unwrap_or(candidate) {
@@ -438,8 +455,11 @@ impl Raft for RaftImpl {
         result.set_term(state.term);
 
         if request.get_term() > state.term {
+            state.term = request.get_term();
             RaftImpl::become_follower(&mut state, self.state.clone());
+
             result.set_success(false);
+            result.set_term(state.term);
             return sink.finish(result);
         }
 
