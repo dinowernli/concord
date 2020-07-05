@@ -1,31 +1,57 @@
 use crate::cluster::raft;
 use crate::cluster::raft_grpc;
 
+use async_std::task;
+use grpc::ClientStubExt;
+use grpc::Error;
 use raft::CommitRequest;
-use raft::CommitResponse;
+use raft::EntryId;
 use raft::Server;
+use raft::Status;
+use raft_grpc::RaftClient;
+use std::time::Duration;
 
-struct Client {
-    // Holds all the peers forming the cluster.
-    cluster: Vec<Server>,
-
+pub struct Client {
     // Our current best guess as to who is the leader.
     leader: Server,
 }
 
 impl Client {
-    fn new(servers: &Vec<Server>) -> Client {
+    pub fn new(servers: &Vec<Server>) -> Client {
         Client {
-            cluster: servers.clone(),
             leader: servers.first().unwrap().clone(),
         }
     }
 
-    pub async fn commit(payload: &[u8]) {
+    // Adds the supplied payload as the next entry in the cluster's shared log.
+    // Returns once the payload has been added (or the operation has failed).
+    pub async fn commit(&mut self, payload: &[u8]) -> Result<EntryId, Error> {
         let mut request = CommitRequest::new();
         request.set_payload(Vec::from(payload));
 
-        // TODO(dino): Send request to current leader guess. If bad leader,
-        // update our guess and try again.
+        loop {
+            let client_conf = Default::default();
+            let address = self.leader.clone();
+            let port = address.get_port() as u16;
+            let client = RaftClient::new_plain(address.get_host(), port, client_conf)
+                .expect("Creating client");
+
+            let result = client
+                .commit(grpc::RequestOptions::new(), request.clone())
+                .drop_metadata()
+                .await;
+            match result {
+                Ok(message) => match message.get_status() {
+                    Status::SUCCESS => return Ok(message.get_entry_id().clone()),
+                    Status::NOT_LEADER => {
+                        if message.has_leader() {
+                            self.leader = message.get_leader().clone();
+                        }
+                    }
+                },
+                Err(message) => return Err(message),
+            }
+            task::sleep(Duration::from_secs(1)).await;
+        }
     }
 }

@@ -1,15 +1,18 @@
 mod client;
 mod cluster;
 
+use client::Client;
 use cluster::raft;
 use cluster::raft_grpc;
 use cluster::RaftImpl;
 use raft::Server;
 use raft_grpc::RaftServer;
 
+use async_std::task;
 use env_logger::Env;
+use futures::executor;
 use log::info;
-use std::thread;
+use std::time::Duration;
 
 fn server(host: &str, port: i32) -> Server {
     let mut result = Server::new();
@@ -28,6 +31,24 @@ fn start_node(address: &Server, all: &Vec<Server>) -> grpc::Server {
     server_builder.build().expect("server")
 }
 
+async fn run_commit_loop(cluster: &Vec<Server>) {
+    let mut client = Client::new(cluster);
+    let mut sequence_number = 1;
+    loop {
+        let payload = format!("Payload number: {}", sequence_number);
+        match client.commit(payload.as_bytes()).await {
+            Ok(id) => {
+                info!("Committed payload {} with id {:?}", sequence_number, &id);
+                sequence_number = sequence_number + 1;
+            }
+            Err(message) => {
+                info!("Failed to commit payload: {}", message);
+            }
+        }
+        task::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 fn main() {
     env_logger::from_env(Env::default().default_filter_or("concord=info")).init();
 
@@ -43,7 +64,5 @@ fn main() {
         servers.push(start_node(&address, &addresses));
     }
 
-    loop {
-        thread::park();
-    }
+    executor::block_on(run_commit_loop(&addresses));
 }

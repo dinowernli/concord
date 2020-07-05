@@ -91,7 +91,8 @@ message CommitResponse {
   // Status of the requested commit operation.
   Status status = 1;
 
-  // The current leader of the raft cluster.
+  // The last known leader of the raft cluster. Not populated if the cluster
+  // has never had a leader.
   Server leader = 2;
 
   // The id of the committed entry. Only populated if status is SUCCESS.

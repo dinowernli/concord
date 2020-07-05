@@ -25,7 +25,6 @@ use std::sync::{Arc, Mutex};
 use timer::Guard;
 use timer::Timer;
 
-use crate::cluster::raft::{CommitRequest, CommitResponse, Status};
 use raft::AppendRequest;
 use raft::AppendResponse;
 use raft::Entry;
@@ -33,6 +32,7 @@ use raft::EntryId;
 use raft::Server;
 use raft::VoteRequest;
 use raft::VoteResponse;
+use raft::{CommitRequest, CommitResponse, Status};
 use raft_grpc::Raft;
 use raft_grpc::RaftClient;
 use std::time;
@@ -98,6 +98,7 @@ struct RaftState {
     address: Server,
     cluster: Vec<Server>,
     clients: HashMap<String, RaftClient>,
+    last_known_leader: Option<Server>,
 }
 
 impl RaftState {
@@ -208,6 +209,7 @@ impl RaftImpl {
                 address: server.clone(),
                 cluster: all.clone(),
                 clients: HashMap::new(),
+                last_known_leader: None,
             })),
         }
     }
@@ -476,6 +478,8 @@ impl Raft for RaftImpl {
             return sink.finish(result);
         }
 
+        state.last_known_leader = Some(request.get_leader().clone());
+
         // Make sure we have the previous log index sent.
         if !state.has_entry(request.get_previous()) {
             result.set_success(false);
@@ -531,7 +535,10 @@ impl Raft for RaftImpl {
         if state.role != RaftRole::Leader {
             let mut result = CommitResponse::new();
             result.set_status(Status::NOT_LEADER);
-            // TODO(dino): Track leader and add here.
+            state
+                .last_known_leader
+                .as_ref()
+                .map(|l| result.set_leader(l.clone()));
             return sink.finish(result);
         }
 
@@ -551,19 +558,23 @@ impl Raft for RaftImpl {
         // TODO(dino): Turn this into a more efficient future-based wait (or,
         // even better, something entirely async).
         loop {
-            let mut state = self.state.lock().unwrap();
+            let state = self.state.lock().unwrap();
 
             // Even if we're no longer the leader, we may have managed to
             // get the entry committed while we were. Let the state of the
             // replicated log and commit state be the source of truth.
             if state.committed >= entry_id.index {
                 let mut result = CommitResponse::new();
-                result.set_status(if state.has_entry(&entry_id) {
-                    Status::SUCCESS
+                state
+                    .last_known_leader
+                    .as_ref()
+                    .map(|l| result.set_leader(l.clone()));
+                if state.has_entry(&entry_id) {
+                    result.set_entry_id(entry_id.clone());
+                    result.set_status(Status::SUCCESS);
                 } else {
-                    Status::NOT_LEADER
-                });
-                // TODO(dino): Track leader and add here.
+                    result.set_status(Status::NOT_LEADER);
+                }
                 return sink.finish(result);
             }
 
@@ -573,7 +584,10 @@ impl Raft for RaftImpl {
             if state.term > entry_id.term {
                 let mut result = CommitResponse::new();
                 result.set_status(Status::NOT_LEADER);
-                // TODO(dino): Track leader and add here.
+                state
+                    .last_known_leader
+                    .as_ref()
+                    .map(|l| result.set_leader(l.clone()));
                 return sink.finish(result);
             }
 
