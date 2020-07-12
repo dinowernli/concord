@@ -282,6 +282,21 @@ impl RaftState {
         });
         request
     }
+
+    // Adds a new entry to the end of the log. Meant to be called by leaders
+    // when processing requests to commit new payloads.
+    fn append_entry(&mut self, payload: Vec<u8>) -> EntryId {
+        let mut entry_id = EntryId::new();
+        entry_id.set_term(self.term);
+        entry_id.set_index(self.entries.len() as i64);
+
+        let mut entry = Entry::new();
+        entry.set_id(entry_id.clone());
+        entry.set_payload(payload);
+
+        self.entries.push(entry);
+        entry_id
+    }
 }
 
 pub struct RaftImpl {
@@ -631,22 +646,14 @@ impl Raft for RaftImpl {
         if state.role != RaftRole::Leader {
             let mut result = CommitResponse::new();
             result.set_status(Status::NOT_LEADER);
-            state
-                .last_known_leader
-                .as_ref()
-                .map(|l| result.set_leader(l.clone()));
+            match &state.last_known_leader {
+                None => (),
+                Some(l) => result.set_leader(l.clone()),
+            }
             return sink.finish(result);
         }
 
-        let mut entry_id = EntryId::new();
-        entry_id.set_term(state.term);
-        entry_id.set_index(state.entries.len() as i64);
-
-        let mut entry = Entry::new();
-        entry.set_id(entry_id.clone());
-        entry.set_payload(request.payload);
-
-        state.entries.push(entry);
+        let entry_id = state.append_entry(request.payload);
 
         // Make sure the regular operations can continue while we wait.
         drop(state);
