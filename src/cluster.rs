@@ -381,13 +381,10 @@ impl RaftImpl {
         state.timer_guard = Some(state.timer.schedule_with_delay(
             chrono::Duration::milliseconds(add_jitter(FOLLOWER_TIMEOUTS_MS)),
             move || {
-                let state = arc_state.lock().unwrap();
-                if state.term > term {
+                if arc_state.lock().unwrap().term > term {
                     // We've moved on, ignore this callback.
                     return;
                 }
-                drop(state);
-
                 info!("[{:?}] Follower timeout in term {}", me, term);
                 RaftImpl::become_candidate(arc_state.clone());
             },
