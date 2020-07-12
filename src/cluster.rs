@@ -422,8 +422,9 @@ impl RaftImpl {
         let mut results = Vec::<GrpcFuture<VoteResponse>>::new();
         {
             let mut state = arc_state.lock().unwrap();
-            if state.term > term {
-                // We've moved on, ignore this.
+
+            // The world has moved on or someone else has won in this term.
+            if state.term > term || state.role != RaftRole::Candidate {
                 return true;
             }
 
@@ -448,8 +449,8 @@ impl RaftImpl {
             let me = state.address.clone();
             debug!("[{:?}] Done waiting for vote requests", &me);
 
-            if state.term > term {
-                // The world has moved on, don't bother processing results.
+            // The world has moved on or someone else has won in this term.
+            if state.term > term || state.role != RaftRole::Candidate {
                 return true;
             }
 
