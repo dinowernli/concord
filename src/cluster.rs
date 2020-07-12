@@ -394,23 +394,9 @@ impl RaftImpl {
     // Keeps running elections until either the term changes, a leader has emerged,
     // or an own election has been won.
     async fn election_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        {
-            let mut state = arc_state.lock().unwrap();
-            if state.term > term {
-                return;
-            }
-            state.role = RaftRole::Candidate;
-            state.term = term;
-            state.timer_guard = None;
-            state.voted_for = Some(state.address.clone());
-            info!("[{:?}] Becoming candidate for term {}", state.address, term);
-        }
-
-        loop {
-            let done = RaftImpl::run_election(arc_state.clone(), term).await;
-            if done {
-                return;
-            }
+        let mut term = term;
+        while !RaftImpl::run_election(arc_state.clone(), term).await {
+            term = term + 1;
             let sleep_ms = add_jitter(CANDIDATE_TIMEOUT_MS) as u64;
             task::sleep(Duration::from_millis(sleep_ms)).await;
         }
@@ -423,12 +409,19 @@ impl RaftImpl {
         {
             let mut state = arc_state.lock().unwrap();
 
-            // The world has moved on or someone else has won in this term.
-            if state.term > term || state.role != RaftRole::Candidate {
+            // The world has moved on.
+            if state.term > term {
                 return true;
             }
 
-            // Start an election and request votes from all servers.
+            // Prepare the election.
+            info!("[{:?}] Starting election for term {}", state.address, term);
+            state.role = RaftRole::Candidate;
+            state.term = term;
+            state.timer_guard = None;
+            state.voted_for = Some(state.address.clone());
+
+            // Request votes from all peer.
             let me = state.address.clone();
             let request = state.create_vote_request();
             for server in state.get_others() {
