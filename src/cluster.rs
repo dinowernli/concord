@@ -36,6 +36,20 @@ use raft_grpc::Raft;
 use raft_grpc::RaftClient;
 use std::time;
 
+// Timeout after which a server in follower state starts a new election.
+const FOLLOWER_TIMEOUTS_MS: i64 = 2000;
+
+// Timeout after which a server in candidate state declares its candidacy a
+// failure and starts a new election.
+const CANDIDATE_TIMEOUT_MS: i64 = 3000;
+
+// Returns a value no lower than the supplied bound, with some additive jitter.
+fn add_jitter(lower: i64) -> i64 {
+    let mut rng = rand::thread_rng();
+    let upper = (lower as f64 * 1.3) as i64;
+    rng.gen_range(lower, upper)
+}
+
 // Returns true if the supplied latest entry id is at least as
 // up-to-date as the supplied log.
 fn is_up_to_date(last: &EntryId, log: &Vec<Entry>) -> bool {
@@ -185,6 +199,89 @@ impl RaftState {
         request.set_committed(self.committed);
         request
     }
+
+    // Incorporates the provided response corresponding to the supplied request.
+    // Must only be called for responses with a valid term.
+    fn handle_append_response(
+        &mut self,
+        peer: &Server,
+        response: &AppendResponse,
+        request: &AppendRequest,
+    ) {
+        let follower = self.followers.get_mut(address_key(&peer).as_str());
+        if follower.is_none() {
+            info!(
+                "[{:?}] Ignoring append response for unknown peer {:?}",
+                &self.address, &peer
+            );
+            return;
+        }
+
+        let f = follower.unwrap();
+        if !response.get_success() {
+            // The follower has rejected our entries, presumably because they could
+            // not find the entry we sent as "previous". We repeatedly reduce the
+            // "next" index until we hit a "previous" entry present on the follower.
+            f.next_index = f.next_index - 1;
+            info!(
+                "[{:?}] Decremented follower next_index for peer {:?} to {}",
+                &self.address, &peer, f.next_index
+            );
+            return;
+        }
+
+        // The follower has appended our entries. The next index we wish to
+        // send them is the one immediately after the last one we sent.
+        match request.get_entries().last() {
+            Some(e) => {
+                f.next_index = e.get_id().get_index() + 1;
+                f.match_index = e.get_id().get_index();
+                info!(
+                    "[{:?}] Updated follower state for peer {:?} to {:?}",
+                    &self.address, &peer, &f
+                );
+            }
+            None => (),
+        }
+    }
+
+    // Scans the state of our followers in the hope of finding a new index which
+    // has been replicated to a majority. If such an index is found, this updates
+    // the index this leader considers committed.
+    fn update_committed(&mut self) {
+        let saved_committed = self.committed;
+        for index in self.committed + 1..self.entries.len() as i64 {
+            let mut matches = 1; // We match.
+            for (_, follower) in &self.followers {
+                if follower.match_index >= index {
+                    matches = matches + 1;
+                }
+            }
+
+            if 2 * matches > self.cluster.len() {
+                self.committed = index;
+            }
+        }
+        if self.committed != saved_committed {
+            info!(
+                "[{:?}] Updated committed index from {} to {}",
+                &self.address, saved_committed, self.committed
+            );
+        }
+    }
+
+    // Returns a request which a candidate can send in order to request the vote
+    // of peer servers in an election.
+    fn create_vote_request(&self) -> VoteRequest {
+        let mut request = VoteRequest::new();
+        request.set_term(self.term);
+        request.set_candidate(self.address.clone());
+        request.set_last(match self.entries.last() {
+            Some(e) => e.get_id().clone(),
+            None => sentinel_entry_id(),
+        });
+        request
+    }
 }
 
 pub struct RaftImpl {
@@ -218,27 +315,28 @@ impl RaftImpl {
 
     pub fn start(&self) {
         let mut s = self.state.lock().unwrap();
-        info!("[{:?}] Starting", s.address.clone());
+        info!("[{:?}] Starting", &self.address);
         RaftImpl::become_follower(&mut s, self.state.clone());
     }
 
     fn become_follower(state: &mut RaftState, arc_state: Arc<Mutex<RaftState>>) {
-        info!(
-            "[{:?}] Becoming follower for term {}",
-            state.address, state.term
-        );
+        let me = state.address.clone();
+        let term = state.term;
+        info!("[{:?}] Becoming follower for term {}", &me, term);
+
         state.role = RaftRole::Follower;
         state.voted_for = None;
-
-        let mut rng = rand::thread_rng();
-        let delay_ms = 2000 + rng.gen_range(1000, 2000);
-
-        let me = state.address.clone();
         state.timer_guard = Some(state.timer.schedule_with_delay(
-            chrono::Duration::milliseconds(delay_ms),
+            chrono::Duration::milliseconds(add_jitter(FOLLOWER_TIMEOUTS_MS)),
             move || {
-                // TODO(dino): Only do this if we're still in the same term.
-                info!("[{:?}] Follower timeout", me);
+                let state = arc_state.lock().unwrap();
+                if state.term > term {
+                    // We've moved on, ignore this callback.
+                    return;
+                }
+                drop(state);
+
+                info!("[{:?}] Follower timeout in term {}", me, term);
                 RaftImpl::become_candidate(arc_state.clone());
             },
         ));
@@ -258,29 +356,21 @@ impl RaftImpl {
         let s = arc_state.clone();
         let a = state.address.clone();
         state.timer_guard = Some(state.timer.schedule_with_delay(
-            chrono::Duration::seconds(3),
+            chrono::Duration::milliseconds(add_jitter(CANDIDATE_TIMEOUT_MS)),
             move || {
                 info!("[{:?}] Election timed out, trying again", &a);
                 RaftImpl::become_candidate(s.clone());
             },
         ));
 
-        let source = state.address.clone();
+        let me = state.address.clone();
 
         // Start an election and request votes from all servers.
+        let request = state.create_vote_request();
         let mut results = Vec::<GrpcFuture<VoteResponse>>::new();
-
-        let mut request = VoteRequest::new();
-        request.set_term(state.term);
-        request.set_candidate(source.clone());
-        state
-            .entries
-            .last()
-            .map(|entry| request.set_last(entry.id.clone().unwrap()));
-
         for server in state.get_others() {
             let client = state.get_client(&server);
-            info!("[{:?}] Making vote rpc to [{:?}]", &source, &server);
+            info!("[{:?}] Making vote rpc to [{:?}]", &me, &server);
             results.push(
                 client
                     .vote(grpc::RequestOptions::new(), request.clone())
@@ -292,10 +382,9 @@ impl RaftImpl {
         // to lock up. Probably want to declare this whole method async and make
         // sure nothing anywhere needs to block.
         let results = executor::block_on(join_all(results));
-        info!("[{:?}] Done waiting for vote requests", &source);
+        info!("[{:?}] Done waiting for vote requests", &me);
 
         let mut votes = 1; // Here we count our own vote for ourselves.
-        let me = state.address.clone();
         for response in &results {
             match response {
                 Ok(message) => {
@@ -375,61 +464,12 @@ impl RaftImpl {
                         RaftImpl::become_follower(&mut state, arc_state.clone());
                         return;
                     }
-
-                    let me = state.address.clone();
-                    let follower = state.followers.get_mut(address_key(&peer).as_str());
-                    if follower.is_some() {
-                        let f = follower.unwrap();
-                        if response.get_success() {
-                            // The follower has appended our entries. The next index we wish to
-                            // send them is the one immediately after the last one we sent.
-                            match request.get_entries().last() {
-                                Some(e) => {
-                                    f.next_index = e.get_id().get_index() + 1;
-                                    f.match_index = e.get_id().get_index();
-                                    info!(
-                                        "[{:?}] Updated follower state for peer {:?} to {:?}",
-                                        &me, &peer, f
-                                    );
-                                }
-                                None => (),
-                            }
-                        } else {
-                            // The follower has rejected our entries, presumably because they could
-                            // not find the entry we sent as "previous". We repeatedly reduce the
-                            // "next" index until we hit a "previous" entry present on the follower.
-                            f.next_index = f.next_index - 1;
-                            info!(
-                                "[{:?}] Decremented follower next_index for peer {:?} to {}",
-                                &me, &peer, f.next_index
-                            );
-                        }
-                    }
+                    state.handle_append_response(&peer, &response, &request);
                 }
             }
         }
 
-        // Next, we check if we can increment our committed index.
-        let saved_committed = state.committed;
-        for index in state.committed + 1..state.entries.len() as i64 {
-            let mut matches = 1; // We match.
-            for (_, follower) in &state.followers {
-                if follower.match_index >= index {
-                    matches = matches + 1;
-                }
-            }
-
-            if 2 * matches > state.cluster.len() {
-                state.committed = index;
-            }
-        }
-        if state.committed != saved_committed {
-            info!(
-                "[{:?}] Updated committed index from {} to {}",
-                &state.address, saved_committed, state.committed
-            );
-        }
-
+        state.update_committed();
         info!("[{:?}] Done replicating entries", &state.address);
 
         // Schedule the next run.
