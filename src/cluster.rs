@@ -9,15 +9,14 @@ pub mod raft;
 #[path = "generated/raft_grpc.rs"]
 pub mod raft_grpc;
 
-use futures::executor;
 use futures::future::join_all;
+use futures::{executor, TryFutureExt};
 use grpc::ClientStubExt;
 use grpc::GrpcFuture;
 use grpc::ServerHandlerContext;
 use grpc::ServerRequestSingle;
 use grpc::ServerResponseUnarySink;
 use log::info;
-use math::round::floor;
 use protobuf::RepeatedField;
 use rand::Rng;
 use std::collections::HashMap;
@@ -64,6 +63,7 @@ fn sentinel_entry_id() -> EntryId {
     return result;
 }
 
+#[derive(Debug)]
 struct FollowerPosition {
     // Next log entry to send to the follower.
     next_index: i64,
@@ -156,7 +156,9 @@ impl RaftState {
         }
         let mut result = Vec::new();
         let idx = entry_id.index as usize;
-        result.clone_from_slice(self.entries[idx..].as_ref());
+        for value in self.entries[idx..].iter() {
+            result.push(value.clone());
+        }
         result
     }
 
@@ -292,7 +294,7 @@ impl RaftImpl {
         let results = executor::block_on(join_all(results));
         info!("[{:?}] Done waiting for vote requests", &source);
 
-        let mut votes = 0;
+        let mut votes = 1; // Here we count our own vote for ourselves.
         let me = state.address.clone();
         for response in &results {
             match response {
@@ -312,7 +314,7 @@ impl RaftImpl {
         }
 
         let arc_state_copy = arc_state.clone();
-        if votes > floor(results.len() as f64 / 2.0, 0) as i32 {
+        if 2 * votes > state.cluster.len() {
             info!(
                 "[{:?}] Won election with {} votes, becoming leader for term {}",
                 &me, votes, state.term
@@ -340,40 +342,94 @@ impl RaftImpl {
         }
 
         info!("[{:?}] Replicating entries", &state.address);
-        let mut results = Vec::<GrpcFuture<AppendResponse>>::new();
+        let mut results = Vec::<GrpcFuture<(Server, AppendRequest, AppendResponse)>>::new();
         for server in state.get_others() {
             let request = state.create_append_request(&server);
             let client = state.get_client(&server);
-            results.push(
-                client
-                    .append(grpc::RequestOptions::new(), request)
-                    .drop_metadata(),
-            );
+            let s = server.clone();
+            let fut = client
+                .append(grpc::RequestOptions::new(), request.clone())
+                .drop_metadata()
+                .map_ok(move |result| (s.clone(), request.clone(), result));
+            results.push(Box::pin(fut));
         }
 
         // TODO(dino): Probably want to declare this async instead.
-        for result in executor::block_on(join_all(results)) {
+        let results = executor::block_on(join_all(results));
+
+        for result in results {
             match result {
-                Err(message) => info!("[{:?}] Append request failed: {}", &state.address, message),
-                Ok(message) => {
-                    if message.get_term() > state.term {
+                Err(message) => info!(
+                    "[{:?}] Append request failed, error: {}",
+                    &state.address, message
+                ),
+                Ok((peer, request, response)) => {
+                    if response.get_term() > state.term {
                         info!(
-                            "[{:?}] Detected higher term {}",
+                            "[{:?}] Detected higher term {} from peer {:?}",
                             &state.address,
-                            message.get_term()
+                            response.get_term(),
+                            &peer,
                         );
-                        state.term = message.get_term();
+                        state.term = response.get_term();
                         RaftImpl::become_follower(&mut state, arc_state.clone());
                         return;
                     }
-                    if message.get_success() {
-                        // TODO(dinow): Update next index and match index for follower
-                    } else {
-                        // TODO(dinow): Decrement next index for follower and try again
+
+                    let me = state.address.clone();
+                    let follower = state.followers.get_mut(address_key(&peer).as_str());
+                    if follower.is_some() {
+                        let f = follower.unwrap();
+                        if response.get_success() {
+                            // The follower has appended our entries. The next index we wish to
+                            // send them is the one immediately after the last one we sent.
+                            match request.get_entries().last() {
+                                Some(e) => {
+                                    f.next_index = e.get_id().get_index() + 1;
+                                    f.match_index = e.get_id().get_index();
+                                    info!(
+                                        "[{:?}] Updated follower state for peer {:?} to {:?}",
+                                        &me, &peer, f
+                                    );
+                                }
+                                None => (),
+                            }
+                        } else {
+                            // The follower has rejected our entries, presumably because they could
+                            // not find the entry we sent as "previous". We repeatedly reduce the
+                            // "next" index until we hit a "previous" entry present on the follower.
+                            f.next_index = f.next_index - 1;
+                            info!(
+                                "[{:?}] Decremented follower next_index for peer {:?} to {}",
+                                &me, &peer, f.next_index
+                            );
+                        }
                     }
                 }
             }
         }
+
+        // Next, we check if we can increment our committed index.
+        let saved_committed = state.committed;
+        for index in state.committed + 1..state.entries.len() as i64 {
+            let mut matches = 1; // We match.
+            for (_, follower) in &state.followers {
+                if follower.match_index >= index {
+                    matches = matches + 1;
+                }
+            }
+
+            if 2 * matches > state.cluster.len() {
+                state.committed = index;
+            }
+        }
+        if state.committed != saved_committed {
+            info!(
+                "[{:?}] Updated committed index from {} to {}",
+                &state.address, saved_committed, state.committed
+            );
+        }
+
         info!("[{:?}] Done replicating entries", &state.address);
 
         // Schedule the next run.
