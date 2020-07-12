@@ -11,7 +11,7 @@ pub mod raft_grpc;
 
 use async_std::task;
 use futures::future::join_all;
-use futures::{executor, TryFutureExt};
+use futures::TryFutureExt;
 use grpc::ClientStubExt;
 use grpc::GrpcFuture;
 use grpc::ServerHandlerContext;
@@ -381,94 +381,116 @@ impl RaftImpl {
         state.timer_guard = Some(state.timer.schedule_with_delay(
             chrono::Duration::milliseconds(add_jitter(FOLLOWER_TIMEOUTS_MS)),
             move || {
-                if arc_state.lock().unwrap().term > term {
-                    // We've moved on, ignore this callback.
-                    return;
-                }
-                info!("[{:?}] Follower timeout in term {}", me, term);
-                RaftImpl::become_candidate(arc_state.clone());
+                let arc_state = arc_state.clone();
+                let me = me.clone();
+                task::spawn(async move {
+                    info!("[{:?}] Follower timeout in term {}", me, term);
+                    RaftImpl::election_loop(arc_state.clone(), term + 1).await;
+                });
             },
         ));
     }
 
-    fn become_candidate(arc_state: Arc<Mutex<RaftState>>) {
-        let mut state = arc_state.lock().unwrap();
-
-        state.role = RaftRole::Candidate;
-        state.term = state.term + 1;
-        state.voted_for = Some(state.address.clone());
-        info!(
-            "[{:?}] Becoming candidate for term {}",
-            state.address, state.term
-        );
-
-        let s = arc_state.clone();
-        let a = state.address.clone();
-        state.timer_guard = Some(state.timer.schedule_with_delay(
-            chrono::Duration::milliseconds(add_jitter(CANDIDATE_TIMEOUT_MS)),
-            move || {
-                info!("[{:?}] Election timed out, trying again", &a);
-                RaftImpl::become_candidate(s.clone());
-            },
-        ));
-
-        let me = state.address.clone();
-
-        // Start an election and request votes from all servers.
-        let request = state.create_vote_request();
-        let term = request.term;
-        let mut results = Vec::<GrpcFuture<VoteResponse>>::new();
-        for server in state.get_others() {
-            let client = state.get_client(&server);
-            info!("[{:?}] Making vote rpc to [{:?}]", &me, &server);
-            results.push(
-                client
-                    .vote(grpc::RequestOptions::new(), request.clone())
-                    .drop_metadata(),
-            );
+    // Keeps running elections until either the term changes, a leader has emerged,
+    // or an own election has been won.
+    async fn election_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
+        {
+            let mut state = arc_state.lock().unwrap();
+            if state.term > term {
+                return;
+            }
+            state.role = RaftRole::Candidate;
+            state.term = term;
+            state.timer_guard = None;
+            state.voted_for = Some(state.address.clone());
+            info!("[{:?}] Becoming candidate for term {}", state.address, term);
         }
 
-        // TODO(dino): This blocking call is problematic, and can cause everything
-        // to lock up. Probably want to declare this whole method async and make
-        // sure nothing anywhere needs to block.
-        let results = executor::block_on(join_all(results));
-        info!("[{:?}] Done waiting for vote requests", &me);
+        loop {
+            let done = RaftImpl::run_election(arc_state.clone(), term).await;
+            if done {
+                return;
+            }
+            let sleep_ms = add_jitter(CANDIDATE_TIMEOUT_MS) as u64;
+            task::sleep(Duration::from_millis(sleep_ms)).await;
+        }
+    }
 
-        let mut votes = 1; // Here we count our own vote for ourselves.
-        for response in &results {
-            match response {
-                Ok(message) => {
-                    if message.get_term() > term {
-                        info!("[{:?}] Detected higher term {}", &me, message.get_term());
-                        RaftImpl::become_follower(
-                            &mut state,
-                            arc_state.clone(),
-                            message.get_term(),
-                        );
-                        return;
-                    }
-                    if message.get_granted() {
-                        votes = votes + 1;
-                    }
-                }
-                Err(message) => info!("[{:?}] Vote request error: {:?}", &me, message),
+    // Returns whether or not the election process is deemed complete. If complete,
+    // there is no need to run any further elections.
+    async fn run_election(arc_state: Arc<Mutex<RaftState>>, term: i64) -> bool {
+        let mut results = Vec::<GrpcFuture<VoteResponse>>::new();
+        {
+            let mut state = arc_state.lock().unwrap();
+            if state.term > term {
+                // We've moved on, ignore this.
+                return true;
+            }
+
+            // Start an election and request votes from all servers.
+            let me = state.address.clone();
+            let request = state.create_vote_request();
+            for server in state.get_others() {
+                let client = state.get_client(&server);
+                debug!("[{:?}] Making vote rpc to [{:?}]", &me, &server);
+                results.push(
+                    client
+                        .vote(grpc::RequestOptions::new(), request.clone())
+                        .drop_metadata(),
+                );
             }
         }
 
-        let arc_state_copy = arc_state.clone();
-        if 2 * votes > state.cluster.len() {
-            info!(
-                "[{:?}] Won election with {} votes, becoming leader for term {}",
-                &me, votes, term
-            );
-            state.role = RaftRole::Leader;
-            state.followers = state.create_follower_positions();
-            state.timer_guard = None;
-            task::spawn(async move {
-                RaftImpl::replicate_loop(arc_state_copy.clone(), term).await;
-            });
-        } else {
-            info!("[{:?}] Lost election with {} votes", &me, votes);
+        let results = join_all(results).await;
+
+        {
+            let mut state = arc_state.lock().unwrap();
+            let me = state.address.clone();
+            debug!("[{:?}] Done waiting for vote requests", &me);
+
+            if state.term > term {
+                // The world has moved on, don't bother processing results.
+                return true;
+            }
+
+            let mut votes = 1; // Here we count our own vote for ourselves.
+            for response in &results {
+                match response {
+                    Ok(message) => {
+                        if message.get_term() > term {
+                            info!("[{:?}] Detected higher term {}", &me, message.get_term());
+                            RaftImpl::become_follower(
+                                &mut state,
+                                arc_state.clone(),
+                                message.get_term(),
+                            );
+                            return true;
+                        }
+                        if message.get_granted() {
+                            votes = votes + 1;
+                        }
+                    }
+                    Err(message) => info!("[{:?}] Vote request error: {:?}", &me, message),
+                }
+            }
+
+            let arc_state_copy = arc_state.clone();
+            return if 2 * votes > state.cluster.len() {
+                info!(
+                    "[{:?}] Won election with {} votes, becoming leader for term {}",
+                    &me, votes, term
+                );
+                state.role = RaftRole::Leader;
+                state.followers = state.create_follower_positions();
+                state.timer_guard = None;
+                task::spawn(async move {
+                    RaftImpl::replicate_loop(arc_state_copy.clone(), term).await;
+                });
+                true
+            } else {
+                info!("[{:?}] Lost election with {} votes", &me, votes);
+                false
+            };
         }
     }
 
@@ -661,13 +683,18 @@ impl Raft for RaftImpl {
         }
 
         // Reset the election timer
-        let s = self.state.clone();
-        let a = state.address.clone();
+        let term = state.term;
+        let arc_state = self.state.clone();
+        let me = state.address.clone();
         state.timer_guard = Some(state.timer.schedule_with_delay(
-            chrono::Duration::seconds(3),
+            chrono::Duration::milliseconds(add_jitter(FOLLOWER_TIMEOUTS_MS)),
             move || {
-                info!("[{:?}] Timed out waiting for leader heartbeat", &a);
-                RaftImpl::become_candidate(s.clone());
+                let arc_state = arc_state.clone();
+                let me = me.clone();
+                task::spawn(async move {
+                    info!("[{:?}] Timed out waiting for leader heartbeat", &me);
+                    RaftImpl::election_loop(arc_state.clone(), term + 1).await;
+                });
             },
         ));
 
