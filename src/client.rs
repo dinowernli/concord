@@ -39,17 +39,15 @@ impl Client {
             let result = client
                 .commit(grpc::RequestOptions::new(), request.clone())
                 .drop_metadata()
-                .await;
-            match result {
-                Ok(message) => match message.get_status() {
-                    Status::SUCCESS => return Ok(message.get_entry_id().clone()),
-                    Status::NOT_LEADER => {
-                        if message.has_leader() {
-                            self.leader = message.get_leader().clone();
-                        }
+                .await?;
+
+            match result.get_status() {
+                Status::SUCCESS => return Ok(result.get_entry_id().clone()),
+                Status::NOT_LEADER => {
+                    if result.has_leader() {
+                        self.leader = result.get_leader().clone();
                     }
-                },
-                Err(message) => return Err(message),
+                }
             }
             task::sleep(Duration::from_secs(1)).await;
         }
