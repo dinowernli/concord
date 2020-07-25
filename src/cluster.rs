@@ -1,3 +1,5 @@
+use crate::diagnostics;
+
 extern crate chrono;
 extern crate math;
 extern crate rand;
@@ -27,6 +29,7 @@ use std::time::Duration;
 use timer::Guard;
 use timer::Timer;
 
+use diagnostics::ServerDiagnostics;
 use raft::AppendRequest;
 use raft::AppendResponse;
 use raft::Entry;
@@ -51,44 +54,253 @@ const CANDIDATE_TIMEOUT_MS: i64 = 3000;
 // lower than the follower timeout.
 const LEADER_REPLICATE_MS: i64 = 500;
 
-// Returns a value no lower than the supplied bound, with some additive jitter.
-fn add_jitter(lower: i64) -> i64 {
-    let mut rng = rand::thread_rng();
-    let upper = (lower as f64 * 1.3) as i64;
-    rng.gen_range(lower, upper)
+// Canonical implementation of the raft service. Acts as one server among peers
+// which form a cluster.
+pub struct RaftImpl {
+    address: Server,
+    state: Arc<Mutex<RaftState>>,
 }
 
-// Returns true if the supplied latest entry id is at least as
-// up-to-date as the supplied log.
-fn is_up_to_date(last: &EntryId, log: &Vec<Entry>) -> bool {
-    if log.is_empty() {
-        return true;
+impl RaftImpl {
+    pub fn new(
+        server: &Server,
+        all: &Vec<Server>,
+        diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
+    ) -> RaftImpl {
+        RaftImpl {
+            address: server.clone(),
+            state: Arc::new(Mutex::new(RaftState {
+                term: 0,
+                voted_for: None,
+                entries: Vec::new(),
+                committed: -1,
+                applied: -1,
+                role: RaftRole::Follower,
+                followers: HashMap::new(),
+
+                timer: Timer::new(),
+                timer_guard: None,
+
+                address: server.clone(),
+                cluster: all.clone(),
+                clients: HashMap::new(),
+                last_known_leader: None,
+
+                diagnostics,
+            })),
+        }
     }
 
-    let log_last = log.last().unwrap().get_id();
-    if log_last.get_term() != last.get_term() {
-        return last.get_term() > last.get_term();
+    pub fn start(&self) {
+        let mut s = self.state.lock().unwrap();
+        let term = s.term;
+        info!("[{:?}] Starting", s.address);
+        RaftImpl::become_follower(&mut s, self.state.clone(), term);
     }
 
-    // Terms are equal, last index decides.
-    return last.get_index() >= log_last.get_index();
+    fn become_follower(state: &mut RaftState, arc_state: Arc<Mutex<RaftState>>, term: i64) {
+        let me = state.address.clone();
+        info!("[{:?}] Becoming follower for term {}", &me, term);
+        assert!(term >= state.term, "Term should never decrease");
+
+        state.term = term;
+        state.role = RaftRole::Follower;
+        state.voted_for = None;
+        state.timer_guard = Some(state.timer.schedule_with_delay(
+            chrono::Duration::milliseconds(add_jitter(FOLLOWER_TIMEOUTS_MS)),
+            move || {
+                let arc_state = arc_state.clone();
+                let me = me.clone();
+                task::spawn(async move {
+                    info!("[{:?}] Follower timeout in term {}", me, term);
+                    RaftImpl::election_loop(arc_state.clone(), term + 1).await;
+                });
+            },
+        ));
+    }
+
+    // Keeps running elections until either the term changes, a leader has emerged,
+    // or an own election has been won.
+    async fn election_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
+        let mut term = term;
+        while !RaftImpl::run_election(arc_state.clone(), term).await {
+            term = term + 1;
+            let sleep_ms = add_jitter(CANDIDATE_TIMEOUT_MS) as u64;
+            task::sleep(Duration::from_millis(sleep_ms)).await;
+        }
+    }
+
+    // Returns whether or not the election process is deemed complete. If complete,
+    // there is no need to run any further elections.
+    async fn run_election(arc_state: Arc<Mutex<RaftState>>, term: i64) -> bool {
+        let mut results = Vec::<GrpcFuture<VoteResponse>>::new();
+        {
+            let mut state = arc_state.lock().unwrap();
+
+            // The world has moved on.
+            if state.term > term {
+                return true;
+            }
+
+            // Prepare the election.
+            info!("[{:?}] Starting election for term {}", state.address, term);
+            state.role = RaftRole::Candidate;
+            state.term = term;
+            state.timer_guard = None;
+            state.voted_for = Some(state.address.clone());
+
+            // Request votes from all peer.
+            let me = state.address.clone();
+            let request = state.create_vote_request();
+            for server in state.get_others() {
+                let client = state.get_client(&server);
+                debug!("[{:?}] Making vote rpc to [{:?}]", &me, &server);
+                results.push(
+                    client
+                        .vote(grpc::RequestOptions::new(), request.clone())
+                        .drop_metadata(),
+                );
+            }
+        }
+
+        let results = join_all(results).await;
+
+        {
+            let mut state = arc_state.lock().unwrap();
+            let me = state.address.clone();
+            debug!("[{:?}] Done waiting for vote requests", &me);
+
+            // The world has moved on or someone else has won in this term.
+            if state.term > term || state.role != RaftRole::Candidate {
+                return true;
+            }
+
+            let mut votes = 1; // Here we count our own vote for ourselves.
+            for response in &results {
+                match response {
+                    Ok(message) => {
+                        if message.get_term() > term {
+                            info!("[{:?}] Detected higher term {}", &me, message.get_term());
+                            RaftImpl::become_follower(
+                                &mut state,
+                                arc_state.clone(),
+                                message.get_term(),
+                            );
+                            return true;
+                        }
+                        if message.get_granted() {
+                            votes = votes + 1;
+                        }
+                    }
+                    Err(message) => info!("[{:?}] Vote request error: {:?}", &me, message),
+                }
+            }
+
+            let arc_state_copy = arc_state.clone();
+            return if 2 * votes > state.cluster.len() {
+                info!(
+                    "[{:?}] Won election with {} votes, becoming leader for term {}",
+                    &me, votes, term
+                );
+                state.role = RaftRole::Leader;
+                state.followers = state.create_follower_positions();
+                state.timer_guard = None;
+                task::spawn(async move {
+                    RaftImpl::replicate_loop(arc_state_copy.clone(), term).await;
+                });
+                true
+            } else {
+                info!("[{:?}] Lost election with {} votes", &me, votes);
+                false
+            };
+        }
+    }
+
+    // Starts the main leader replication loop. The loop stops once the term has
+    // moved on (or we otherwise detect we are no longer leader).
+    async fn replicate_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
+        let me = arc_state.lock().unwrap().address.clone();
+        loop {
+            {
+                let locked_state = arc_state.lock().unwrap();
+                if locked_state.term > term {
+                    info!("[{:?}] Detected higher term {}", me, locked_state.term);
+                    return;
+                }
+                if locked_state.role != RaftRole::Leader {
+                    return;
+                }
+                match &locked_state.diagnostics {
+                    Some(d) => d.lock().unwrap().report_leader(term, &locked_state.address),
+                    _ => (),
+                }
+            }
+
+            RaftImpl::replicate_entries(arc_state.clone(), term).await;
+            let sleep_ms = add_jitter(LEADER_REPLICATE_MS) as u64;
+            task::sleep(Duration::from_millis(sleep_ms)).await;
+        }
+    }
+
+    // Makes a single request to all followers, heartbeating them and replicating
+    // any entries they don't have.
+    async fn replicate_entries(arc_state: Arc<Mutex<RaftState>>, term: i64) {
+        let mut results = Vec::<GrpcFuture<(Server, AppendRequest, AppendResponse)>>::new();
+        {
+            let mut state = arc_state.lock().unwrap();
+            debug!("[{:?}] Replicating entries", &state.address);
+            for server in state.get_others() {
+                let request = state.create_append_request(&server);
+                let client = state.get_client(&server);
+                let s = server.clone();
+                let fut = client
+                    .append(grpc::RequestOptions::new(), request.clone())
+                    .drop_metadata()
+                    .map_ok(move |result| (s.clone(), request.clone(), result));
+                results.push(Box::pin(fut));
+            }
+        }
+
+        // TODO(dino): Add timeouts to these rpcs.
+        let results = join_all(results).await;
+
+        {
+            let mut state = arc_state.lock().unwrap();
+            if state.term > term {
+                info!("[{:?}] Detected higher term {}", state.address, state.term);
+                return;
+            }
+            if state.role != RaftRole::Leader {
+                info!("[{:?}] No longer leader", state.address);
+                return;
+            }
+
+            let me = state.address.clone();
+            for result in results {
+                match result {
+                    Err(message) => info!("[{:?}] Append request failed, error: {}", &me, message),
+                    Ok((peer, request, response)) => {
+                        let rterm = response.get_term();
+                        if rterm > state.term {
+                            info!(
+                                "[{:?}] Detected higher term {} from peer {:?}",
+                                &me, rterm, &peer,
+                            );
+                            RaftImpl::become_follower(&mut state, arc_state.clone(), rterm);
+                            return;
+                        }
+                        state.handle_append_response(&peer, &response, &request);
+                    }
+                }
+            }
+            state.update_committed();
+            debug!("[{:?}] Done replicating entries", &state.address);
+        }
+    }
 }
 
-fn address_key(address: &Server) -> String {
-    format!("{}:{}", address.get_host(), address.get_port())
-}
-
-fn entry_id_key(entry_id: &EntryId) -> String {
-    format!("(term={},id={})", entry_id.term, entry_id.index)
-}
-
-fn sentinel_entry_id() -> EntryId {
-    let mut result = EntryId::new();
-    result.set_term(-1);
-    result.set_index(-1);
-    return result;
-}
-
+// Holds the state a cluster leader tracks about its followers. Used to decide
+// which entries to replicate to the follower.
 #[derive(Debug, Clone, PartialEq)]
 struct FollowerPosition {
     // Next log entry to send to the follower.
@@ -125,6 +337,10 @@ struct RaftState {
     cluster: Vec<Server>,
     clients: HashMap<String, RaftClient>,
     last_known_leader: Option<Server>,
+
+    // If present, this instance will inform the diagnostics object of relevant
+    // updates as they happen during execution.
+    diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
 }
 
 impl RaftState {
@@ -334,237 +550,6 @@ impl RaftState {
     }
 }
 
-pub struct RaftImpl {
-    address: Server,
-    state: Arc<Mutex<RaftState>>,
-}
-
-impl RaftImpl {
-    pub fn new(server: &Server, all: &Vec<Server>) -> RaftImpl {
-        RaftImpl {
-            address: server.clone(),
-            state: Arc::new(Mutex::new(RaftState {
-                term: 0,
-                voted_for: None,
-                entries: Vec::new(),
-                committed: -1,
-                applied: -1,
-                role: RaftRole::Follower,
-                followers: HashMap::new(),
-
-                timer: Timer::new(),
-                timer_guard: None,
-
-                address: server.clone(),
-                cluster: all.clone(),
-                clients: HashMap::new(),
-                last_known_leader: None,
-            })),
-        }
-    }
-
-    pub fn start(&self) {
-        let mut s = self.state.lock().unwrap();
-        let term = s.term;
-        info!("[{:?}] Starting", s.address);
-        RaftImpl::become_follower(&mut s, self.state.clone(), term);
-    }
-
-    fn become_follower(state: &mut RaftState, arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        let me = state.address.clone();
-        info!("[{:?}] Becoming follower for term {}", &me, term);
-        assert!(term >= state.term, "Term should never decrease");
-
-        state.term = term;
-        state.role = RaftRole::Follower;
-        state.voted_for = None;
-        state.timer_guard = Some(state.timer.schedule_with_delay(
-            chrono::Duration::milliseconds(add_jitter(FOLLOWER_TIMEOUTS_MS)),
-            move || {
-                let arc_state = arc_state.clone();
-                let me = me.clone();
-                task::spawn(async move {
-                    info!("[{:?}] Follower timeout in term {}", me, term);
-                    RaftImpl::election_loop(arc_state.clone(), term + 1).await;
-                });
-            },
-        ));
-    }
-
-    // Keeps running elections until either the term changes, a leader has emerged,
-    // or an own election has been won.
-    async fn election_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        let mut term = term;
-        while !RaftImpl::run_election(arc_state.clone(), term).await {
-            term = term + 1;
-            let sleep_ms = add_jitter(CANDIDATE_TIMEOUT_MS) as u64;
-            task::sleep(Duration::from_millis(sleep_ms)).await;
-        }
-    }
-
-    // Returns whether or not the election process is deemed complete. If complete,
-    // there is no need to run any further elections.
-    async fn run_election(arc_state: Arc<Mutex<RaftState>>, term: i64) -> bool {
-        let mut results = Vec::<GrpcFuture<VoteResponse>>::new();
-        {
-            let mut state = arc_state.lock().unwrap();
-
-            // The world has moved on.
-            if state.term > term {
-                return true;
-            }
-
-            // Prepare the election.
-            info!("[{:?}] Starting election for term {}", state.address, term);
-            state.role = RaftRole::Candidate;
-            state.term = term;
-            state.timer_guard = None;
-            state.voted_for = Some(state.address.clone());
-
-            // Request votes from all peer.
-            let me = state.address.clone();
-            let request = state.create_vote_request();
-            for server in state.get_others() {
-                let client = state.get_client(&server);
-                debug!("[{:?}] Making vote rpc to [{:?}]", &me, &server);
-                results.push(
-                    client
-                        .vote(grpc::RequestOptions::new(), request.clone())
-                        .drop_metadata(),
-                );
-            }
-        }
-
-        let results = join_all(results).await;
-
-        {
-            let mut state = arc_state.lock().unwrap();
-            let me = state.address.clone();
-            debug!("[{:?}] Done waiting for vote requests", &me);
-
-            // The world has moved on or someone else has won in this term.
-            if state.term > term || state.role != RaftRole::Candidate {
-                return true;
-            }
-
-            let mut votes = 1; // Here we count our own vote for ourselves.
-            for response in &results {
-                match response {
-                    Ok(message) => {
-                        if message.get_term() > term {
-                            info!("[{:?}] Detected higher term {}", &me, message.get_term());
-                            RaftImpl::become_follower(
-                                &mut state,
-                                arc_state.clone(),
-                                message.get_term(),
-                            );
-                            return true;
-                        }
-                        if message.get_granted() {
-                            votes = votes + 1;
-                        }
-                    }
-                    Err(message) => info!("[{:?}] Vote request error: {:?}", &me, message),
-                }
-            }
-
-            let arc_state_copy = arc_state.clone();
-            return if 2 * votes > state.cluster.len() {
-                info!(
-                    "[{:?}] Won election with {} votes, becoming leader for term {}",
-                    &me, votes, term
-                );
-                state.role = RaftRole::Leader;
-                state.followers = state.create_follower_positions();
-                state.timer_guard = None;
-                task::spawn(async move {
-                    RaftImpl::replicate_loop(arc_state_copy.clone(), term).await;
-                });
-                true
-            } else {
-                info!("[{:?}] Lost election with {} votes", &me, votes);
-                false
-            };
-        }
-    }
-
-    // Starts the main leader replication loop. The loop stops once the term has
-    // moved on (or we otherwise detect we are no longer leader).
-    async fn replicate_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        let me = arc_state.lock().unwrap().address.clone();
-        loop {
-            let new_term = arc_state.lock().unwrap().term;
-            if new_term > term {
-                info!("[{:?}] Detected higher term {}", me, new_term);
-                return;
-            }
-            if arc_state.lock().unwrap().role != RaftRole::Leader {
-                return;
-            }
-
-            RaftImpl::replicate_entries(arc_state.clone(), term).await;
-            let sleep_ms = add_jitter(LEADER_REPLICATE_MS) as u64;
-            task::sleep(Duration::from_millis(sleep_ms)).await;
-        }
-    }
-
-    // Makes a single request to all followers, heartbeating them and replicating
-    // any entries they don't have.
-    async fn replicate_entries(arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        let mut results = Vec::<GrpcFuture<(Server, AppendRequest, AppendResponse)>>::new();
-        {
-            let mut state = arc_state.lock().unwrap();
-            debug!("[{:?}] Replicating entries", &state.address);
-            for server in state.get_others() {
-                let request = state.create_append_request(&server);
-                let client = state.get_client(&server);
-                let s = server.clone();
-                let fut = client
-                    .append(grpc::RequestOptions::new(), request.clone())
-                    .drop_metadata()
-                    .map_ok(move |result| (s.clone(), request.clone(), result));
-                results.push(Box::pin(fut));
-            }
-        }
-
-        // TODO(dino): Add timeouts to these rpcs.
-        let results = join_all(results).await;
-
-        {
-            let mut state = arc_state.lock().unwrap();
-            if state.term > term {
-                info!("[{:?}] Detected higher term {}", state.address, state.term);
-                return;
-            }
-            if state.role != RaftRole::Leader {
-                info!("[{:?}] No longer leader", state.address);
-                return;
-            }
-
-            let me = state.address.clone();
-            for result in results {
-                match result {
-                    Err(message) => info!("[{:?}] Append request failed, error: {}", &me, message),
-                    Ok((peer, request, response)) => {
-                        let rterm = response.get_term();
-                        if rterm > state.term {
-                            info!(
-                                "[{:?}] Detected higher term {} from peer {:?}",
-                                &me, rterm, &peer,
-                            );
-                            RaftImpl::become_follower(&mut state, arc_state.clone(), rterm);
-                            return;
-                        }
-                        state.handle_append_response(&peer, &response, &request);
-                    }
-                }
-            }
-            state.update_committed();
-            debug!("[{:?}] Done replicating entries", &state.address);
-        }
-    }
-}
-
 impl Raft for RaftImpl {
     fn vote(
         &self,
@@ -653,7 +638,12 @@ impl Raft for RaftImpl {
             return sink.finish(result);
         }
 
-        state.last_known_leader = Some(request.get_leader().clone());
+        let leader = request.get_leader().clone();
+        state.last_known_leader = Some(leader.clone());
+        match &state.diagnostics {
+            Some(d) => d.lock().unwrap().report_leader(state.term, &leader),
+            _ => (),
+        }
 
         // Make sure we have the previous log index sent.
         if !state.has_entry(request.get_previous()) {
@@ -796,4 +786,42 @@ impl Raft for RaftImpl {
         result.set_leader(state.address.clone());
         return sink.finish(result);
     }
+}
+
+// Returns a value no lower than the supplied bound, with some additive jitter.
+fn add_jitter(lower: i64) -> i64 {
+    let mut rng = rand::thread_rng();
+    let upper = (lower as f64 * 1.3) as i64;
+    rng.gen_range(lower, upper)
+}
+
+// Returns true if the supplied latest entry id is at least as
+// up-to-date as the supplied log.
+fn is_up_to_date(last: &EntryId, log: &Vec<Entry>) -> bool {
+    if log.is_empty() {
+        return true;
+    }
+
+    let log_last = log.last().unwrap().get_id();
+    if log_last.get_term() != last.get_term() {
+        return last.get_term() > last.get_term();
+    }
+
+    // Terms are equal, last index decides.
+    return last.get_index() >= log_last.get_index();
+}
+
+fn address_key(address: &Server) -> String {
+    format!("{}:{}", address.get_host(), address.get_port())
+}
+
+fn entry_id_key(entry_id: &EntryId) -> String {
+    format!("(term={},id={})", entry_id.term, entry_id.index)
+}
+
+fn sentinel_entry_id() -> EntryId {
+    let mut result = EntryId::new();
+    result.set_term(-1);
+    result.set_index(-1);
+    return result;
 }

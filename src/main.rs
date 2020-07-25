@@ -1,7 +1,9 @@
 #![feature(async_closure)]
+#![feature(map_first_last)]
 
 mod client;
 mod cluster;
+mod diagnostics;
 
 use client::Client;
 use cluster::raft;
@@ -12,9 +14,10 @@ use raft::Server;
 use raft_grpc::RaftServer;
 
 use async_std::task;
+use diagnostics::Diagnostics;
 use env_logger::Env;
 use futures::executor;
-use futures::future::join;
+use futures::future::join3;
 use log::info;
 use std::time::Duration;
 
@@ -29,9 +32,11 @@ fn server(host: &str, port: i32) -> Server {
     return result;
 }
 
-fn start_node(address: &Server, all: &Vec<Server>) -> grpc::Server {
+fn start_node(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagnostics) -> grpc::Server {
+    let server_diagnostics = diagnostics.get_server(&address);
+
     let mut server_builder = grpc::ServerBuilder::new_plain();
-    let raft = RaftImpl::new(address, all);
+    let raft = RaftImpl::new(address, all, Some(server_diagnostics));
     raft.start();
 
     server_builder.add_service(RaftServer::new_service_def(raft));
@@ -75,6 +80,16 @@ async fn run_preempt_loop(cluster: &Vec<Server>) {
     }
 }
 
+// Starts a loop which periodically asks the diagnostics object to validate the
+// execution history of the cluster. If this fails, this indicates a bug in the
+// raft implementation.
+async fn run_validate_loop(diag: &mut Diagnostics) {
+    loop {
+        diag.validate().expect("Cluster execution validation");
+        task::sleep(Duration::from_secs(5)).await;
+    }
+}
+
 fn main() {
     env_logger::from_env(Env::default().default_filter_or("concord=info")).init();
 
@@ -85,13 +100,15 @@ fn main() {
     ];
     info!("Starting {} servers", addresses.len());
 
+    let mut diag = Diagnostics::new();
     let mut servers = Vec::<grpc::Server>::new();
     for address in &addresses {
-        servers.push(start_node(&address, &addresses));
+        servers.push(start_node(&address, &addresses, &mut diag));
     }
 
-    executor::block_on(join(
+    executor::block_on(join3(
         run_commit_loop(&addresses),
         run_preempt_loop(&addresses),
+        run_validate_loop(&mut diag),
     ));
 }
