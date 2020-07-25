@@ -14,6 +14,7 @@ use raft_grpc::RaftServer;
 use async_std::task;
 use env_logger::Env;
 use futures::executor;
+use futures::future::join;
 use log::info;
 use std::time::Duration;
 
@@ -38,6 +39,7 @@ fn start_node(address: &Server, all: &Vec<Server>) -> grpc::Server {
     server_builder.build().expect("server")
 }
 
+// Starts a loop which provides a steady amount of commit traffic.
 async fn run_commit_loop(cluster: &Vec<Server>) {
     let mut client = Client::new(cluster);
     let mut sequence_number = 0;
@@ -60,6 +62,19 @@ async fn run_commit_loop(cluster: &Vec<Server>) {
     }
 }
 
+// Starts a loop which periodically preempts the cluster leader, forcing the
+// cluster to recover by electing a new one.
+async fn run_preempt_loop(cluster: &Vec<Server>) {
+    let mut client = Client::new(cluster);
+    loop {
+        match client.preempt_leader().await {
+            Ok(leader) => info!("Preempted cluster leader: {:?}", leader),
+            Err(message) => info!("Failed to commit payload: {}", message),
+        }
+        task::sleep(Duration::from_secs(10)).await;
+    }
+}
+
 fn main() {
     env_logger::from_env(Env::default().default_filter_or("concord=info")).init();
 
@@ -75,5 +90,8 @@ fn main() {
         servers.push(start_node(&address, &addresses));
     }
 
-    executor::block_on(run_commit_loop(&addresses));
+    executor::block_on(join(
+        run_commit_loop(&addresses),
+        run_preempt_loop(&addresses),
+    ));
 }

@@ -99,9 +99,26 @@ message CommitResponse {
   EntryId entry_id = 3;
 }
 
+// A request for the leader to step down and turn into a follower. The main
+// use case for this method is when we're preparing to remove the current
+// leader of a cluster from the cluster entirely.
+message StepDownRequest {
+}
+
+message StepDownResponse {
+  // Status of the requested step down operation.
+  Status status = 1;
+
+  // The last known leader of the raft cluster. Not populated if the cluster
+  // has never had a leader. Note that if status is SUCCESS, this holds the
+  // address of the leader which just stepped down as part of this request.
+  Server leader = 2;
+}
+
 service Raft {
   rpc Vote (VoteRequest) returns (VoteResponse) {}
   rpc Append (AppendRequest) returns (AppendResponse) {}
   rpc Commit (CommitRequest) returns (CommitResponse) {}
+  rpc StepDown (StepDownRequest) returns (StepDownResponse) {}
 }
 

@@ -8,6 +8,7 @@ use raft::CommitRequest;
 use raft::EntryId;
 use raft::Server;
 use raft::Status;
+use raft::StepDownRequest;
 use raft_grpc::RaftClient;
 use std::time::Duration;
 
@@ -30,13 +31,8 @@ impl Client {
         request.set_payload(Vec::from(payload));
 
         loop {
-            let client_conf = Default::default();
-            let address = self.leader.clone();
-            let port = address.get_port() as u16;
-            let client = RaftClient::new_plain(address.get_host(), port, client_conf)
-                .expect("Creating client");
-
-            let result = client
+            let result = self
+                .new_leader_client()
                 .commit(grpc::RequestOptions::new(), request.clone())
                 .drop_metadata()
                 .await?;
@@ -51,5 +47,36 @@ impl Client {
             }
             task::sleep(Duration::from_secs(1)).await;
         }
+    }
+
+    // Sends an rpc to the cluster leader to step down. Returns the address of
+    // the leader which stepped down.
+    pub async fn preempt_leader(&mut self) -> Result<Server, Error> {
+        loop {
+            let result = self
+                .new_leader_client()
+                .step_down(grpc::RequestOptions::new(), StepDownRequest::new())
+                .drop_metadata()
+                .await?;
+
+            match result.get_status() {
+                Status::SUCCESS => return Ok(result.get_leader().clone()),
+                Status::NOT_LEADER => {
+                    if result.has_leader() {
+                        self.leader = result.get_leader().clone();
+                    }
+                }
+            }
+            task::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    // Returns a client with an open connection to the server currently
+    // believed to be the leader of the cluster.
+    fn new_leader_client(&self) -> RaftClient {
+        let client_conf = Default::default();
+        let address = self.leader.clone();
+        let port = address.get_port() as u16;
+        RaftClient::new_plain(address.get_host(), port, client_conf).expect("Creating client")
     }
 }

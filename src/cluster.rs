@@ -34,7 +34,7 @@ use raft::EntryId;
 use raft::Server;
 use raft::VoteRequest;
 use raft::VoteResponse;
-use raft::{CommitRequest, CommitResponse, Status};
+use raft::{CommitRequest, CommitResponse, Status, StepDownRequest, StepDownResponse};
 use raft_grpc::Raft;
 use raft_grpc::RaftClient;
 use std::time;
@@ -498,6 +498,10 @@ impl RaftImpl {
                 info!("[{:?}] Detected higher term {}", me, new_term);
                 return;
             }
+            if arc_state.lock().unwrap().role != RaftRole::Leader {
+                return;
+            }
+
             RaftImpl::replicate_entries(arc_state.clone(), term).await;
             let sleep_ms = add_jitter(LEADER_REPLICATE_MS) as u64;
             task::sleep(Duration::from_millis(sleep_ms)).await;
@@ -532,10 +536,10 @@ impl RaftImpl {
                 info!("[{:?}] Detected higher term {}", state.address, state.term);
                 return;
             }
-            assert!(
-                state.role == RaftRole::Leader,
-                "Leader change should change term"
-            );
+            if state.role != RaftRole::Leader {
+                info!("[{:?}] No longer leader", state.address);
+                return;
+            }
 
             let me = state.address.clone();
             for result in results {
@@ -763,5 +767,33 @@ impl Raft for RaftImpl {
             // commit the entry yet. Check again in the next iteration.
             std::thread::sleep(time::Duration::from_millis(10));
         }
+    }
+
+    fn step_down(
+        &self,
+        _: ServerHandlerContext,
+        _req: ServerRequestSingle<StepDownRequest>,
+        sink: ServerResponseUnarySink<StepDownResponse>,
+    ) -> grpc::Result<()> {
+        debug!("[{:?}] Handling step down request", self.address);
+
+        let mut state = self.state.lock().unwrap();
+        if state.role != RaftRole::Leader {
+            let mut result = StepDownResponse::new();
+            result.set_status(Status::NOT_LEADER);
+            match &state.last_known_leader {
+                None => (),
+                Some(l) => result.set_leader(l.clone()),
+            }
+            return sink.finish(result);
+        }
+
+        let term = state.term;
+        RaftImpl::become_follower(&mut state, self.state.clone(), term);
+
+        let mut result = StepDownResponse::new();
+        result.set_status(Status::SUCCESS);
+        result.set_leader(state.address.clone());
+        return sink.finish(result);
     }
 }
