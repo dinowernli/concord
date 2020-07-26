@@ -1,16 +1,13 @@
-use crate::cluster::raft;
-use crate::cluster::raft_grpc;
+use crate::cluster::raft_proto;
+use crate::cluster::raft_proto_grpc;
 
 use async_std::task;
 use grpc::ClientStubExt;
 use grpc::Error;
-use raft::CommitRequest;
-use raft::EntryId;
-use raft::Server;
-use raft::Status;
-use raft::StepDownRequest;
-use raft_grpc::RaftClient;
 use std::time::Duration;
+
+use raft_proto::{CommitRequest, EntryId, Server, Status, StepDownRequest};
+use raft_proto_grpc::RaftClient;
 
 pub struct Client {
     // Our current best guess as to who is the leader.

@@ -5,42 +5,34 @@ extern crate math;
 extern crate rand;
 extern crate timer;
 
-#[path = "generated/raft.rs"]
-pub mod raft;
+#[path = "generated/raft_proto.rs"]
+pub mod raft_proto;
 
-#[path = "generated/raft_grpc.rs"]
-pub mod raft_grpc;
+#[path = "generated/raft_proto_grpc.rs"]
+pub mod raft_proto_grpc;
 
 use async_std::task;
 use futures::future::join_all;
 use futures::TryFutureExt;
-use grpc::ClientStubExt;
-use grpc::GrpcFuture;
-use grpc::ServerHandlerContext;
-use grpc::ServerRequestSingle;
-use grpc::ServerResponseUnarySink;
-use log::debug;
-use log::info;
+use grpc::{
+    ClientStubExt, GrpcFuture, ServerHandlerContext, ServerRequestSingle, ServerResponseUnarySink,
+};
+use log::{debug, info};
 use protobuf::RepeatedField;
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time;
 use std::time::Duration;
 use timer::Guard;
 use timer::Timer;
 
 use diagnostics::ServerDiagnostics;
-use raft::AppendRequest;
-use raft::AppendResponse;
-use raft::Entry;
-use raft::EntryId;
-use raft::Server;
-use raft::VoteRequest;
-use raft::VoteResponse;
-use raft::{CommitRequest, CommitResponse, Status, StepDownRequest, StepDownResponse};
-use raft_grpc::Raft;
-use raft_grpc::RaftClient;
-use std::time;
+use raft_proto::{
+    AppendRequest, AppendResponse, Entry, EntryId, Server, VoteRequest, VoteResponse,
+};
+use raft_proto::{CommitRequest, CommitResponse, Status, StepDownRequest, StepDownResponse};
+use raft_proto_grpc::{Raft, RaftClient};
 
 // Timeout after which a server in follower state starts a new election.
 const FOLLOWER_TIMEOUTS_MS: i64 = 2000;

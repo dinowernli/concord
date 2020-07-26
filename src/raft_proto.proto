@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package raft;
+package raft_proto;
 
 message Server {
   string host = 1;

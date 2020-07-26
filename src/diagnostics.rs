@@ -1,9 +1,8 @@
-use crate::cluster::raft;
+use crate::cluster::raft_proto;
 
 use log::info;
-use raft::Server;
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use raft_proto::Server;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 // Holds information about the execution of a cluster over time. Can be used

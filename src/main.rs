@@ -5,13 +5,8 @@ mod client;
 mod cluster;
 mod diagnostics;
 
-use client::Client;
-use cluster::raft;
-use cluster::raft_grpc;
-use cluster::RaftImpl;
-use raft::EntryId;
-use raft::Server;
-use raft_grpc::RaftServer;
+use cluster::raft_proto;
+use cluster::raft_proto_grpc;
 
 use async_std::task;
 use diagnostics::Diagnostics;
@@ -20,6 +15,11 @@ use futures::executor;
 use futures::future::join3;
 use log::info;
 use std::time::Duration;
+
+use client::Client;
+use cluster::RaftImpl;
+use raft_proto::{EntryId, Server};
+use raft_proto_grpc::RaftServer;
 
 fn entry_id_key(entry_id: &EntryId) -> String {
     format!("(term={},id={})", entry_id.term, entry_id.index)
