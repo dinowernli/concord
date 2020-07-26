@@ -9,8 +9,8 @@ mod log;
 mod client;
 pub use client::Client;
 
-mod cluster;
-pub use cluster::RaftImpl;
+mod consensus;
+pub use consensus::RaftImpl;
 
 mod diagnostics;
 pub use diagnostics::Diagnostics;
