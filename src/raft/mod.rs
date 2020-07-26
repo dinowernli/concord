@@ -1,5 +1,3 @@
-pub mod diagnostics;
-
 #[path = "generated/raft_proto.rs"]
 pub mod raft_proto;
 
@@ -8,3 +6,9 @@ pub mod raft_proto_grpc;
 
 mod client;
 pub use client::Client;
+
+mod cluster;
+pub use cluster::RaftImpl;
+
+mod diagnostics;
+pub use diagnostics::Diagnostics;

@@ -1,23 +1,19 @@
 #![feature(async_closure)]
 #![feature(map_first_last)]
 
-mod cluster;
 mod raft;
 
-use raft::diagnostics;
 use raft::raft_proto;
 use raft::raft_proto_grpc;
 
 use async_std::task;
-use diagnostics::Diagnostics;
 use env_logger::Env;
 use futures::executor;
 use futures::future::join3;
 use log::info;
 use std::time::Duration;
 
-use cluster::RaftImpl;
-use raft::Client;
+use raft::{Client, Diagnostics, RaftImpl};
 use raft_proto::{EntryId, Server};
 use raft_proto_grpc::RaftServer;
 
