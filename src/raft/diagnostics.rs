@@ -1,4 +1,4 @@
-use crate::cluster::raft_proto;
+use crate::raft::raft_proto;
 
 use log::info;
 use raft_proto::Server;

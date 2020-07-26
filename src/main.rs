@@ -5,8 +5,8 @@ mod cluster;
 mod raft;
 
 use raft::diagnostics;
-use cluster::raft_proto;
-use cluster::raft_proto_grpc;
+use raft::raft_proto;
+use raft::raft_proto_grpc;
 
 use async_std::task;
 use diagnostics::Diagnostics;

@@ -1,4 +1,4 @@
 /target
 *swp
-src/generated
+src/raft/generated
 .idea

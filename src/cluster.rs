@@ -1,15 +1,12 @@
 use crate::raft::diagnostics;
+use crate::raft;
+use raft::raft_proto;
+use raft::raft_proto_grpc;
 
 extern crate chrono;
 extern crate math;
 extern crate rand;
 extern crate timer;
-
-#[path = "generated/raft_proto.rs"]
-pub mod raft_proto;
-
-#[path = "generated/raft_proto_grpc.rs"]
-pub mod raft_proto_grpc;
 
 use async_std::task;
 use futures::future::join_all;

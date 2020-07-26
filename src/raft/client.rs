@@ -1,5 +1,5 @@
-use crate::cluster::raft_proto;
-use crate::cluster::raft_proto_grpc;
+use crate::raft::raft_proto;
+use crate::raft::raft_proto_grpc;
 
 use async_std::task;
 use grpc::ClientStubExt;
