@@ -1,4 +1,4 @@
-use crate::diagnostics;
+use crate::raft::diagnostics;
 
 extern crate chrono;
 extern crate math;

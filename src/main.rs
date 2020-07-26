@@ -1,10 +1,10 @@
 #![feature(async_closure)]
 #![feature(map_first_last)]
 
-mod client;
 mod cluster;
-mod diagnostics;
+mod raft;
 
+use raft::diagnostics;
 use cluster::raft_proto;
 use cluster::raft_proto_grpc;
 
@@ -16,7 +16,7 @@ use futures::future::join3;
 use log::info;
 use std::time::Duration;
 
-use client::Client;
+use raft::Client;
 use cluster::RaftImpl;
 use raft_proto::{EntryId, Server};
 use raft_proto_grpc::RaftServer;
