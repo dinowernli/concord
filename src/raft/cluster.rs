@@ -25,9 +25,8 @@ use timer::Guard;
 use timer::Timer;
 
 use diagnostics::ServerDiagnostics;
-use raft_proto::{
-    AppendRequest, AppendResponse, Entry, EntryId, Server, VoteRequest, VoteResponse,
-};
+use raft::log::{ContainsResult, LogSlice};
+use raft_proto::{AppendRequest, AppendResponse, EntryId, Server, VoteRequest, VoteResponse};
 use raft_proto::{CommitRequest, CommitResponse, Status, StepDownRequest, StepDownResponse};
 use raft_proto_grpc::{Raft, RaftClient};
 
@@ -61,7 +60,7 @@ impl RaftImpl {
             state: Arc::new(Mutex::new(RaftState {
                 term: 0,
                 voted_for: None,
-                entries: Vec::new(),
+                log: LogSlice::new(),
                 committed: -1,
                 applied: -1,
                 role: RaftRole::Follower,
@@ -310,7 +309,7 @@ struct RaftState {
     // Persistent raft state.
     term: i64,
     voted_for: Option<Server>,
-    entries: Vec<Entry>,
+    log: LogSlice,
 
     // Volatile raft state.
     committed: i64,
@@ -360,35 +359,11 @@ impl RaftState {
             result.insert(
                 address_key(&server),
                 FollowerPosition {
-                    next_index: self.entries.len() as i64,
+                    // Optimistically start assuming next is the same as our own next.
+                    next_index: self.log.next_index(),
                     match_index: -1,
                 },
             );
-        }
-        result
-    }
-
-    // Returns whether or not the supplied entry id exists in the log.
-    fn has_entry(&self, entry_id: &EntryId) -> bool {
-        if entry_id == &sentinel_entry_id() {
-            return true;
-        }
-        match self.entries.get(entry_id.index as usize) {
-            None => false,
-            Some(entry) => entry.get_id().get_term() == entry_id.term,
-        }
-    }
-
-    // Returns all entries strictly after the supplied id. Must only be called
-    // if the supplied entry id is present in the log.
-    fn get_entries_after(&self, entry_id: &EntryId) -> Vec<Entry> {
-        if entry_id == &sentinel_entry_id() {
-            return self.entries.clone();
-        }
-        let mut result = Vec::new();
-        let idx = entry_id.index as usize;
-        for value in self.entries[idx..].iter() {
-            result.push(value.clone());
         }
         result
     }
@@ -399,11 +374,7 @@ impl RaftState {
         // Construct the id of the last known index to be replicated on the follower.
         let position = self.followers.get(address_key(&follower).as_str()).unwrap();
         let previous = if position.next_index > 0 {
-            self.entries
-                .get(position.next_index as usize - 1)
-                .unwrap()
-                .get_id()
-                .clone()
+            self.log.id_at(position.next_index - 1)
         } else {
             sentinel_entry_id()
         };
@@ -412,7 +383,7 @@ impl RaftState {
         request.set_term(self.term);
         request.set_leader(self.address.clone());
         request.set_previous(previous.clone());
-        request.set_entries(RepeatedField::from(self.get_entries_after(&previous)));
+        request.set_entries(RepeatedField::from(self.log.get_entries_after(&previous)));
         request.set_committed(self.committed);
         request
     }
@@ -470,7 +441,7 @@ impl RaftState {
     // the index this leader considers committed.
     fn update_committed(&mut self) {
         let saved_committed = self.committed;
-        for index in self.committed + 1..self.entries.len() as i64 {
+        for index in self.committed + 1..self.log.next_index() {
             let mut matches = 1; // We match.
             for (_, follower) in &self.followers {
                 if follower.match_index >= index {
@@ -497,15 +468,11 @@ impl RaftState {
     fn apply_committed(&mut self) {
         while self.applied < self.committed {
             self.applied = self.applied + 1;
-            let entry_id = self
-                .entries
-                .get(self.applied as usize)
-                .expect("invalid applied")
-                .get_id();
+            let entry_id = self.log.id_at(self.applied);
             info!(
                 "[{:?}] Applied entry: {}",
                 self.address,
-                entry_id_key(entry_id)
+                entry_id_key(&entry_id)
             );
         }
     }
@@ -516,26 +483,8 @@ impl RaftState {
         let mut request = VoteRequest::new();
         request.set_term(self.term);
         request.set_candidate(self.address.clone());
-        request.set_last(match self.entries.last() {
-            Some(e) => e.get_id().clone(),
-            None => sentinel_entry_id(),
-        });
+        request.set_last(self.log.last_id().unwrap_or(sentinel_entry_id()));
         request
-    }
-
-    // Adds a new entry to the end of the log. Meant to be called by leaders
-    // when processing requests to commit new payloads.
-    fn append_entry(&mut self, payload: Vec<u8>) -> EntryId {
-        let mut entry_id = EntryId::new();
-        entry_id.set_term(self.term);
-        entry_id.set_index(self.entries.len() as i64);
-
-        let mut entry = Entry::new();
-        entry.set_id(entry_id.clone());
-        entry.set_payload(payload);
-
-        self.entries.push(entry);
-        entry_id
     }
 }
 
@@ -579,7 +528,7 @@ impl Raft for RaftImpl {
 
         let candidate = request.get_candidate();
         if candidate == state.voted_for.as_ref().unwrap_or(candidate) {
-            if is_up_to_date(request.get_last(), &state.entries) {
+            if state.log.is_up_to_date(request.get_last()) {
                 state.voted_for = Some(candidate.clone());
                 info!("[{:?}] Granted vote", self.address);
                 result.set_granted(true);
@@ -635,22 +584,20 @@ impl Raft for RaftImpl {
         }
 
         // Make sure we have the previous log index sent.
-        if !state.has_entry(request.get_previous()) {
-            result.set_success(false);
-            return sink.finish(result);
+        match state.log.contains(request.get_previous()) {
+            ContainsResult::MISMATCH => panic!("Unexpected mismatch"),
+            ContainsResult::COMPACTED => panic!("Unexpected compacted"),
+            ContainsResult::ABSENT => {
+                // Let the leader know we don't have this entry yet, so it
+                // can try again from an earlier index.
+                result.set_success(false);
+                return sink.finish(result);
+            }
+            ContainsResult::PRESENT => (),
         }
 
-        for entry in request.get_entries() {
-            let index = entry.get_id().get_index() as usize;
-            if index == state.entries.len() {
-                state.entries.push(entry.clone());
-            } else {
-                state.entries[index] = entry.clone();
-            }
-        }
-        match request.get_entries().last() {
-            Some(entry) => state.entries.truncate(entry.get_id().index as usize + 1),
-            None => (),
+        if !request.get_entries().is_empty() {
+            state.log.append_all(request.get_entries());
         }
 
         let leader_commit = request.get_committed();
@@ -658,6 +605,8 @@ impl Raft for RaftImpl {
             state.committed = leader_commit;
             state.apply_committed();
         }
+
+        // TODO(dino): Also reset the timer if we return failure above!
 
         // Reset the election timer
         let term = state.term;
@@ -701,7 +650,8 @@ impl Raft for RaftImpl {
             return sink.finish(result);
         }
 
-        let entry_id = state.append_entry(request.payload);
+        let term = state.term;
+        let entry_id = state.log.append(term, request.payload);
 
         // Make sure the regular operations can continue while we wait.
         drop(state);
@@ -720,7 +670,7 @@ impl Raft for RaftImpl {
                     .last_known_leader
                     .as_ref()
                     .map(|l| result.set_leader(l.clone()));
-                if state.has_entry(&entry_id) {
+                if state.log.contains(&entry_id) == ContainsResult::PRESENT {
                     result.set_entry_id(entry_id.clone());
                     result.set_status(Status::SUCCESS);
                 } else {
@@ -782,22 +732,6 @@ fn add_jitter(lower: i64) -> i64 {
     let mut rng = rand::thread_rng();
     let upper = (lower as f64 * 1.3) as i64;
     rng.gen_range(lower, upper)
-}
-
-// Returns true if the supplied latest entry id is at least as
-// up-to-date as the supplied log.
-fn is_up_to_date(last: &EntryId, log: &Vec<Entry>) -> bool {
-    if log.is_empty() {
-        return true;
-    }
-
-    let log_last = log.last().unwrap().get_id();
-    if log_last.get_term() != last.get_term() {
-        return last.get_term() > last.get_term();
-    }
-
-    // Terms are equal, last index decides.
-    return last.get_index() >= log_last.get_index();
 }
 
 fn address_key(address: &Server) -> String {
