@@ -16,8 +16,8 @@ use futures::future::join3;
 use log::info;
 use std::time::Duration;
 
-use raft::Client;
 use cluster::RaftImpl;
+use raft::Client;
 use raft_proto::{EntryId, Server};
 use raft_proto_grpc::RaftServer;
 

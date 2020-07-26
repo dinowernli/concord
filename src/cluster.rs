@@ -1,5 +1,5 @@
-use crate::raft::diagnostics;
 use crate::raft;
+use crate::raft::diagnostics;
 use raft::raft_proto;
 use raft::raft_proto_grpc;
 
