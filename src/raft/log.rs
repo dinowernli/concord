@@ -34,6 +34,11 @@ impl LogSlice {
     // Adds a new entry to the end of the slice. Returns the id of the
     // newly appended entry.
     pub fn append(&mut self, term: i64, payload: Vec<u8>) -> EntryId {
+        match self.last_id() {
+            Some(id) => assert!(term >= id.get_term()),
+            None => (),
+        }
+
         let mut entry_id = EntryId::new();
         entry_id.set_term(term);
         entry_id.set_index(self.next_index());
@@ -54,11 +59,6 @@ impl LogSlice {
     // Returns the latest entry id currently in the log slice.
     pub fn last_id(&self) -> Option<EntryId> {
         self.entries.last().map(|entry| entry.get_id().clone())
-    }
-
-    // Returns the highest index currently in the log slice.
-    pub fn last_index(&self) -> Option<i64> {
-        self.last_id().map(|id| id.index)
     }
 
     // Returns the expected index of the next element which will be added to
@@ -149,6 +149,8 @@ impl LogSlice {
     // Returns all entries strictly after the supplied id. Must only be called
     // if the supplied entry id is present in the slice.
     pub fn get_entries_after(&self, entry_id: &EntryId) -> Vec<Entry> {
+        assert_eq!(ContainsResult::PRESENT, self.contains(entry_id));
+
         let start_idx = entry_id.get_index() + 1;
         if start_idx == 0 && self.entries.is_empty() {
             return Vec::new();
@@ -185,5 +187,146 @@ impl LogSlice {
     // Returns true if this slice starts at the beginning of time.
     fn starts_at_beginning_of_time(&self) -> bool {
         self.entries.is_empty() || self.first_index().unwrap() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty() {
+        let l = LogSlice::new();
+
+        assert_eq!(ContainsResult::PRESENT, l.contains(&entry_id(-1, -1)));
+        assert!(l.starts_at_beginning_of_time());
+
+        let after = l.get_entries_after(&entry_id(-1, -1));
+        assert!(after.is_empty());
+
+        assert_eq!(0, l.next_index());
+        assert!(l.first_index().is_none());
+        assert!(l.last_id().is_none());
+    }
+
+    #[test]
+    fn test_single_entry() {
+        let mut l = LogSlice::new();
+        l.append(72 /* term */, "some payload".as_bytes().to_vec());
+
+        assert!(l.starts_at_beginning_of_time());
+        assert_eq!(0, l.first_index().unwrap());
+        assert_eq!(72, l.last_id().unwrap().get_term());
+
+        let id = l.id_at(0);
+        assert_eq!(0, id.get_index());
+        assert_eq!(72, id.get_term());
+
+        assert_eq!(1, l.next_index());
+    }
+
+    #[test]
+    fn test_first_last() {
+        let l = create_default_slice();
+
+        assert_eq!(0, l.first_index().unwrap());
+        assert_eq!(74, l.last_id().unwrap().get_term());
+    }
+
+    #[test]
+    fn test_beginning_of_time() {
+        let l = create_default_slice();
+        assert!(l.starts_at_beginning_of_time());
+    }
+
+    #[test]
+    fn test_contains() {
+        let l = create_default_slice();
+
+        // Special sentinel case.
+        assert_eq!(ContainsResult::PRESENT, l.contains(&entry_id(-1, -1)));
+
+        // Check a few existing entries.
+        assert_eq!(ContainsResult::PRESENT, l.contains(&entry_id(73, 2)));
+        assert_eq!(ContainsResult::PRESENT, l.contains(&entry_id(73, 3)));
+
+        // Term mismatch, both larger and smaller.
+        assert_eq!(ContainsResult::MISMATCH, l.contains(&entry_id(59, 3)));
+        assert_eq!(ContainsResult::MISMATCH, l.contains(&entry_id(95, 3)));
+
+        // First index not present.
+        let next = l.next_index();
+        assert_eq!(6, next);
+        assert_eq!(ContainsResult::ABSENT, l.contains(&entry_id(95, next)));
+        assert_eq!(ContainsResult::ABSENT, l.contains(&entry_id(12, next)));
+    }
+
+    #[test]
+    fn test_id_at_valid() {
+        let l = create_default_slice();
+
+        let i = l.id_at(0);
+        assert_eq!(0, i.get_index());
+        assert_eq!(71, i.get_term());
+
+        let j = l.id_at(4);
+        assert_eq!(4, j.get_index());
+        assert_eq!(73, j.get_term());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_id_at_invalid() {
+        let l = create_default_slice();
+        l.id_at(l.next_index());
+    }
+
+    #[test]
+    fn test_is_up_to_date() {
+        let l = create_default_slice();
+
+        // Not up to date, l contains a newer entry.
+        assert!(!l.is_up_to_date(&entry_id(73, 5)));
+
+        // Not up to date, l contains a newer term.
+        assert!(!l.is_up_to_date(&entry_id(69, 12)));
+
+        // Should be up to date.
+        assert!(l.is_up_to_date(&entry_id(74, 5)));
+        assert!(l.is_up_to_date(&entry_id(75, 5)));
+        assert!(l.is_up_to_date(&entry_id(75, 17)));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_bad_append() {
+        let mut l = create_default_slice();
+        l.append(73, "bad term".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn test_append() {
+        let mut l = create_default_slice();
+        let id = l.append(74, "bad term".as_bytes().to_vec());
+        assert_eq!(74, id.get_term());
+        assert_eq!(6, id.get_index());
+    }
+
+    fn create_default_slice() -> LogSlice {
+        let mut result = LogSlice::new();
+        result.append(71 /* term */, "some payload".as_bytes().to_vec());
+        result.append(72 /* term */, "some payload".as_bytes().to_vec());
+        result.append(73 /* term */, "some payload".as_bytes().to_vec());
+        result.append(73 /* term */, "some payload".as_bytes().to_vec());
+        result.append(73 /* term */, "some payload".as_bytes().to_vec());
+        result.append(74 /* term */, "some payload".as_bytes().to_vec());
+        result
+    }
+
+    fn entry_id(term: i64, index: i64) -> EntryId {
+        let mut result = EntryId::new();
+        result.set_index(index);
+        result.set_term(term);
+        return result;
     }
 }
