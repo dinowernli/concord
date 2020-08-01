@@ -25,6 +25,7 @@ use std::time::Duration;
 use timer::Guard;
 use timer::Timer;
 
+use bytes::Buf;
 use diagnostics::ServerDiagnostics;
 use raft::log::{ContainsResult, LogSlice};
 use raft_proto::{AppendRequest, AppendResponse, EntryId, Server, VoteRequest, VoteResponse};
@@ -475,7 +476,7 @@ impl RaftState {
             let entry = self.log.entry_at(self.applied);
             let entry_id = entry.get_id().clone();
 
-            self.state_machine.apply(entry.get_payload());
+            self.state_machine.apply(&entry.get_payload().to_bytes());
             info!(
                 "[{:?}] Applied entry: {}",
                 self.address,

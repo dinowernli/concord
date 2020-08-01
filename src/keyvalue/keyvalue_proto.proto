@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package keyvalue_proto;
+
+// Represents an operation which modifies a store.
+message Operation {
+  oneof op {
+    SetOperation set = 1;
+  }
+}
+
+// Sets a (key, value) pair in the store, overwriting the value for the key
+// if already present.
+message SetOperation {
+  bytes key = 1;
+  bytes value = 2;
+}
+

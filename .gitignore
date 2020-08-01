@@ -1,4 +1,5 @@
 /target
 *swp
 src/raft/generated
+src/keyvalue/generated
 .idea
