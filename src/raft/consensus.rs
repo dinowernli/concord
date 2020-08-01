@@ -2,6 +2,7 @@ use crate::raft;
 use crate::raft::diagnostics;
 use raft::raft_proto;
 use raft::raft_proto_grpc;
+use raft::StateMachine;
 
 extern crate chrono;
 extern crate math;
@@ -53,6 +54,7 @@ impl RaftImpl {
     pub fn new(
         server: &Server,
         all: &Vec<Server>,
+        state_machine: Box<dyn StateMachine + Send>,
         diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
     ) -> RaftImpl {
         RaftImpl {
@@ -61,11 +63,12 @@ impl RaftImpl {
                 term: 0,
                 voted_for: None,
                 log: LogSlice::new(),
+                state_machine: state_machine,
+
                 committed: -1,
                 applied: -1,
                 role: RaftRole::Follower,
                 followers: HashMap::new(),
-
                 timer: Timer::new(),
                 timer_guard: None,
 
@@ -310,6 +313,7 @@ struct RaftState {
     term: i64,
     voted_for: Option<Server>,
     log: LogSlice,
+    state_machine: Box<dyn StateMachine + Send>, // RaftState gets sent between threads.
 
     // Volatile raft state.
     committed: i64,
@@ -468,7 +472,10 @@ impl RaftState {
     fn apply_committed(&mut self) {
         while self.applied < self.committed {
             self.applied = self.applied + 1;
-            let entry_id = self.log.id_at(self.applied);
+            let entry = self.log.entry_at(self.applied);
+            let entry_id = entry.get_id().clone();
+
+            self.state_machine.apply(entry.get_payload());
             info!(
                 "[{:?}] Applied entry: {}",
                 self.address,

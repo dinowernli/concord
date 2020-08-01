@@ -175,6 +175,12 @@ impl LogSlice {
             .clone()
     }
 
+    // Returns the entry at the supplied index. Must only be called if the index
+    // is present in the slice.
+    pub fn entry_at(&self, index: i64) -> Entry {
+        self.entries.get(self.local_index(index)).unwrap().clone()
+    }
+
     // Returns the position in the slice vector associated with the supplied
     // log index. Must only be called if the index is known to be within range
     // of this slice.

@@ -14,3 +14,6 @@ pub use consensus::RaftImpl;
 
 mod diagnostics;
 pub use diagnostics::Diagnostics;
+
+mod state_machine;
+pub use state_machine::StateMachine;

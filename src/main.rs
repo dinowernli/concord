@@ -1,6 +1,7 @@
 #![feature(async_closure)]
 #![feature(map_first_last)]
 
+mod keyvalue;
 mod raft;
 
 use raft::raft_proto;
@@ -31,8 +32,9 @@ fn server(host: &str, port: i32) -> Server {
 fn start_node(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagnostics) -> grpc::Server {
     let server_diagnostics = diagnostics.get_server(&address);
 
+    let state_machine = Box::new(keyvalue::MapStore::new());
     let mut server_builder = grpc::ServerBuilder::new_plain();
-    let raft = RaftImpl::new(address, all, Some(server_diagnostics));
+    let raft = RaftImpl::new(address, all, state_machine, Some(server_diagnostics));
     raft.start();
 
     server_builder.add_service(RaftServer::new_service_def(raft));
