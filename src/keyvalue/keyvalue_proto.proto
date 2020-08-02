@@ -2,6 +2,15 @@ syntax = "proto3";
 
 package keyvalue_proto;
 
+// A single key-value entry in the store.
+message Entry {
+  // The key for this entry.
+  bytes key = 1;
+
+  // The value for this entry.
+  bytes value = 2;
+}
+
 // Represents an operation which modifies a store.
 message Operation {
   oneof op {
@@ -12,7 +21,10 @@ message Operation {
 // Sets a (key, value) pair in the store, overwriting the value for the key
 // if already present.
 message SetOperation {
-  bytes key = 1;
-  bytes value = 2;
+  Entry entry = 1;
 }
 
+// Represents a full snapshot of all data present in the store.
+message Snapshot {
+  repeated Entry entries = 1;
+}
