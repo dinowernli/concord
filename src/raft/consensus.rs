@@ -15,7 +15,7 @@ use futures::TryFutureExt;
 use grpc::{
     ClientStubExt, GrpcFuture, ServerHandlerContext, ServerRequestSingle, ServerResponseUnarySink,
 };
-use log::{debug, info};
+use log::{debug, info, warn};
 use protobuf::RepeatedField;
 use rand::Rng;
 use std::collections::HashMap;
@@ -476,12 +476,24 @@ impl RaftState {
             let entry = self.log.entry_at(self.applied);
             let entry_id = entry.get_id().clone();
 
-            self.state_machine.apply(&entry.get_payload().to_bytes());
-            info!(
-                "[{:?}] Applied entry: {}",
-                self.address,
-                entry_id_key(&entry_id)
-            );
+            let result = self.state_machine.apply(&entry.get_payload().to_bytes());
+            match result {
+                Ok(()) => {
+                    info!(
+                        "[{:?}] Applied entry: {}",
+                        self.address,
+                        entry_id_key(&entry_id)
+                    );
+                }
+                Err(msg) => {
+                    warn!(
+                        "[{:?}] Failed to apply {}: {}",
+                        self.address,
+                        entry_id_key(&entry_id),
+                        msg,
+                    );
+                }
+            }
         }
     }
 

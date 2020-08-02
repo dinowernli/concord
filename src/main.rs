@@ -1,6 +1,5 @@
 #![feature(async_closure)]
 #![feature(map_first_last)]
-#![feature(result_flattening)]
 
 mod keyvalue;
 mod raft;
@@ -24,9 +23,12 @@ use raft_proto::{EntryId, Server};
 use raft_proto_grpc::RaftServer;
 
 fn make_set_operation(key: &[u8], value: &[u8]) -> Operation {
+    let mut entry = keyvalue_proto::Entry::new();
+    entry.set_key(key.to_vec());
+    entry.set_value(value.to_vec());
+
     let mut op = keyvalue_proto::SetOperation::new();
-    op.set_key(key.to_vec());
-    op.set_value(value.to_vec());
+    op.set_entry(entry);
 
     let mut result = Operation::new();
     result.set_set(op);
