@@ -1,22 +1,37 @@
 #![feature(async_closure)]
 #![feature(map_first_last)]
+#![feature(result_flattening)]
 
 mod keyvalue;
 mod raft;
 
+use keyvalue::keyvalue_proto;
 use raft::raft_proto;
 use raft::raft_proto_grpc;
 
 use async_std::task;
+use bytes::Bytes;
 use env_logger::Env;
 use futures::executor;
 use futures::future::join3;
 use log::info;
 use std::time::Duration;
 
+use keyvalue_proto::Operation;
+use protobuf::Message;
 use raft::{Client, Diagnostics, RaftImpl};
 use raft_proto::{EntryId, Server};
 use raft_proto_grpc::RaftServer;
+
+fn make_set_operation(key: &[u8], value: &[u8]) -> Operation {
+    let mut op = keyvalue_proto::SetOperation::new();
+    op.set_key(key.to_vec());
+    op.set_value(value.to_vec());
+
+    let mut result = Operation::new();
+    result.set_set(op);
+    result
+}
 
 fn entry_id_key(entry_id: &EntryId) -> String {
     format!("(term={},id={})", entry_id.term, entry_id.index)
@@ -47,8 +62,11 @@ async fn run_commit_loop(cluster: &Vec<Server>) {
     let mut client = Client::new(cluster);
     let mut sequence_number = 0;
     loop {
-        let payload = format!("Payload number: {}", sequence_number);
-        match client.commit(payload.as_bytes()).await {
+        let payload_value = format!("Payload number: {}", sequence_number);
+        let op = make_set_operation("payload".as_bytes(), payload_value.as_bytes());
+        let serialized = Bytes::from(op.write_to_bytes().expect("serialization"));
+
+        match client.commit(&serialized).await {
             Ok(id) => {
                 info!(
                     "Committed payload {} with id {}",
