@@ -26,5 +26,6 @@ message SetOperation {
 
 // Represents a full snapshot of all data present in the store.
 message Snapshot {
-  repeated Entry entries = 1;
+  int64 version = 1;
+  repeated Entry entries = 2;
 }

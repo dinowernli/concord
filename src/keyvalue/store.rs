@@ -1,18 +1,20 @@
 extern crate bytes;
 extern crate protobuf;
+extern crate im;
 
 use crate::keyvalue::keyvalue_proto;
 use crate::raft::{StateMachine, StateMachineResult};
 
 use bytes::Bytes;
-use std::collections::HashMap;
+use im::HashMap;
+use std::collections::VecDeque;
 
 use self::bytes::Buf;
 use self::protobuf::Message;
 use keyvalue_proto::{Entry, Operation, Snapshot};
 
 #[derive(Debug, Clone)]
-struct StoreError {
+pub struct StoreError {
     message: String,
 }
 
@@ -24,21 +26,49 @@ impl StoreError {
     }
 }
 
-// A key-value store where both the key and the value type are just bytes.
+// A versioned key-value store where both the key and the value type are bytes.
+// Each modification to the store creates a new version, leaving older versions
+// still accessible until trimmed.
 pub trait Store {
+    // Returns the latest value associated with the supplied key.
     fn get(&self, key: &Bytes) -> Option<Bytes>;
+
+    // Returns the value associated with the supplied key at a specific version
+    // of the store. Returns an error if the supplied version is not present in
+    // the store (because it hasn't occurred yet, or has been compacted).
+    fn get_at(&self, key: &Bytes, version: i64) -> Result<Option<Bytes>, StoreError>;
+
+    // Updates the supplied (key, value) pair, creating a new version.
     fn set(&mut self, key: Bytes, value: Bytes);
+
+    // Trims all versions smaller than the supplied version. In the event where
+    // this would lead to trimming all versions present, the latest version is
+    // preserved to avoid losing state entirely. As a corollary, this means
+    // that trimming can never cause the latest value to change.
+    fn trim(&mut self, version: i64);
 }
 
 // A store implementation backed by a simple in-memory hash map.
 pub struct MapStore {
+    // Holds a contiguous sequence of versions. This list is never empty.
+    versions: VecDeque<MapVersion>,
+}
+
+// Holds the data associated with a particular version of the store. The data
+// member typically shares internal data nodes with other versions of the same
+// store instance.
+struct MapVersion {
+    version: i64,
     data: HashMap<Bytes, Bytes>,
 }
 
 impl MapStore {
     pub fn new() -> Self {
         MapStore {
-            data: HashMap::new(),
+            versions: create_deque(MapVersion {
+                version: 0,
+                data: HashMap::new(),
+            }),
         }
     }
 
@@ -55,15 +85,60 @@ impl MapStore {
         }
         Err(StoreError::new("Unrecognized operation type"))
     }
+
+    fn latest_data(&self) -> &HashMap<Bytes, Bytes> {
+        self.versions.back().unwrap().data.as_ref()
+    }
+
+    fn latest_version(&self) -> i64 {
+        self.versions.back().unwrap().version
+    }
+
+    fn earliest_version(&self) -> i64 {
+        self.versions.front().unwrap().version
+    }
+
+    fn num_versions(&self) -> usize {
+        self.versions.len()
+    }
+
+    fn version_index(&self, version: i64) -> Result<usize, StoreError> {
+        let min = self.versions.front().expect("non-empty").version;
+        let max = self.versions.back().expect("non-empty").version;
+        if version < min || version > max {
+            return Err(StoreError::new(format!(
+                "Invalid version {}, expected in range [{}, {}]",
+                version, min, max
+            ).as_str()));
+        }
+        Ok((version - min) as usize)
+    }
 }
 
 impl Store for MapStore {
     fn get(&self, key: &Bytes) -> Option<Bytes> {
-        self.data.get(key).cloned()
+        self.get_at(key, self.latest_version()).expect("valid version")
+    }
+
+    fn get_at(&self, key: &Bytes, version: i64) -> Result<Option<Bytes>, StoreError> {
+        let index = self.version_index(version)?;
+        Ok(self.versions.get(index).expect("valid index").data.get(key).cloned())
     }
 
     fn set(&mut self, key: Bytes, value: Bytes) {
-        self.data.insert(key, value);
+        let latest = self.versions.back().unwrap();
+        let new_version = latest.version + 1;
+        let new_data = latest.data.update(key, value);
+        self.versions.push_back(MapVersion {
+            version: new_version,
+            data: new_data,
+        });
+    }
+
+    fn trim(&mut self, version: i64) {
+        while self.earliest_version() < version && self.num_versions() > 1 {
+            self.versions.pop_front();
+        }
     }
 }
 
@@ -88,7 +163,7 @@ impl StateMachine for MapStore {
 
     fn create_snapshot(&self) -> Bytes {
         let mut snapshot = Snapshot::new();
-        for (k, v) in &self.data {
+        for (k, v) in self.latest_data() {
             let mut entry = Entry::new();
             entry.set_key(k.to_vec());
             entry.set_value(v.to_vec());
@@ -107,13 +182,24 @@ impl StateMachine for MapStore {
         }
 
         let contents: Snapshot = parsed.unwrap();
-        self.data.clear();
+
+        let mut data: HashMap<Bytes, Bytes> = HashMap::new();
         for entry in contents.get_entries() {
-            self.data
-                .insert(entry.get_key().to_bytes(), entry.get_value().to_bytes());
+            data.insert(entry.get_key().to_bytes(), entry.get_value().to_bytes());
         }
+
+        self.versions = create_deque(MapVersion {
+            version: contents.get_version(),
+            data,
+        });
         Ok(())
     }
+}
+
+fn create_deque<T>(item: T) -> VecDeque<T> {
+    let mut result = VecDeque::new();
+    result.push_back(item);
+    result
 }
 
 #[cfg(test)]
@@ -206,5 +292,36 @@ mod tests {
 
         let gibberish = Bytes::from("not an actual valid proto");
         assert!(store.load_snapshot(&gibberish).is_err());
+    }
+
+    #[test]
+    fn test_map_store_versions() {
+        let k1 = Bytes::from("key1");
+        let v1 = Bytes::from("bar");
+        let v2 = Bytes::from("baz");
+        let v3 = Bytes::from("fib");
+        let mut store = MapStore::new();
+
+        store.set(k1.clone(), v1.clone());
+        store.set(k1.clone(), v2.clone());
+        store.set(k1.clone(), v3.clone());
+
+        // Check that the versions have been updated correctly.
+        assert_eq!(store.get_at(&k1, 1).unwrap().unwrap(), &v1);
+        assert_eq!(store.get_at(&k1, 2).unwrap().unwrap(), &v2);
+        assert_eq!(store.get_at(&k1, 3).unwrap().unwrap(), &v3);
+
+        // Trim versions 0 and 1 above.
+        store.trim(2);
+
+        assert!(store.get_at(&k1, 1).is_err());
+        assert_eq!(store.get_at(&k1, 2).unwrap().unwrap(), &v2);
+        assert_eq!(store.get_at(&k1, 3).unwrap().unwrap(), &v3);
+
+        // Trim everything, should preserve the latest version.
+        store.trim(17);
+
+        assert_eq!(store.get_at(&k1, 3).unwrap().unwrap(), &v3);
+        assert_eq!(store.get(&k1).unwrap(), &v3);
     }
 }
