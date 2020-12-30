@@ -46,6 +46,9 @@ pub trait Store {
     // preserved to avoid losing state entirely. As a corollary, this means
     // that trimming can never cause the latest value to change.
     fn trim(&mut self, version: i64);
+
+    // Returns the latest (highest) version present in this store.
+    fn latest_version(&self) -> i64;
 }
 
 // A store implementation backed by a simple in-memory hash map.
@@ -88,10 +91,6 @@ impl MapStore {
 
     fn latest_data(&self) -> &HashMap<Bytes, Bytes> {
         self.versions.back().unwrap().data.as_ref()
-    }
-
-    fn latest_version(&self) -> i64 {
-        self.versions.back().unwrap().version
     }
 
     fn earliest_version(&self) -> i64 {
@@ -140,6 +139,10 @@ impl Store for MapStore {
             self.versions.pop_front();
         }
     }
+
+    fn latest_version(&self) -> i64 {
+        self.versions.back().unwrap().version
+    }
 }
 
 impl StateMachine for MapStore {
@@ -161,8 +164,11 @@ impl StateMachine for MapStore {
         Ok(())
     }
 
+    // Returns a serialized snapshot proto containing all entries present in
+    // the latest version of the store.
     fn create_snapshot(&self) -> Bytes {
         let mut snapshot = Snapshot::new();
+        snapshot.set_version(self.latest_version());
         for (k, v) in self.latest_data() {
             let mut entry = Entry::new();
             entry.set_key(k.to_vec());
@@ -172,6 +178,8 @@ impl StateMachine for MapStore {
         Bytes::from(snapshot.write_to_bytes().expect("serialization"))
     }
 
+    // Discards all versions present in the current store instance, replacing
+    // them with the supplied version.
     fn load_snapshot(&mut self, snapshot: &Bytes) -> StateMachineResult {
         let parsed = protobuf::parse_from_bytes(snapshot.bytes());
         if parsed.is_err() {
@@ -271,10 +279,15 @@ mod tests {
 
         let mut store = MapStore::new();
         store.set(k1.clone(), v1.clone());
+        assert_eq!(store.latest_version(), 1);
+
         let snap = store.create_snapshot();
 
         let mut other_store = MapStore::new();
         other_store.set(k2.clone(), v2.clone());
+        other_store.set(k2.clone(), v2.clone());
+        other_store.set(k2.clone(), v2.clone());
+        assert_eq!(other_store.latest_version(), 3);
 
         // Check that the value present in the snapshot is not in the store.
         assert!(other_store.get(&k1).is_none());
@@ -284,6 +297,7 @@ mod tests {
             .expect("load should succeed");
         assert_eq!(other_store.get(&k1).unwrap(), &v1);
         assert!(other_store.get(&k2).is_none());
+        assert_eq!(other_store.latest_version(), 1);
     }
 
     #[test]
@@ -301,10 +315,16 @@ mod tests {
         let v2 = Bytes::from("baz");
         let v3 = Bytes::from("fib");
         let mut store = MapStore::new();
+        assert_eq!(store.latest_version(), 0);
 
         store.set(k1.clone(), v1.clone());
+        assert_eq!(store.latest_version(), 1);
+
         store.set(k1.clone(), v2.clone());
+        assert_eq!(store.latest_version(), 2);
+
         store.set(k1.clone(), v3.clone());
+        assert_eq!(store.latest_version(), 3);
 
         // Check that the versions have been updated correctly.
         assert_eq!(store.get_at(&k1, 1).unwrap().unwrap(), &v1);
