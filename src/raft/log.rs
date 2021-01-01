@@ -138,18 +138,24 @@ impl LogSlice {
         assert!(!entries.is_empty(), "append_all called with empty entries");
 
         for entry in entries {
+            let size_bytes = entry.payload.len() as i64;
             let index = entry.get_id().get_index();
             if index == self.next_index() {
                 self.entries.push(entry.clone());
+                self.size_bytes += size_bytes;
             } else {
                 let local_index = self.local_index(index);
+                self.size_bytes -= self.entries[local_index].payload.len() as i64;
                 self.entries[local_index] = entry.clone();
+                self.size_bytes += size_bytes;
             }
         }
 
         let last = entries.last().unwrap().get_id();
         let local_index = self.local_index(last.get_index());
-        self.entries.truncate(local_index + 1);
+        for entry in self.entries.drain((local_index + 1)..) {
+            self.size_bytes -= entry.payload.len() as i64;
+        }
     }
 
     // Removes all contents from this instance, leaving it empty.
@@ -365,14 +371,41 @@ mod tests {
         assert_eq!(6, id.get_index());
     }
 
+    #[test]
+    fn test_append_all() {
+        let mut l = create_default_slice();
+
+        // Validate the initial state.
+        assert_eq!(l.first_index().unwrap(), 0);
+        assert_eq!(l.last_id().unwrap().index, 5);
+        let initial_size_bytes = 6;
+        assert_eq!(l.size_bytes(), initial_size_bytes);
+
+        // This should replace entries 3 and 4, and remove entry 5
+        l.append_all(&[
+            entry(75, 3 /* index */, 10 /* size */),
+            entry(75, 4 /* index */, 10 /* size */),
+        ]);
+        assert_eq!(l.first_index().unwrap(), 0);
+        assert_eq!(l.last_id().unwrap().index, 4);
+        let size_bytes = initial_size_bytes - 3 + 20;
+        assert_eq!(l.size_bytes(), size_bytes);
+
+        // This should just append
+        l.append_all(&[entry(76, 5 /* index */, 10 /* size */)]);
+        assert_eq!(l.last_id().unwrap().index, 5);
+        let new_size_bytes = size_bytes + 10;
+        assert_eq!(l.size_bytes(), new_size_bytes);
+    }
+
     fn create_default_slice() -> LogSlice {
         let mut result = LogSlice::new();
-        result.append(71 /* term */, "some payload".as_bytes().to_vec());
-        result.append(72 /* term */, "some payload".as_bytes().to_vec());
-        result.append(73 /* term */, "some payload".as_bytes().to_vec());
-        result.append(73 /* term */, "some payload".as_bytes().to_vec());
-        result.append(73 /* term */, "some payload".as_bytes().to_vec());
-        result.append(74 /* term */, "some payload".as_bytes().to_vec());
+        result.append(71 /* term */, payload_of_size(1));
+        result.append(72 /* term */, payload_of_size(1));
+        result.append(73 /* term */, payload_of_size(1));
+        result.append(73 /* term */, payload_of_size(1));
+        result.append(73 /* term */, payload_of_size(1));
+        result.append(74 /* term */, payload_of_size(1));
         result
     }
 
@@ -384,6 +417,13 @@ mod tests {
         let mut result = EntryId::new();
         result.set_index(index);
         result.set_term(term);
+        return result;
+    }
+
+    fn entry(term: i64, index: i64, payload_size_bytes: i64) -> Entry {
+        let mut result = Entry::new();
+        result.set_payload(payload_of_size(payload_size_bytes));
+        result.set_id(entry_id(term, index));
         return result;
     }
 }
