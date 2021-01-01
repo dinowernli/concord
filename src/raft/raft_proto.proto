@@ -1,5 +1,7 @@
 syntax = "proto3";
 
+// Specifies the RPC protocol necessary to implement consensus between servers
+// based on the Raft algorithm.
 package raft_proto;
 
 message Server {

@@ -92,7 +92,7 @@ async fn run_preempt_loop(cluster: &Vec<Server>) {
     loop {
         match client.preempt_leader().await {
             Ok(leader) => info!("Preempted cluster leader: {:?}", leader),
-            Err(message) => info!("Failed to commit payload: {}", message),
+            Err(message) => info!("Failed to preempt leader: {}", message),
         }
         task::sleep(Duration::from_secs(10)).await;
     }

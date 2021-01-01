@@ -1,5 +1,8 @@
 syntax = "proto3";
 
+// Specifies the schema of all data and operations required to implement a Raft
+// StateMachine for a versioned key-value store. The data and operations need
+// to be serialized and transmitted to other participants in the Raft cluster.
 package keyvalue_proto;
 
 // A single key-value entry in the store.
