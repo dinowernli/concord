@@ -5,6 +5,9 @@ use raft_proto::{Entry, EntryId};
 // Represents a contiguous slice of a raft log.
 pub struct LogSlice {
     entries: Vec<Entry>,
+
+    // The sum of the sizes of all payloads in the stored entries.
+    size_bytes: i64,
 }
 
 // The possible outcomes of asking a log slice whether an entry id is
@@ -28,6 +31,7 @@ impl LogSlice {
     pub fn new() -> Self {
         LogSlice {
             entries: Vec::new(),
+            size_bytes: 0,
         }
     }
 
@@ -39,6 +43,7 @@ impl LogSlice {
             None => (),
         }
 
+        let size_bytes = payload.len() as i64;
         let mut entry_id = EntryId::new();
         entry_id.set_term(term);
         entry_id.set_index(self.next_index());
@@ -48,6 +53,7 @@ impl LogSlice {
         entry.set_payload(payload);
 
         self.entries.push(entry);
+        self.size_bytes += size_bytes;
         entry_id
     }
 
@@ -146,6 +152,20 @@ impl LogSlice {
         self.entries.truncate(local_index + 1);
     }
 
+    // Removes all contents from this instance, leaving it empty.
+    pub fn clear(&mut self) {
+        self.entries = Vec::new();
+        self.size_bytes = 0;
+    }
+
+    // Returns the total size in bytes of all stored payloads. This is an
+    // approximation of the total memory occupied by this instance. Note that
+    // the size of the entry metadata and other meta structures are not
+    // included in this returned value).
+    pub fn size_bytes(&self) -> i64 {
+        self.size_bytes as i64
+    }
+
     // Returns all entries strictly after the supplied id. Must only be called
     // if the supplied entry id is present in the slice.
     pub fn get_entries_after(&self, entry_id: &EntryId) -> Vec<Entry> {
@@ -213,6 +233,33 @@ mod tests {
         assert_eq!(0, l.next_index());
         assert!(l.first_index().is_none());
         assert!(l.last_id().is_none());
+    }
+
+    #[test]
+    fn test_size_bytes() {
+        let mut l = LogSlice::new();
+        assert_eq!(0, l.size_bytes());
+
+        l.append(13 /* term */, payload_of_size(25));
+        assert_eq!(25, l.size_bytes());
+
+        l.append(13 /* term */, payload_of_size(4));
+        assert_eq!(29, l.size_bytes());
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut l = LogSlice::new();
+        assert_eq!(0, l.size_bytes());
+
+        l.append(13 /* term */, payload_of_size(25));
+        assert_eq!(25, l.size_bytes());
+
+        l.clear();
+        assert_eq!(0, l.size_bytes());
+
+        l.clear();
+        assert_eq!(0, l.size_bytes());
     }
 
     #[test]
@@ -327,6 +374,10 @@ mod tests {
         result.append(73 /* term */, "some payload".as_bytes().to_vec());
         result.append(74 /* term */, "some payload".as_bytes().to_vec());
         result
+    }
+
+    fn payload_of_size(size_bytes: i64) -> Vec<u8> {
+        [3].repeat(size_bytes as usize)
     }
 
     fn entry_id(term: i64, index: i64) -> EntryId {
