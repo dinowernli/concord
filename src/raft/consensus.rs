@@ -15,7 +15,7 @@ use futures::TryFutureExt;
 use grpc::{
     ClientStubExt, GrpcFuture, ServerHandlerContext, ServerRequestSingle, ServerResponseUnarySink,
 };
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use protobuf::RepeatedField;
 use rand::Rng;
 use std::collections::HashMap;
@@ -25,11 +25,12 @@ use std::time::Duration;
 use timer::Guard;
 use timer::Timer;
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use diagnostics::ServerDiagnostics;
 use raft::log::{ContainsResult, LogSlice};
 use raft_proto::{AppendRequest, AppendResponse, EntryId, Server, VoteRequest, VoteResponse};
 use raft_proto::{CommitRequest, CommitResponse, Status, StepDownRequest, StepDownResponse};
+use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 use raft_proto_grpc::{Raft, RaftClient};
 
 // Timeout after which a server in follower state starts a new election.
@@ -744,6 +745,40 @@ impl Raft for RaftImpl {
         let mut result = StepDownResponse::new();
         result.set_status(Status::SUCCESS);
         result.set_leader(state.address.clone());
+        return sink.finish(result);
+    }
+
+    fn install_snapshot(
+        &self,
+        _: ServerHandlerContext,
+        req: ServerRequestSingle<InstallSnapshotRequest>,
+        sink: ServerResponseUnarySink<InstallSnapshotResponse>,
+    ) -> grpc::Result<()> {
+        let request = req.message;
+        debug!("[{:?}] Handling install snapshot request", self.address);
+
+        let mut state = self.state.lock().unwrap();
+        if request.term >= state.term {
+            let contains = state.log.contains(request.get_last());
+
+            // If we have a copy of the latest entry in our log, there is
+            // nothing to do and we should retain any log entries that are
+            // newer than the latest entry in the snapshot.
+            if contains != ContainsResult::PRESENT {
+                let snapshot = Bytes::from(request.snapshot);
+                match state.state_machine.load_snapshot(&snapshot) {
+                    Ok(_) => (),
+                    Err(message) => error!(
+                        "[{:?}] Failed to load snapshot: [{:?}]",
+                        self.address, message
+                    ),
+                }
+                state.log = LogSlice::new();
+            }
+        }
+
+        let mut result = InstallSnapshotResponse::new();
+        result.set_term(state.term);
         return sink.finish(result);
     }
 }

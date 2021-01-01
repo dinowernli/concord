@@ -83,7 +83,7 @@ enum Status {
 }
 
 // Request to add a new entry to the shared raft log. Only the leader can
-// process these request. Followers will return a NOT_LEADER error.
+// process these requests. Followers will return a NOT_LEADER error.
 message CommitRequest {
   // The payload to append to the log.
   bytes payload = 1;
@@ -117,10 +117,34 @@ message StepDownResponse {
   Server leader = 2;
 }
 
+// Sent by the leader of the cluster to its peers in order to transmit a
+// snapshot of the underlying state machine to the follower.
+message InstallSnapshotRequest {
+  // Term of the rpc originator.
+  int64 term = 1;
+
+  // Current leader. Always the originator of the rpc.
+  Server leader = 2;
+
+  // The id of the latest entry included in the snapshot. The snapshot replaces
+  // all entries up to (and including) this one on the receiver.
+  EntryId last = 3;
+
+  // The snapshot bytes, as obtained from the state machine.
+  // TODO(dino): send chunks instead of entire snapshots.
+  bytes snapshot = 4;
+}
+
+message InstallSnapshotResponse {
+  // Term of the rpc recipient.
+  int64 term = 1;
+}
+
 service Raft {
   rpc Vote (VoteRequest) returns (VoteResponse) {}
   rpc Append (AppendRequest) returns (AppendResponse) {}
   rpc Commit (CommitRequest) returns (CommitResponse) {}
   rpc StepDown (StepDownRequest) returns (StepDownResponse) {}
+  rpc InstallSnapshot (InstallSnapshotRequest) returns (InstallSnapshotResponse) {}
 }
 
