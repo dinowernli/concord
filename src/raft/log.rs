@@ -5,6 +5,9 @@ use raft_proto::{Entry, EntryId};
 // Represents a contiguous slice of a raft log.
 pub struct LogSlice {
     entries: Vec<Entry>,
+
+    // The sum of the sizes of all payloads in the stored entries.
+    size_bytes: i64,
 }
 
 // The possible outcomes of asking a log slice whether an entry id is
@@ -28,6 +31,7 @@ impl LogSlice {
     pub fn new() -> Self {
         LogSlice {
             entries: Vec::new(),
+            size_bytes: 0,
         }
     }
 
@@ -39,6 +43,7 @@ impl LogSlice {
             None => (),
         }
 
+        let size_bytes = payload.len() as i64;
         let mut entry_id = EntryId::new();
         entry_id.set_term(term);
         entry_id.set_index(self.next_index());
@@ -48,6 +53,7 @@ impl LogSlice {
         entry.set_payload(payload);
 
         self.entries.push(entry);
+        self.size_bytes += size_bytes;
         entry_id
     }
 
@@ -132,18 +138,39 @@ impl LogSlice {
         assert!(!entries.is_empty(), "append_all called with empty entries");
 
         for entry in entries {
+            let size_bytes = entry.payload.len() as i64;
             let index = entry.get_id().get_index();
             if index == self.next_index() {
                 self.entries.push(entry.clone());
+                self.size_bytes += size_bytes;
             } else {
                 let local_index = self.local_index(index);
+                self.size_bytes -= self.entries[local_index].payload.len() as i64;
                 self.entries[local_index] = entry.clone();
+                self.size_bytes += size_bytes;
             }
         }
 
+        // Remove anything that comes after the end of the provided entries.
         let last = entries.last().unwrap().get_id();
         let local_index = self.local_index(last.get_index());
-        self.entries.truncate(local_index + 1);
+        for entry in self.entries.drain((local_index + 1)..) {
+            self.size_bytes -= entry.payload.len() as i64;
+        }
+    }
+
+    // Removes all contents from this instance, leaving it empty.
+    pub fn clear(&mut self) {
+        self.entries = Vec::new();
+        self.size_bytes = 0;
+    }
+
+    // Returns the total size in bytes of all stored payloads. This is an
+    // approximation of the total memory occupied by this instance. Note that
+    // the size of the entry metadata and other meta structures are not
+    // included in this returned value).
+    pub fn size_bytes(&self) -> i64 {
+        self.size_bytes as i64
     }
 
     // Returns all entries strictly after the supplied id. Must only be called
@@ -213,6 +240,33 @@ mod tests {
         assert_eq!(0, l.next_index());
         assert!(l.first_index().is_none());
         assert!(l.last_id().is_none());
+    }
+
+    #[test]
+    fn test_size_bytes() {
+        let mut l = LogSlice::new();
+        assert_eq!(0, l.size_bytes());
+
+        l.append(13 /* term */, payload_of_size(25));
+        assert_eq!(25, l.size_bytes());
+
+        l.append(13 /* term */, payload_of_size(4));
+        assert_eq!(29, l.size_bytes());
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut l = LogSlice::new();
+        assert_eq!(0, l.size_bytes());
+
+        l.append(13 /* term */, payload_of_size(25));
+        assert_eq!(25, l.size_bytes());
+
+        l.clear();
+        assert_eq!(0, l.size_bytes());
+
+        l.clear();
+        assert_eq!(0, l.size_bytes());
     }
 
     #[test]
@@ -305,7 +359,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn test_bad_append() {
+    fn test_append_bad_term() {
         let mut l = create_default_slice();
         l.append(73, "bad term".as_bytes().to_vec());
     }
@@ -318,21 +372,78 @@ mod tests {
         assert_eq!(6, id.get_index());
     }
 
+    #[test]
+    fn test_append_all() {
+        let mut l = create_default_slice();
+
+        // Validate the initial state.
+        assert_eq!(l.first_index().unwrap(), 0);
+        assert_eq!(l.last_id().unwrap().index, 5);
+        let initial_size_bytes = 6;
+        assert_eq!(l.size_bytes(), initial_size_bytes);
+
+        // This should replace entries 3 and 4, and remove entry 5
+        l.append_all(&[
+            entry(75, 3 /* index */, 10 /* size */),
+            entry(75, 4 /* index */, 10 /* size */),
+        ]);
+        assert_eq!(l.first_index().unwrap(), 0);
+        assert_eq!(l.last_id().unwrap().index, 4);
+        let size_bytes = initial_size_bytes - 3 + 20;
+        assert_eq!(l.size_bytes(), size_bytes);
+
+        // This should just append a new entry 5
+        l.append_all(&[entry(76, 5 /* index */, 10 /* size */)]);
+        assert_eq!(l.last_id().unwrap().index, 5);
+        let new_size_bytes = size_bytes + 10;
+        assert_eq!(l.size_bytes(), new_size_bytes);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_append_all_empty() {
+        let mut l = create_default_slice();
+        l.append_all(&[]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_append_far_future_index() {
+        let mut l = LogSlice::new();
+
+        // Make an append with indexes that are far in the future.
+        l.append_all(&[
+            entry(75, 45 /* index */, 10 /* size */),
+            entry(75, 46 /* index */, 10 /* size */),
+        ]);
+    }
+
     fn create_default_slice() -> LogSlice {
         let mut result = LogSlice::new();
-        result.append(71 /* term */, "some payload".as_bytes().to_vec());
-        result.append(72 /* term */, "some payload".as_bytes().to_vec());
-        result.append(73 /* term */, "some payload".as_bytes().to_vec());
-        result.append(73 /* term */, "some payload".as_bytes().to_vec());
-        result.append(73 /* term */, "some payload".as_bytes().to_vec());
-        result.append(74 /* term */, "some payload".as_bytes().to_vec());
+        result.append(71 /* term */, payload_of_size(1));
+        result.append(72 /* term */, payload_of_size(1));
+        result.append(73 /* term */, payload_of_size(1));
+        result.append(73 /* term */, payload_of_size(1));
+        result.append(73 /* term */, payload_of_size(1));
+        result.append(74 /* term */, payload_of_size(1));
         result
+    }
+
+    fn payload_of_size(size_bytes: i64) -> Vec<u8> {
+        [3].repeat(size_bytes as usize)
     }
 
     fn entry_id(term: i64, index: i64) -> EntryId {
         let mut result = EntryId::new();
         result.set_index(index);
         result.set_term(term);
+        return result;
+    }
+
+    fn entry(term: i64, index: i64, payload_size_bytes: i64) -> Entry {
+        let mut result = Entry::new();
+        result.set_payload(payload_of_size(payload_size_bytes));
+        result.set_id(entry_id(term, index));
         return result;
     }
 }
