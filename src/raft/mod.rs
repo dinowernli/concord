@@ -8,7 +8,6 @@
 // The implementation in this module is based on the paper at:
 // https://raft.github.io/raft.pdf
 
-
 #[path = "generated/raft_proto.rs"]
 pub mod raft_proto;
 

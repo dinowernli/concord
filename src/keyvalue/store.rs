@@ -1,6 +1,6 @@
 extern crate bytes;
-extern crate protobuf;
 extern crate im;
+extern crate protobuf;
 
 use crate::keyvalue::keyvalue_proto;
 use crate::raft::{StateMachine, StateMachineResult};
@@ -105,10 +105,13 @@ impl MapStore {
         let min = self.versions.front().expect("non-empty").version;
         let max = self.versions.back().expect("non-empty").version;
         if version < min || version > max {
-            return Err(StoreError::new(format!(
-                "Invalid version {}, expected in range [{}, {}]",
-                version, min, max
-            ).as_str()));
+            return Err(StoreError::new(
+                format!(
+                    "Invalid version {}, expected in range [{}, {}]",
+                    version, min, max
+                )
+                .as_str(),
+            ));
         }
         Ok((version - min) as usize)
     }
@@ -116,12 +119,19 @@ impl MapStore {
 
 impl Store for MapStore {
     fn get(&self, key: &Bytes) -> Option<Bytes> {
-        self.get_at(key, self.latest_version()).expect("valid version")
+        self.get_at(key, self.latest_version())
+            .expect("valid version")
     }
 
     fn get_at(&self, key: &Bytes, version: i64) -> Result<Option<Bytes>, StoreError> {
         let index = self.version_index(version)?;
-        Ok(self.versions.get(index).expect("valid index").data.get(key).cloned())
+        Ok(self
+            .versions
+            .get(index)
+            .expect("valid index")
+            .data
+            .get(key)
+            .cloned())
     }
 
     fn set(&mut self, key: Bytes, value: Bytes) {
