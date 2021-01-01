@@ -151,6 +151,7 @@ impl LogSlice {
             }
         }
 
+        // Remove anything that comes after the end of the provided entries.
         let last = entries.last().unwrap().get_id();
         let local_index = self.local_index(last.get_index());
         for entry in self.entries.drain((local_index + 1)..) {
@@ -358,7 +359,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn test_bad_append() {
+    fn test_append_bad_term() {
         let mut l = create_default_slice();
         l.append(73, "bad term".as_bytes().to_vec());
     }
@@ -391,11 +392,30 @@ mod tests {
         let size_bytes = initial_size_bytes - 3 + 20;
         assert_eq!(l.size_bytes(), size_bytes);
 
-        // This should just append
+        // This should just append a new entry 5
         l.append_all(&[entry(76, 5 /* index */, 10 /* size */)]);
         assert_eq!(l.last_id().unwrap().index, 5);
         let new_size_bytes = size_bytes + 10;
         assert_eq!(l.size_bytes(), new_size_bytes);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_append_all_empty() {
+        let mut l = create_default_slice();
+        l.append_all(&[]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_append_far_future_index() {
+        let mut l = LogSlice::new();
+
+        // Make an append with indexes that are far in the future.
+        l.append_all(&[
+            entry(75, 45 /* index */, 10 /* size */),
+            entry(75, 46 /* index */, 10 /* size */),
+        ]);
     }
 
     fn create_default_slice() -> LogSlice {
