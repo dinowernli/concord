@@ -63,7 +63,7 @@ impl RaftImpl {
             state: Arc::new(Mutex::new(RaftState {
                 term: 0,
                 voted_for: None,
-                log: LogSlice::new(),
+                log: LogSlice::initial(),
                 state_machine: state_machine,
 
                 committed: -1,

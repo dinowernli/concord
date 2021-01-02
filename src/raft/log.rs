@@ -8,6 +8,10 @@ pub struct LogSlice {
 
     // The sum of the sizes of all payloads in the stored entries.
     size_bytes: i64,
+
+    // The id of the entry immediately *before* this log slice, or a (-1, -1)
+    // sentinel entry if this slice starts at the beginning of time.
+    previous_id: EntryId,
 }
 
 // The possible outcomes of asking a log slice whether an entry id is
@@ -28,29 +32,35 @@ pub enum ContainsResult {
 }
 
 impl LogSlice {
-    pub fn new() -> Self {
+    // Returns a new instance with no entries, starting at some position in
+    // the middle of the log. The "previous_id" parameter holds the id of
+    // the last element in the log *not present* in this slice, i.e., the entry
+    // immediately before this slice starts.
+    pub fn new(previous_id: EntryId) -> Self {
         LogSlice {
             entries: Vec::new(),
             size_bytes: 0,
+            previous_id: previous_id,
         }
+    }
+
+    // Returns a new instance with no entries, representing the *beginning* of
+    // the log, i.e., the next expected entry has index 0.
+    pub fn initial() -> Self {
+        let mut sentinel = EntryId::new();
+        sentinel.set_term(-1);
+        sentinel.set_index(-1);
+        Self::new(sentinel)
     }
 
     // Adds a new entry to the end of the slice. Returns the id of the
     // newly appended entry.
     pub fn append(&mut self, term: i64, payload: Vec<u8>) -> EntryId {
-        match self.last_id() {
-            Some(id) => assert!(term >= id.get_term()),
-            None => (),
-        }
+        assert!(term >= self.last_known_id().get_term());
 
         let size_bytes = payload.len() as i64;
-        let mut entry_id = EntryId::new();
-        entry_id.set_term(term);
-        entry_id.set_index(self.next_index());
-
-        let mut entry = Entry::new();
-        entry.set_id(entry_id.clone());
-        entry.set_payload(payload);
+        let entry = create_entry(term, self.next_index(), payload);
+        let entry_id = entry.get_id().clone();
 
         self.entries.push(entry);
         self.size_bytes += size_bytes;
@@ -67,33 +77,28 @@ impl LogSlice {
         self.entries.last().map(|entry| entry.get_id().clone())
     }
 
-    // Returns the expected index of the next element which will be added to
-    // the log. If the log is empty, this is index 0, otherwise it's the index
-    // one greater than the last entry present.
+    // Returns the expected index of the next element added to the log.
     pub fn next_index(&self) -> i64 {
-        match self.entries.last() {
-            Some(entry) => entry.get_id().get_index() + 1,
-            None => 0,
-        }
+        self.last_known_id().get_index() + 1
     }
 
     // Returns true if the supplied last entry id is at least as up-to-date
     // as the slice of the log tracked by this instance.
-    pub fn is_up_to_date(&self, last: &EntryId) -> bool {
-        if self.entries.is_empty() {
-            return true;
-        }
+    pub fn is_up_to_date(&self, other_last: &EntryId) -> bool {
+        let this_last = match self.entries.last() {
+            Some(entry) => entry.get_id(),
+            None => &self.previous_id,
+        };
 
-        let this_last = self.last_id().unwrap();
-        if this_last.get_term() != last.get_term() {
-            return last.get_term() > this_last.get_term();
+        if this_last.get_term() != other_last.get_term() {
+            return other_last.get_term() > this_last.get_term();
         }
 
         // Terms are equal, last index decides.
-        return last.get_index() >= this_last.get_index();
+        return other_last.get_index() >= this_last.get_index();
     }
 
-    // Returns true if the supplied entry
+    // Returns true if the supplied entry is present in this slice.
     pub fn contains(&self, query: &EntryId) -> ContainsResult {
         // Special case where we've never seen an entry and the request comes
         // in for the special "-1" index.
@@ -159,12 +164,6 @@ impl LogSlice {
         }
     }
 
-    // Removes all contents from this instance, leaving it empty.
-    pub fn clear(&mut self) {
-        self.entries = Vec::new();
-        self.size_bytes = 0;
-    }
-
     // Returns the total size in bytes of all stored payloads. This is an
     // approximation of the total memory occupied by this instance. Note that
     // the size of the entry metadata and other meta structures are not
@@ -178,12 +177,10 @@ impl LogSlice {
     pub fn get_entries_after(&self, entry_id: &EntryId) -> Vec<Entry> {
         assert_eq!(ContainsResult::PRESENT, self.contains(entry_id));
 
-        let start_idx = entry_id.get_index() + 1;
-        if start_idx == 0 && self.entries.is_empty() {
+        let local_start_idx = self.local_index(entry_id.get_index() + 1);
+        if local_start_idx >= self.entries.len() {
             return Vec::new();
         }
-
-        let local_start_idx = self.local_index(start_idx);
 
         let mut result = Vec::new();
         for value in &self.entries[local_start_idx..] {
@@ -212,15 +209,35 @@ impl LogSlice {
     // log index. Must only be called if the index is known to be within range
     // of this slice.
     fn local_index(&self, index: i64) -> usize {
-        let adjusted = index - self.first_index().expect("cannot be empty");
+        let adjusted = index - self.previous_id.get_index() - 1;
         assert!(adjusted >= 0, "adjusted index out of range");
         adjusted as usize
     }
 
     // Returns true if this slice starts at the beginning of time.
     fn starts_at_beginning_of_time(&self) -> bool {
-        self.entries.is_empty() || self.first_index().unwrap() == 0
+        self.previous_id.index == -1
     }
+
+    // Returns the highest index known to exist (even if the entry is not held
+    // in this instance). Returns -1 if there are no known entries at all.
+    fn last_known_id(&self) -> &EntryId {
+        match self.entries.last() {
+            Some(entry) => entry.get_id(),
+            None => &self.previous_id,
+        }
+    }
+}
+
+fn create_entry(term: i64, index: i64, payload: Vec<u8>) -> Entry {
+    let mut entry_id = EntryId::new();
+    entry_id.set_term(term);
+    entry_id.set_index(index);
+
+    let mut entry = Entry::new();
+    entry.set_id(entry_id);
+    entry.set_payload(payload);
+    entry
 }
 
 #[cfg(test)]
@@ -229,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_empty() {
-        let l = LogSlice::new();
+        let l = LogSlice::initial();
 
         assert_eq!(ContainsResult::PRESENT, l.contains(&entry_id(-1, -1)));
         assert!(l.starts_at_beginning_of_time());
@@ -244,7 +261,7 @@ mod tests {
 
     #[test]
     fn test_size_bytes() {
-        let mut l = LogSlice::new();
+        let mut l = LogSlice::initial();
         assert_eq!(0, l.size_bytes());
 
         l.append(13 /* term */, payload_of_size(25));
@@ -255,33 +272,15 @@ mod tests {
     }
 
     #[test]
-    fn test_clear() {
-        let mut l = LogSlice::new();
-        assert_eq!(0, l.size_bytes());
-
-        l.append(13 /* term */, payload_of_size(25));
-        assert_eq!(25, l.size_bytes());
-
-        l.clear();
-        assert_eq!(0, l.size_bytes());
-
-        l.clear();
-        assert_eq!(0, l.size_bytes());
-    }
-
-    #[test]
     fn test_single_entry() {
-        let mut l = LogSlice::new();
+        let mut l = LogSlice::initial();
         l.append(72 /* term */, "some payload".as_bytes().to_vec());
 
+        let expected_id = entry_id(72 /* term */, 0 /* index */);
+
         assert!(l.starts_at_beginning_of_time());
-        assert_eq!(0, l.first_index().unwrap());
-        assert_eq!(72, l.last_id().unwrap().get_term());
-
-        let id = l.id_at(0);
-        assert_eq!(0, id.get_index());
-        assert_eq!(72, id.get_term());
-
+        assert_eq!(&l.last_id().unwrap(), &expected_id);
+        assert_eq!(&l.id_at(0), &expected_id);
         assert_eq!(1, l.next_index());
     }
 
@@ -409,7 +408,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_append_far_future_index() {
-        let mut l = LogSlice::new();
+        let mut l = LogSlice::new(entry_id(75, 10));
 
         // Make an append with indexes that are far in the future.
         l.append_all(&[
@@ -419,7 +418,7 @@ mod tests {
     }
 
     fn create_default_slice() -> LogSlice {
-        let mut result = LogSlice::new();
+        let mut result = LogSlice::initial();
         result.append(71 /* term */, payload_of_size(1));
         result.append(72 /* term */, payload_of_size(1));
         result.append(73 /* term */, payload_of_size(1));
