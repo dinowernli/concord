@@ -855,17 +855,13 @@ mod tests {
     #[test]
     fn test_append() {
         let raft = create_raft();
+        let raft_state = raft.state.clone();
+        let server = create_grpc_server(raft);
+
         let leader = create_fake_server_list()[1].clone();
-
-        let mut server_builder = grpc::ServerBuilder::new_plain();
-        raft.start();
-        server_builder.add_service(RaftServer::new_service_def(raft));
-        server_builder.http.set_port(0);
-        let server = server_builder.build().expect("server");
-
         let mut request = AppendRequest::new();
         request.set_term(12);
-        request.set_leader(leader);
+        request.set_leader(leader.clone());
         request.set_previous(entry_id(10, 75));
         request.set_entries(RepeatedField::from(vec![
             entry(entry_id(10, 76), Vec::new()),
@@ -873,10 +869,7 @@ mod tests {
         ]));
         request.set_committed(0);
 
-        let client_conf = Default::default();
-        let port = server.local_addr().port().expect("port");
-        let client = RaftClient::new_plain("::1", port, client_conf).expect("client");
-
+        let client = create_grpc_client(&server);
         let fut = client
             .append(grpc::RequestOptions::new(), request.clone())
             .drop_metadata();
@@ -887,6 +880,10 @@ mod tests {
 
         // The entries were too far in the future, the append should fail.
         assert!(!result.get_success());
+
+        // The raft server should acknowledge the new leader.
+        let state = raft_state.lock().unwrap();
+        assert_eq!(state.last_known_leader, Some(leader.clone()));
     }
 
     fn entry(id: EntryId, payload: Vec<u8>) -> Entry {
@@ -933,6 +930,20 @@ mod tests {
         result.set_host("::1".to_string());
         result.set_port(port);
         result
+    }
+
+    fn create_grpc_server(raft: RaftImpl) -> grpc::Server {
+        let mut server_builder = grpc::ServerBuilder::new_plain();
+        raft.start();
+        server_builder.add_service(RaftServer::new_service_def(raft));
+        server_builder.http.set_port(0);
+        server_builder.build().expect("server")
+    }
+
+    fn create_grpc_client(server: &grpc::Server) -> RaftClient {
+        let client_conf = Default::default();
+        let port = server.local_addr().port().expect("port");
+        RaftClient::new_plain("::1", port, client_conf).expect("client")
     }
 
     struct FakeStateMachine {}
