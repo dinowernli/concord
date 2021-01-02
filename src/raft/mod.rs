@@ -20,7 +20,7 @@ mod client;
 pub use client::Client;
 
 mod consensus;
-pub use consensus::RaftImpl;
+pub use consensus::{Config, RaftImpl};
 
 mod diagnostics;
 pub use diagnostics::Diagnostics;

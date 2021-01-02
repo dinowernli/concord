@@ -53,7 +53,7 @@ pub struct Config {
 }
 
 impl Config {
-    fn default() -> Self {
+    pub fn default() -> Self {
         Config {
             follower_timeout_ms: DEFAULT_FOLLOWER_TIMEOUTS_MS,
             candidate_timeouts_ms: DEFAULT_CANDIDATE_TIMEOUT_MS,
@@ -75,16 +75,17 @@ impl RaftImpl {
         all: &Vec<Server>,
         state_machine: Box<dyn StateMachine + Send>,
         diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
+        config: Config,
     ) -> RaftImpl {
         RaftImpl {
             address: server.clone(),
             state: Arc::new(Mutex::new(RaftState {
-                config: Config::default(),
+                config,
 
                 term: 0,
                 voted_for: None,
                 log: LogSlice::initial(),
-                state_machine: state_machine,
+                state_machine,
 
                 committed: -1,
                 applied: -1,
