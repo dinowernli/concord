@@ -64,9 +64,13 @@ impl LogSlice {
         entry_id
     }
 
-    // Returns the latest entry id currently in the log slice.
-    pub fn last_id(&self) -> Option<EntryId> {
-        self.entries.last().map(|entry| entry.get_id().clone())
+    // Returns the highest index known to exist (even if the entry is not held
+    // in this instance). Returns -1 if there are no known entries at all.
+    pub fn last_known_id(&self) -> &EntryId {
+        match self.entries.last() {
+            Some(entry) => entry.get_id(),
+            None => &self.previous_id,
+        }
     }
 
     // Returns the expected index of the next element added to the log.
@@ -163,19 +167,25 @@ impl LogSlice {
     }
 
     // Returns the entry id for the entry at the supplied index. Must only be
-    // called if the index is present in the slice.
+    // called if the index is known to this slice.
+    //
+    // Note that for the entry immediately before the start of this slice, the
+    // entry id can be returned, but not the full entry.
     pub fn id_at(&self, index: i64) -> EntryId {
-        self.entries
-            .get(self.local_index(index))
-            .unwrap()
-            .get_id()
-            .clone()
+        if index == self.previous_id.get_index() {
+            return self.previous_id.clone();
+        }
+        let local_idx = self.local_index(index);
+        assert!(local_idx <= self.entries.len());
+        self.entries.get(local_idx).unwrap().get_id().clone()
     }
 
     // Returns the entry at the supplied index. Must only be called if the index
     // is present in the slice.
     pub fn entry_at(&self, index: i64) -> Entry {
-        self.entries.get(self.local_index(index)).unwrap().clone()
+        let local_idx = self.local_index(index);
+        assert!(local_idx <= self.entries.len());
+        self.entries.get(local_idx).unwrap().clone()
     }
 
     // Returns the position in the slice vector associated with the supplied
@@ -185,15 +195,6 @@ impl LogSlice {
         let adjusted = index - self.previous_id.get_index() - 1;
         assert!(adjusted >= 0, "adjusted index out of range");
         adjusted as usize
-    }
-
-    // Returns the highest index known to exist (even if the entry is not held
-    // in this instance). Returns -1 if there are no known entries at all.
-    fn last_known_id(&self) -> &EntryId {
-        match self.entries.last() {
-            Some(entry) => entry.get_id(),
-            None => &self.previous_id,
-        }
     }
 }
 
@@ -213,16 +214,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_empty() {
+    fn test_initial() {
         let l = LogSlice::initial();
-
         assert_eq!(l.contains(&entry_id(-1, -1)), ContainsResult::COMPACTED);
 
         let after = l.get_entries_after(&entry_id(-1, -1));
         assert!(after.is_empty());
-
         assert_eq!(0, l.next_index());
-        assert!(l.last_id().is_none());
+    }
+
+    #[test]
+    fn test_empty() {
+        let previous = entry_id(65 /* term */, 17 /* index */);
+        let l = LogSlice::new(previous.clone());
+
+        assert_eq!(l.size_bytes(), 0);
+        assert_eq!(l.next_index(), 18);
     }
 
     #[test]
@@ -244,15 +251,8 @@ mod tests {
 
         let expected_id = entry_id(72 /* term */, 0 /* index */);
 
-        assert_eq!(&l.last_id().unwrap(), &expected_id);
         assert_eq!(&l.id_at(0), &expected_id);
         assert_eq!(1, l.next_index());
-    }
-
-    #[test]
-    fn test_last() {
-        let l = create_default_slice();
-        assert_eq!(74, l.last_id().unwrap().get_term());
     }
 
     #[test]
@@ -284,6 +284,28 @@ mod tests {
         let j = l.id_at(4);
         assert_eq!(4, j.get_index());
         assert_eq!(73, j.get_term());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_entry_at_previous() {
+        let l = LogSlice::new(entry_id(75 /* term */, 17 /* index */));
+
+        // Even though the id is known, the entry is not present.
+        l.entry_at(17);
+    }
+
+    #[test]
+    fn test_id_at_previous() {
+        let previous = entry_id(75 /* term */, 17 /* index */);
+        let l = LogSlice::new(previous.clone());
+        assert_eq!(l.id_at(17), previous);
+    }
+
+    #[test]
+    fn test_id_at_initial() {
+        let l = LogSlice::initial();
+        assert_eq!(l.id_at(-1), entry_id(-1, -1));
     }
 
     #[test]
@@ -325,12 +347,36 @@ mod tests {
     }
 
     #[test]
-    fn test_append_all() {
+    fn test_append_all_from_initial() {
+        let mut l = LogSlice::initial();
+        l.append_all(&[
+            entry(75, 0 /* index */, 10 /* size */),
+            entry(75, 1 /* index */, 10 /* size */),
+        ]);
+        assert_eq!(l.id_at(0), entry_id(75, 0));
+        assert_eq!(l.id_at(1), entry_id(75, 1));
+    }
+
+    #[test]
+    fn test_append_all_from_empty() {
+        let mut l = LogSlice::new(entry_id(75, 17 /* index */));
+        l.append_all(&[
+            entry(75, 18 /* index */, 10 /* size */),
+            entry(75, 19 /* index */, 10 /* size */),
+        ]);
+        assert_eq!(l.id_at(18), entry_id(75, 18));
+        assert_eq!(l.id_at(19), entry_id(75, 19));
+        assert_eq!(l.next_index(), 20);
+    }
+
+    #[test]
+    fn test_append_all_replaces_tail() {
         let mut l = create_default_slice();
 
         // Validate the initial state.
         assert_eq!(l.id_at(0).get_index(), 0);
-        assert_eq!(l.last_id().unwrap().index, 5);
+        assert_eq!(l.id_at(5).get_index(), 5);
+        assert_eq!(l.next_index(), 6);
         let initial_size_bytes = 6;
         assert_eq!(l.size_bytes(), initial_size_bytes);
 
@@ -340,27 +386,27 @@ mod tests {
             entry(75, 4 /* index */, 10 /* size */),
         ]);
         assert_eq!(l.id_at(0).get_index(), 0);
-        assert_eq!(l.last_id().unwrap().index, 4);
+        assert_eq!(l.next_index(), 5);
         let size_bytes = initial_size_bytes - 3 + 20;
         assert_eq!(l.size_bytes(), size_bytes);
 
         // This should just append a new entry 5
         l.append_all(&[entry(76, 5 /* index */, 10 /* size */)]);
-        assert_eq!(l.last_id().unwrap().index, 5);
+        assert_eq!(l.next_index(), 6);
         let new_size_bytes = size_bytes + 10;
         assert_eq!(l.size_bytes(), new_size_bytes);
     }
 
     #[test]
     #[should_panic]
-    fn test_append_all_empty() {
+    fn test_append_all_with_empty_entries_panics() {
         let mut l = create_default_slice();
         l.append_all(&[]);
     }
 
     #[test]
     #[should_panic]
-    fn test_append_far_future_index() {
+    fn test_append_far_future_index_panics() {
         let mut l = LogSlice::new(entry_id(75, 10));
 
         // Make an append with indexes that are far in the future.
@@ -368,6 +414,15 @@ mod tests {
             entry(75, 45 /* index */, 10 /* size */),
             entry(75, 46 /* index */, 10 /* size */),
         ]);
+    }
+
+    #[test]
+    fn test_last_known_id() {
+        let initial = LogSlice::initial();
+        assert_eq!(initial.last_known_id(), &entry_id(-1, -1));
+
+        let other = LogSlice::new(entry_id(6, 8));
+        assert_eq!(other.last_known_id(), &entry_id(6, 8));
     }
 
     fn create_default_slice() -> LogSlice {

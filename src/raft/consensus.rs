@@ -378,11 +378,10 @@ impl RaftState {
     fn create_append_request(&self, follower: &Server) -> AppendRequest {
         // Construct the id of the last known index to be replicated on the follower.
         let position = self.followers.get(address_key(&follower).as_str()).unwrap();
-        let previous = if position.next_index > 0 {
-            self.log.id_at(position.next_index - 1)
-        } else {
-            sentinel_entry_id()
-        };
+
+        // TODO(dino): Before enabling snapshots, handle the case where the index
+        // the follower wants has already been compacted locally.
+        let previous = self.log.id_at(position.next_index - 1);
 
         let mut request = AppendRequest::new();
         request.set_term(self.term);
@@ -503,7 +502,7 @@ impl RaftState {
         let mut request = VoteRequest::new();
         request.set_term(self.term);
         request.set_candidate(self.address.clone());
-        request.set_last(self.log.last_id().unwrap_or(sentinel_entry_id()));
+        request.set_last(self.log.last_known_id().clone());
         request
     }
 }
@@ -762,11 +761,4 @@ fn address_key(address: &Server) -> String {
 
 fn entry_id_key(entry_id: &EntryId) -> String {
     format!("(term={},id={})", entry_id.term, entry_id.index)
-}
-
-fn sentinel_entry_id() -> EntryId {
-    let mut result = EntryId::new();
-    result.set_term(-1);
-    result.set_index(-1);
-    return result;
 }
