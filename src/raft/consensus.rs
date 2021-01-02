@@ -525,12 +525,6 @@ impl Raft for RaftImpl {
 
         // Reject anything from an outdated term.
         if state.term > request.get_term() {
-            info!(
-                "[{:?}] Our term {} is higher than incoming request term {}",
-                self.address,
-                state.term,
-                request.get_term(),
-            );
             let mut result = VoteResponse::new();
             result.set_term(state.term);
             result.set_granted(false);
@@ -581,27 +575,49 @@ impl Raft for RaftImpl {
         );
 
         let mut state = self.state.lock().unwrap();
-        let mut result = AppendResponse::new();
-        result.set_term(state.term);
 
+        // Handle the case where we are ahead of the leader. We inform the
+        // leader of our (greater) term and fail the append.
+        if state.term > request.get_term() {
+            let mut result = AppendResponse::new();
+            result.set_term(state.term);
+            result.set_success(false);
+            return sink.finish(result);
+        }
+
+        // If the leader's term is greater than ours, we update ours to match
+        // by resetting to a "clean" follower state for the leader's (greater)
+        // term. Note that we then handle the leader's append afterwards.
         if request.get_term() > state.term {
             RaftImpl::become_follower(&mut state, self.state.clone(), request.get_term());
-            result.set_success(false);
-            result.set_term(state.term);
-            return sink.finish(result);
         }
 
-        if state.term > request.get_term() {
-            result.set_success(false);
-            return sink.finish(result);
-        }
-
+        // Record the latest leader.
         let leader = request.get_leader().clone();
         state.last_known_leader = Some(leader.clone());
         match &state.diagnostics {
             Some(d) => d.lock().unwrap().report_leader(state.term, &leader),
             _ => (),
         }
+
+        // Reset the election timer
+        let term = state.term;
+        let arc_state = self.state.clone();
+        let me = state.address.clone();
+        state.timer_guard = Some(state.timer.schedule_with_delay(
+            chrono::Duration::milliseconds(add_jitter(FOLLOWER_TIMEOUTS_MS)),
+            move || {
+                let arc_state = arc_state.clone();
+                let me = me.clone();
+                task::spawn(async move {
+                    info!("[{:?}] Timed out waiting for leader heartbeat", &me);
+                    RaftImpl::election_loop(arc_state.clone(), term + 1).await;
+                });
+            },
+        ));
+
+        let mut result = AppendResponse::new();
+        result.set_term(state.term);
 
         // Make sure we have the previous log index sent.
         match state.log.contains(request.get_previous()) {
@@ -620,32 +636,16 @@ impl Raft for RaftImpl {
             state.log.append_all(request.get_entries());
         }
 
+        // If the leader considers an entry committed, it is guaranteed that
+        // all members of the cluster agree on the log up to that index, so it
+        // is safe to apply the entries to the state machine.
         let leader_commit = request.get_committed();
         if leader_commit > state.committed {
             state.committed = leader_commit;
             state.apply_committed();
         }
 
-        // TODO(dino): Also reset the timer if we return failure above!
-
-        // Reset the election timer
-        let term = state.term;
-        let arc_state = self.state.clone();
-        let me = state.address.clone();
-        state.timer_guard = Some(state.timer.schedule_with_delay(
-            chrono::Duration::milliseconds(add_jitter(FOLLOWER_TIMEOUTS_MS)),
-            move || {
-                let arc_state = arc_state.clone();
-                let me = me.clone();
-                task::spawn(async move {
-                    info!("[{:?}] Timed out waiting for leader heartbeat", &me);
-                    RaftImpl::election_loop(arc_state.clone(), term + 1).await;
-                });
-            },
-        ));
-
         debug!("[{:?}] Successfully processed heartbeat", &state.address);
-
         result.set_success(true);
         return sink.finish(result);
     }
