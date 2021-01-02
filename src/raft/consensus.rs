@@ -28,7 +28,9 @@ use timer::Timer;
 use bytes::{Buf, Bytes};
 use diagnostics::ServerDiagnostics;
 use raft::log::{ContainsResult, LogSlice};
-use raft_proto::{AppendRequest, AppendResponse, EntryId, Server, VoteRequest, VoteResponse};
+use raft_proto::{
+    AppendRequest, AppendResponse, Entry, EntryId, Server, VoteRequest, VoteResponse,
+};
 use raft_proto::{CommitRequest, CommitResponse, Status, StepDownRequest, StepDownResponse};
 use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 use raft_proto_grpc::{Raft, RaftClient};
@@ -331,7 +333,7 @@ struct FollowerPosition {
     match_index: i64,
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum RaftRole {
     Follower,
     Candidate,
@@ -831,4 +833,119 @@ fn address_key(address: &Server) -> String {
 
 fn entry_id_key(entry_id: &EntryId) -> String {
     format!("(term={},id={})", entry_id.term, entry_id.index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raft::StateMachineResult;
+    use futures::executor;
+    use raft_proto_grpc::RaftServer;
+
+    #[test]
+    fn test_initial_state() {
+        let raft = create_raft();
+        let state = raft.state.lock().unwrap();
+        assert_eq!(state.role, RaftRole::Follower);
+        assert_eq!(state.term, 0);
+        assert_eq!(state.committed, -1);
+        assert_eq!(state.applied, -1);
+    }
+
+    #[test]
+    fn test_append() {
+        let raft = create_raft();
+        let leader = create_fake_server_list()[1].clone();
+
+        let mut server_builder = grpc::ServerBuilder::new_plain();
+        raft.start();
+        server_builder.add_service(RaftServer::new_service_def(raft));
+        server_builder.http.set_port(0);
+        let server = server_builder.build().expect("server");
+
+        let mut request = AppendRequest::new();
+        request.set_term(12);
+        request.set_leader(leader);
+        request.set_previous(entry_id(10, 75));
+        request.set_entries(RepeatedField::from(vec![
+            entry(entry_id(10, 76), Vec::new()),
+            entry(entry_id(10, 77), Vec::new()),
+        ]));
+        request.set_committed(0);
+
+        let client_conf = Default::default();
+        let port = server.local_addr().port().expect("port");
+        let client = RaftClient::new_plain("::1", port, client_conf).expect("client");
+
+        let fut = client
+            .append(grpc::RequestOptions::new(), request.clone())
+            .drop_metadata();
+        let result: AppendResponse = executor::block_on(fut).expect("result");
+
+        // Make sure the handler has updated its term.
+        assert_eq!(result.get_term(), 12);
+
+        // The entries were too far in the future, the append should fail.
+        assert!(!result.get_success());
+    }
+
+    fn entry(id: EntryId, payload: Vec<u8>) -> Entry {
+        let mut entry = Entry::new();
+        entry.set_payload(payload);
+        entry.set_id(id);
+        entry
+    }
+
+    fn entry_id(term: i64, index: i64) -> EntryId {
+        let mut entry_id = EntryId::new();
+        entry_id.set_term(term);
+        entry_id.set_index(index);
+        entry_id
+    }
+
+    fn create_raft() -> RaftImpl {
+        let servers = create_fake_server_list();
+        RaftImpl::new(
+            &servers[0].clone(),
+            &servers.clone(),
+            Box::new(FakeStateMachine {}),
+            None,
+            create_config_for_testing(),
+        )
+    }
+
+    fn create_config_for_testing() -> Config {
+        // Configs with very high timeouts to make sure none of them ever
+        // trigger during a unit test.
+        Config {
+            follower_timeout_ms: 100000000,
+            candidate_timeouts_ms: 100000000,
+            leader_replicate_ms: 100000000,
+        }
+    }
+
+    fn create_fake_server_list() -> Vec<Server> {
+        vec![create_server(1), create_server(2), create_server(3)]
+    }
+
+    fn create_server(port: i32) -> Server {
+        let mut result = Server::new();
+        result.set_host("::1".to_string());
+        result.set_port(port);
+        result
+    }
+
+    struct FakeStateMachine {}
+
+    impl StateMachine for FakeStateMachine {
+        fn apply(&mut self, _operation: &Bytes) -> StateMachineResult {
+            unimplemented!()
+        }
+        fn create_snapshot(&self) -> Bytes {
+            unimplemented!()
+        }
+        fn load_snapshot(&mut self, _snapshot: &Bytes) -> StateMachineResult {
+            unimplemented!()
+        }
+    }
 }
