@@ -777,6 +777,9 @@ impl Raft for RaftImpl {
             }
         }
 
+        // TODO(dino): Need to make sure that after installing a snaphot, the
+        // leader's request to append the next entry succeeds.
+
         let mut result = InstallSnapshotResponse::new();
         result.set_term(state.term);
         return sink.finish(result);
