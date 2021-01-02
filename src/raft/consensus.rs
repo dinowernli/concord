@@ -33,17 +33,34 @@ use raft_proto::{CommitRequest, CommitResponse, Status, StepDownRequest, StepDow
 use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 use raft_proto_grpc::{Raft, RaftClient};
 
-// Timeout after which a server in follower state starts a new election.
-const FOLLOWER_TIMEOUTS_MS: i64 = 2000;
+const DEFAULT_FOLLOWER_TIMEOUTS_MS: i64 = 2000;
+const DEFAULT_CANDIDATE_TIMEOUT_MS: i64 = 3000;
+const DEFAULT_LEADER_REPLICATE_MS: i64 = 500;
 
-// Timeout after which a server in candidate state declares its candidacy a
-// failure and starts a new election.
-const CANDIDATE_TIMEOUT_MS: i64 = 3000;
+// Parameters used to configure the behavior of a cluster participant.
+pub struct Config {
+    // Timeout after which a server in follower state starts a new election.
+    follower_timeout_ms: i64,
 
-// How frequently a leader will wake up and replicate entries to followers.
-// Note that this also serves as the leader's heartbeat, so this should be
-// lower than the follower timeout.
-const LEADER_REPLICATE_MS: i64 = 500;
+    // Timeout after which a server in candidate state declares its candidacy a
+    // failure and starts a new election.
+    candidate_timeouts_ms: i64,
+
+    // How frequently a leader will wake up and replicate entries to followers.
+    // Note that this also serves as the leader's heartbeat, so this should be
+    // lower than the follower timeout.
+    leader_replicate_ms: i64,
+}
+
+impl Config {
+    fn default() -> Self {
+        Config {
+            follower_timeout_ms: DEFAULT_FOLLOWER_TIMEOUTS_MS,
+            candidate_timeouts_ms: DEFAULT_CANDIDATE_TIMEOUT_MS,
+            leader_replicate_ms: DEFAULT_LEADER_REPLICATE_MS,
+        }
+    }
+}
 
 // Canonical implementation of the raft service. Acts as one server among peers
 // which form a cluster.
@@ -62,6 +79,8 @@ impl RaftImpl {
         RaftImpl {
             address: server.clone(),
             state: Arc::new(Mutex::new(RaftState {
+                config: Config::default(),
+
                 term: 0,
                 voted_for: None,
                 log: LogSlice::initial(),
@@ -99,8 +118,9 @@ impl RaftImpl {
         state.term = term;
         state.role = RaftRole::Follower;
         state.voted_for = None;
+        let timeout_ms = state.config.follower_timeout_ms;
         state.timer_guard = Some(state.timer.schedule_with_delay(
-            chrono::Duration::milliseconds(add_jitter(FOLLOWER_TIMEOUTS_MS)),
+            chrono::Duration::milliseconds(add_jitter(timeout_ms)),
             move || {
                 let arc_state = arc_state.clone();
                 let me = me.clone();
@@ -115,10 +135,16 @@ impl RaftImpl {
     // Keeps running elections until either the term changes, a leader has emerged,
     // or an own election has been won.
     async fn election_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
+        let timeout_ms = arc_state
+            .lock()
+            .unwrap()
+            .config
+            .candidate_timeouts_ms
+            .clone();
         let mut term = term;
         while !RaftImpl::run_election(arc_state.clone(), term).await {
             term = term + 1;
-            let sleep_ms = add_jitter(CANDIDATE_TIMEOUT_MS) as u64;
+            let sleep_ms = add_jitter(timeout_ms) as u64;
             task::sleep(Duration::from_millis(sleep_ms)).await;
         }
     }
@@ -213,6 +239,7 @@ impl RaftImpl {
     // moved on (or we otherwise detect we are no longer leader).
     async fn replicate_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
         let me = arc_state.lock().unwrap().address.clone();
+        let timeouts_ms = arc_state.lock().unwrap().config.leader_replicate_ms.clone();
         loop {
             {
                 let locked_state = arc_state.lock().unwrap();
@@ -230,7 +257,7 @@ impl RaftImpl {
             }
 
             RaftImpl::replicate_entries(arc_state.clone(), term).await;
-            let sleep_ms = add_jitter(LEADER_REPLICATE_MS) as u64;
+            let sleep_ms = add_jitter(timeouts_ms) as u64;
             task::sleep(Duration::from_millis(sleep_ms)).await;
         }
     }
@@ -311,6 +338,9 @@ enum RaftRole {
 }
 
 struct RaftState {
+    // Constant state.
+    config: Config,
+
     // Persistent raft state.
     term: i64,
     voted_for: Option<Server>,
@@ -604,8 +634,9 @@ impl Raft for RaftImpl {
         let term = state.term;
         let arc_state = self.state.clone();
         let me = state.address.clone();
+        let timeout_ms = state.config.follower_timeout_ms;
         state.timer_guard = Some(state.timer.schedule_with_delay(
-            chrono::Duration::milliseconds(add_jitter(FOLLOWER_TIMEOUTS_MS)),
+            chrono::Duration::milliseconds(add_jitter(timeout_ms)),
             move || {
                 let arc_state = arc_state.clone();
                 let me = me.clone();
@@ -765,7 +796,7 @@ impl Raft for RaftImpl {
             // nothing to do and we should retain any log entries that are
             // newer than the latest entry in the snapshot.
             if contains != ContainsResult::PRESENT {
-                let snapshot = Bytes::from(request.snapshot);
+                let snapshot = Bytes::from(request.snapshot.clone());
                 match state.state_machine.load_snapshot(&snapshot) {
                     Ok(_) => (),
                     Err(message) => error!(
@@ -773,7 +804,7 @@ impl Raft for RaftImpl {
                         self.address, message
                     ),
                 }
-                state.log = LogSlice::new();
+                state.log = LogSlice::new(request.get_last().clone());
             }
         }
 
