@@ -63,7 +63,7 @@ impl RaftImpl {
             state: Arc::new(Mutex::new(RaftState {
                 term: 0,
                 voted_for: None,
-                log: LogSlice::new(),
+                log: LogSlice::initial(),
                 state_machine: state_machine,
 
                 committed: -1,
@@ -378,11 +378,10 @@ impl RaftState {
     fn create_append_request(&self, follower: &Server) -> AppendRequest {
         // Construct the id of the last known index to be replicated on the follower.
         let position = self.followers.get(address_key(&follower).as_str()).unwrap();
-        let previous = if position.next_index > 0 {
-            self.log.id_at(position.next_index - 1)
-        } else {
-            sentinel_entry_id()
-        };
+
+        // TODO(dino): Before enabling snapshots, handle the case where the index
+        // the follower wants has already been compacted locally.
+        let previous = self.log.id_at(position.next_index - 1);
 
         let mut request = AppendRequest::new();
         request.set_term(self.term);
@@ -503,7 +502,7 @@ impl RaftState {
         let mut request = VoteRequest::new();
         request.set_term(self.term);
         request.set_candidate(self.address.clone());
-        request.set_last(self.log.last_id().unwrap_or(sentinel_entry_id()));
+        request.set_last(self.log.last_known_id().clone());
         request
     }
 }
@@ -619,17 +618,14 @@ impl Raft for RaftImpl {
         let mut result = AppendResponse::new();
         result.set_term(state.term);
 
-        // Make sure we have the previous log index sent.
-        match state.log.contains(request.get_previous()) {
-            ContainsResult::MISMATCH => panic!("Unexpected mismatch"),
-            ContainsResult::COMPACTED => panic!("Unexpected compacted"),
-            ContainsResult::ABSENT => {
-                // Let the leader know we don't have this entry yet, so it
-                // can try again from an earlier index.
-                result.set_success(false);
-                return sink.finish(result);
-            }
-            ContainsResult::PRESENT => (),
+        // Make sure we have the previous log index sent. Note that COMPACTED
+        // can happen whenever we have no entries (e.g.,initially or just after
+        // a snapshot install).
+        if state.log.contains(request.get_previous()) == ContainsResult::ABSENT {
+            // Let the leader know that this entry is too far in the future, so
+            // it can try again from with earlier index.
+            result.set_success(false);
+            return sink.finish(result);
         }
 
         if !request.get_entries().is_empty() {
@@ -690,6 +686,11 @@ impl Raft for RaftImpl {
                     .last_known_leader
                     .as_ref()
                     .map(|l| result.set_leader(l.clone()));
+
+                // TODO(dino): Handle the case where the state of the world has
+                // moved on so much that the entry we committed got compacted.
+                // This would mean "contains" below returns COMPACTED.
+
                 if state.log.contains(&entry_id) == ContainsResult::PRESENT {
                     result.set_entry_id(entry_id.clone());
                     result.set_status(Status::SUCCESS);
@@ -760,11 +761,4 @@ fn address_key(address: &Server) -> String {
 
 fn entry_id_key(entry_id: &EntryId) -> String {
     format!("(term={},id={})", entry_id.term, entry_id.index)
-}
-
-fn sentinel_entry_id() -> EntryId {
-    let mut result = EntryId::new();
-    result.set_term(-1);
-    result.set_index(-1);
-    return result;
 }
