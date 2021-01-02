@@ -24,9 +24,6 @@ pub enum ContainsResult {
     // Indicates that an entry is present in the log slice.
     PRESENT,
 
-    // Indicates that an entry index is present, but with a different term.
-    MISMATCH,
-
     // Indicates that an entry with this index has yet to be added.
     ABSENT,
 }
@@ -67,11 +64,6 @@ impl LogSlice {
         entry_id
     }
 
-    // Returns the lowest index currently in the log slice.
-    pub fn first_index(&self) -> Option<i64> {
-        self.entries.first().map(|entry| entry.get_id().index)
-    }
-
     // Returns the latest entry id currently in the log slice.
     pub fn last_id(&self) -> Option<EntryId> {
         self.entries.last().map(|entry| entry.get_id().clone())
@@ -100,40 +92,19 @@ impl LogSlice {
 
     // Returns true if the supplied entry is present in this slice.
     pub fn contains(&self, query: &EntryId) -> ContainsResult {
-        // Special case where we've never seen an entry and the request comes
-        // in for the special "-1" index.
-        if query.index == -1 {
-            return if self.starts_at_beginning_of_time() {
-                ContainsResult::PRESENT
-            } else {
-                ContainsResult::COMPACTED
-            };
-        }
-
-        let first = self.first_index();
-        if first.is_none() {
-            // Assumes that this can only happen when the log slice represents
-            // the beginning of time and has never seen an entry.
-            return ContainsResult::ABSENT;
-        }
-
-        if first.unwrap() > query.index {
+        if query.get_index() <= self.previous_id.get_index() {
+            assert!(query.get_term() <= self.previous_id.get_term());
             return ContainsResult::COMPACTED;
         }
 
-        // Translate the requested index into the vector index.
-        let idx = self.local_index(query.index);
+        let idx = self.local_index(query.get_index());
         if idx >= self.entries.len() {
             return ContainsResult::ABSENT;
         }
 
         let &entry_id = &self.entries[idx as usize].get_id();
-        assert_eq!(entry_id.get_index(), query.get_index());
-        if entry_id.get_term() == query.get_term() {
-            ContainsResult::PRESENT
-        } else {
-            ContainsResult::MISMATCH
-        }
+        assert!(entry_id == query);
+        return ContainsResult::PRESENT;
     }
 
     // Adds the supplied entries to the end of the slice. Any conflicting
@@ -175,7 +146,9 @@ impl LogSlice {
     // Returns all entries strictly after the supplied id. Must only be called
     // if the supplied entry id is present in the slice.
     pub fn get_entries_after(&self, entry_id: &EntryId) -> Vec<Entry> {
-        assert_eq!(ContainsResult::PRESENT, self.contains(entry_id));
+        // We can only actually return the entries we have, i.e., starting with
+        // the entry immediately following "self.previous_id".
+        assert!(entry_id.index >= self.previous_id.index);
 
         let local_start_idx = self.local_index(entry_id.get_index() + 1);
         if local_start_idx >= self.entries.len() {
@@ -214,11 +187,6 @@ impl LogSlice {
         adjusted as usize
     }
 
-    // Returns true if this slice starts at the beginning of time.
-    fn starts_at_beginning_of_time(&self) -> bool {
-        self.previous_id.index == -1
-    }
-
     // Returns the highest index known to exist (even if the entry is not held
     // in this instance). Returns -1 if there are no known entries at all.
     fn last_known_id(&self) -> &EntryId {
@@ -248,14 +216,12 @@ mod tests {
     fn test_empty() {
         let l = LogSlice::initial();
 
-        assert_eq!(ContainsResult::PRESENT, l.contains(&entry_id(-1, -1)));
-        assert!(l.starts_at_beginning_of_time());
+        assert_eq!(l.contains(&entry_id(-1, -1)), ContainsResult::COMPACTED);
 
         let after = l.get_entries_after(&entry_id(-1, -1));
         assert!(after.is_empty());
 
         assert_eq!(0, l.next_index());
-        assert!(l.first_index().is_none());
         assert!(l.last_id().is_none());
     }
 
@@ -278,24 +244,15 @@ mod tests {
 
         let expected_id = entry_id(72 /* term */, 0 /* index */);
 
-        assert!(l.starts_at_beginning_of_time());
         assert_eq!(&l.last_id().unwrap(), &expected_id);
         assert_eq!(&l.id_at(0), &expected_id);
         assert_eq!(1, l.next_index());
     }
 
     #[test]
-    fn test_first_last() {
+    fn test_last() {
         let l = create_default_slice();
-
-        assert_eq!(0, l.first_index().unwrap());
         assert_eq!(74, l.last_id().unwrap().get_term());
-    }
-
-    #[test]
-    fn test_beginning_of_time() {
-        let l = create_default_slice();
-        assert!(l.starts_at_beginning_of_time());
     }
 
     #[test]
@@ -303,15 +260,11 @@ mod tests {
         let l = create_default_slice();
 
         // Special sentinel case.
-        assert_eq!(ContainsResult::PRESENT, l.contains(&entry_id(-1, -1)));
+        assert_eq!(ContainsResult::COMPACTED, l.contains(&entry_id(-1, -1)));
 
         // Check a few existing entries.
         assert_eq!(ContainsResult::PRESENT, l.contains(&entry_id(73, 2)));
         assert_eq!(ContainsResult::PRESENT, l.contains(&entry_id(73, 3)));
-
-        // Term mismatch, both larger and smaller.
-        assert_eq!(ContainsResult::MISMATCH, l.contains(&entry_id(59, 3)));
-        assert_eq!(ContainsResult::MISMATCH, l.contains(&entry_id(95, 3)));
 
         // First index not present.
         let next = l.next_index();
@@ -376,7 +329,7 @@ mod tests {
         let mut l = create_default_slice();
 
         // Validate the initial state.
-        assert_eq!(l.first_index().unwrap(), 0);
+        assert_eq!(l.id_at(0).get_index(), 0);
         assert_eq!(l.last_id().unwrap().index, 5);
         let initial_size_bytes = 6;
         assert_eq!(l.size_bytes(), initial_size_bytes);
@@ -386,7 +339,7 @@ mod tests {
             entry(75, 3 /* index */, 10 /* size */),
             entry(75, 4 /* index */, 10 /* size */),
         ]);
-        assert_eq!(l.first_index().unwrap(), 0);
+        assert_eq!(l.id_at(0).get_index(), 0);
         assert_eq!(l.last_id().unwrap().index, 4);
         let size_bytes = initial_size_bytes - 3 + 20;
         assert_eq!(l.size_bytes(), size_bytes);
