@@ -28,9 +28,7 @@ use timer::Timer;
 use bytes::{Buf, Bytes};
 use diagnostics::ServerDiagnostics;
 use raft::log::{ContainsResult, LogSlice};
-use raft_proto::{
-    AppendRequest, AppendResponse, Entry, EntryId, Server, VoteRequest, VoteResponse,
-};
+use raft_proto::{AppendRequest, AppendResponse, EntryId, Server, VoteRequest, VoteResponse};
 use raft_proto::{CommitRequest, CommitResponse, Status, StepDownRequest, StepDownResponse};
 use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 use raft_proto_grpc::{Raft, RaftClient};
@@ -837,6 +835,7 @@ fn entry_id_key(entry_id: &EntryId) -> String {
 mod tests {
     use super::*;
     use crate::raft::StateMachineResult;
+    use crate::raft_proto::Entry;
     use futures::executor;
     use raft_proto_grpc::RaftServer;
 
