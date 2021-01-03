@@ -15,7 +15,7 @@ use futures::TryFutureExt;
 use grpc::{
     ClientStubExt, GrpcFuture, ServerHandlerContext, ServerRequestSingle, ServerResponseUnarySink,
 };
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use protobuf::RepeatedField;
 use rand::Rng;
 use std::collections::HashMap;
@@ -25,24 +25,42 @@ use std::time::Duration;
 use timer::Guard;
 use timer::Timer;
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use diagnostics::ServerDiagnostics;
 use raft::log::{ContainsResult, LogSlice};
 use raft_proto::{AppendRequest, AppendResponse, EntryId, Server, VoteRequest, VoteResponse};
 use raft_proto::{CommitRequest, CommitResponse, Status, StepDownRequest, StepDownResponse};
+use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 use raft_proto_grpc::{Raft, RaftClient};
 
-// Timeout after which a server in follower state starts a new election.
-const FOLLOWER_TIMEOUTS_MS: i64 = 2000;
+const DEFAULT_FOLLOWER_TIMEOUTS_MS: i64 = 2000;
+const DEFAULT_CANDIDATE_TIMEOUT_MS: i64 = 3000;
+const DEFAULT_LEADER_REPLICATE_MS: i64 = 500;
 
-// Timeout after which a server in candidate state declares its candidacy a
-// failure and starts a new election.
-const CANDIDATE_TIMEOUT_MS: i64 = 3000;
+// Parameters used to configure the behavior of a cluster participant.
+pub struct Config {
+    // Timeout after which a server in follower state starts a new election.
+    follower_timeout_ms: i64,
 
-// How frequently a leader will wake up and replicate entries to followers.
-// Note that this also serves as the leader's heartbeat, so this should be
-// lower than the follower timeout.
-const LEADER_REPLICATE_MS: i64 = 500;
+    // Timeout after which a server in candidate state declares its candidacy a
+    // failure and starts a new election.
+    candidate_timeouts_ms: i64,
+
+    // How frequently a leader will wake up and replicate entries to followers.
+    // Note that this also serves as the leader's heartbeat, so this should be
+    // lower than the follower timeout.
+    leader_replicate_ms: i64,
+}
+
+impl Config {
+    pub fn default() -> Self {
+        Config {
+            follower_timeout_ms: DEFAULT_FOLLOWER_TIMEOUTS_MS,
+            candidate_timeouts_ms: DEFAULT_CANDIDATE_TIMEOUT_MS,
+            leader_replicate_ms: DEFAULT_LEADER_REPLICATE_MS,
+        }
+    }
+}
 
 // Canonical implementation of the raft service. Acts as one server among peers
 // which form a cluster.
@@ -57,14 +75,17 @@ impl RaftImpl {
         all: &Vec<Server>,
         state_machine: Box<dyn StateMachine + Send>,
         diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
+        config: Config,
     ) -> RaftImpl {
         RaftImpl {
             address: server.clone(),
             state: Arc::new(Mutex::new(RaftState {
+                config,
+
                 term: 0,
                 voted_for: None,
                 log: LogSlice::initial(),
-                state_machine: state_machine,
+                state_machine,
 
                 committed: -1,
                 applied: -1,
@@ -98,8 +119,9 @@ impl RaftImpl {
         state.term = term;
         state.role = RaftRole::Follower;
         state.voted_for = None;
+        let timeout_ms = state.config.follower_timeout_ms;
         state.timer_guard = Some(state.timer.schedule_with_delay(
-            chrono::Duration::milliseconds(add_jitter(FOLLOWER_TIMEOUTS_MS)),
+            chrono::Duration::milliseconds(add_jitter(timeout_ms)),
             move || {
                 let arc_state = arc_state.clone();
                 let me = me.clone();
@@ -114,10 +136,16 @@ impl RaftImpl {
     // Keeps running elections until either the term changes, a leader has emerged,
     // or an own election has been won.
     async fn election_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
+        let timeout_ms = arc_state
+            .lock()
+            .unwrap()
+            .config
+            .candidate_timeouts_ms
+            .clone();
         let mut term = term;
         while !RaftImpl::run_election(arc_state.clone(), term).await {
             term = term + 1;
-            let sleep_ms = add_jitter(CANDIDATE_TIMEOUT_MS) as u64;
+            let sleep_ms = add_jitter(timeout_ms) as u64;
             task::sleep(Duration::from_millis(sleep_ms)).await;
         }
     }
@@ -212,6 +240,7 @@ impl RaftImpl {
     // moved on (or we otherwise detect we are no longer leader).
     async fn replicate_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
         let me = arc_state.lock().unwrap().address.clone();
+        let timeouts_ms = arc_state.lock().unwrap().config.leader_replicate_ms.clone();
         loop {
             {
                 let locked_state = arc_state.lock().unwrap();
@@ -229,7 +258,7 @@ impl RaftImpl {
             }
 
             RaftImpl::replicate_entries(arc_state.clone(), term).await;
-            let sleep_ms = add_jitter(LEADER_REPLICATE_MS) as u64;
+            let sleep_ms = add_jitter(timeouts_ms) as u64;
             task::sleep(Duration::from_millis(sleep_ms)).await;
         }
     }
@@ -302,7 +331,7 @@ struct FollowerPosition {
     match_index: i64,
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum RaftRole {
     Follower,
     Candidate,
@@ -310,6 +339,9 @@ enum RaftRole {
 }
 
 struct RaftState {
+    // Constant state.
+    config: Config,
+
     // Persistent raft state.
     term: i64,
     voted_for: Option<Server>,
@@ -603,8 +635,9 @@ impl Raft for RaftImpl {
         let term = state.term;
         let arc_state = self.state.clone();
         let me = state.address.clone();
+        let timeout_ms = state.config.follower_timeout_ms;
         state.timer_guard = Some(state.timer.schedule_with_delay(
-            chrono::Duration::milliseconds(add_jitter(FOLLOWER_TIMEOUTS_MS)),
+            chrono::Duration::milliseconds(add_jitter(timeout_ms)),
             move || {
                 let arc_state = arc_state.clone();
                 let me = me.clone();
@@ -746,6 +779,41 @@ impl Raft for RaftImpl {
         result.set_leader(state.address.clone());
         return sink.finish(result);
     }
+
+    fn install_snapshot(
+        &self,
+        _: ServerHandlerContext,
+        req: ServerRequestSingle<InstallSnapshotRequest>,
+        sink: ServerResponseUnarySink<InstallSnapshotResponse>,
+    ) -> grpc::Result<()> {
+        let request = req.message;
+        debug!("[{:?}] Handling install snapshot request", self.address);
+
+        let mut state = self.state.lock().unwrap();
+        if request.term >= state.term {
+            let contains = state.log.contains(request.get_last());
+
+            // If we have a copy of the latest entry in our log, there is
+            // nothing to do and we should retain any log entries that are
+            // newer than the latest entry in the snapshot.
+            if contains != ContainsResult::PRESENT {
+                let snapshot = Bytes::from(request.snapshot.clone());
+                match state.state_machine.load_snapshot(&snapshot) {
+                    Ok(_) => (),
+                    Err(message) => error!(
+                        "[{:?}] Failed to load snapshot: [{:?}]",
+                        self.address, message
+                    ),
+                }
+                state.log = LogSlice::new(request.get_last().clone());
+                state.applied = request.get_last().get_index();
+            }
+        }
+
+        let mut result = InstallSnapshotResponse::new();
+        result.set_term(state.term);
+        return sink.finish(result);
+    }
 }
 
 // Returns a value no lower than the supplied bound, with some additive jitter.
@@ -761,4 +829,180 @@ fn address_key(address: &Server) -> String {
 
 fn entry_id_key(entry_id: &EntryId) -> String {
     format!("(term={},id={})", entry_id.term, entry_id.index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raft::StateMachineResult;
+    use crate::raft_proto::Entry;
+    use futures::executor;
+    use raft_proto_grpc::RaftServer;
+
+    #[test]
+    fn test_initial_state() {
+        let raft = create_raft();
+        let state = raft.state.lock().unwrap();
+        assert_eq!(state.role, RaftRole::Follower);
+        assert_eq!(state.term, 0);
+        assert_eq!(state.committed, -1);
+        assert_eq!(state.applied, -1);
+    }
+
+    // This test verifies that initially, a follower fails to accept entries
+    // too far in the future. Then, after installing an appropriate snapshot,
+    // sending those same entries succeeds.
+    #[test]
+    fn test_load_snapshot_and_append() {
+        let raft = create_raft();
+        let raft_state = raft.state.clone();
+        let server = create_grpc_server(raft);
+
+        // Make an append request coming from a supposed leader, for a bunch of
+        // entries far in the future.
+        let leader = create_fake_server_list()[1].clone();
+        let mut append_request = AppendRequest::new();
+        append_request.set_term(12);
+        append_request.set_leader(leader.clone());
+        append_request.set_previous(entry_id(10, 75));
+        append_request.set_entries(RepeatedField::from(vec![
+            entry(entry_id(10, 76), Vec::new()),
+            entry(entry_id(10, 77), Vec::new()),
+        ]));
+        append_request.set_committed(0);
+
+        let client = create_grpc_client(&server);
+        let opts = grpc::RequestOptions::new();
+
+        let append_response_1 = executor::block_on(
+            client
+                .append(opts.clone(), append_request.clone())
+                .drop_metadata(),
+        )
+        .expect("result");
+
+        // Make sure the handler has updated its term.
+        assert_eq!(append_response_1.get_term(), 12);
+
+        // The entries were too far in the future, the append should fail.
+        assert!(!append_response_1.get_success());
+
+        // The raft server should acknowledge the new leader.
+        let state = raft_state.lock().unwrap();
+        assert_eq!(state.last_known_leader, Some(leader.clone()));
+        drop(state);
+
+        // Now install a snapshot which should make the original append request
+        // valid.
+        let mut snapshot_request = InstallSnapshotRequest::new();
+        snapshot_request.set_leader(leader.clone());
+        snapshot_request.set_term(12);
+        snapshot_request.set_last(entry_id(10, 75));
+        snapshot_request.set_snapshot(vec![1, 2]);
+
+        let install_response_1 = executor::block_on(
+            client
+                .install_snapshot(opts.clone(), snapshot_request.clone())
+                .drop_metadata(),
+        )
+        .expect("result");
+        assert_eq!(install_response_1.get_term(), 12);
+
+        // Then, try the same append request again. This time, it should work.
+        let append_response_2 = executor::block_on(
+            client
+                .append(opts.clone(), append_request.clone())
+                .drop_metadata(),
+        )
+        .expect("result");
+        assert!(append_response_2.get_success());
+    }
+
+    fn entry(id: EntryId, payload: Vec<u8>) -> Entry {
+        let mut entry = Entry::new();
+        entry.set_payload(payload);
+        entry.set_id(id);
+        entry
+    }
+
+    fn entry_id(term: i64, index: i64) -> EntryId {
+        let mut entry_id = EntryId::new();
+        entry_id.set_term(term);
+        entry_id.set_index(index);
+        entry_id
+    }
+
+    fn create_raft() -> RaftImpl {
+        let servers = create_fake_server_list();
+        RaftImpl::new(
+            &servers[0].clone(),
+            &servers.clone(),
+            Box::new(FakeStateMachine::new()),
+            None,
+            create_config_for_testing(),
+        )
+    }
+
+    fn create_config_for_testing() -> Config {
+        // Configs with very high timeouts to make sure none of them ever
+        // trigger during a unit test.
+        Config {
+            follower_timeout_ms: 100000000,
+            candidate_timeouts_ms: 100000000,
+            leader_replicate_ms: 100000000,
+        }
+    }
+
+    fn create_fake_server_list() -> Vec<Server> {
+        vec![create_server(1), create_server(2), create_server(3)]
+    }
+
+    fn create_server(port: i32) -> Server {
+        let mut result = Server::new();
+        result.set_host("::1".to_string());
+        result.set_port(port);
+        result
+    }
+
+    fn create_grpc_server(raft: RaftImpl) -> grpc::Server {
+        let mut server_builder = grpc::ServerBuilder::new_plain();
+        raft.start();
+        server_builder.add_service(RaftServer::new_service_def(raft));
+        server_builder.http.set_addr(("0.0.0.0", 0)).unwrap();
+        server_builder.build().expect("server")
+    }
+
+    fn create_grpc_client(server: &grpc::Server) -> RaftClient {
+        let client_conf = Default::default();
+        let port = server.local_addr().port().expect("port");
+        RaftClient::new_plain("0.0.0.0", port, client_conf).expect("client")
+    }
+
+    struct FakeStateMachine {
+        committed: i64,
+        snapshots_loaded: i64,
+    }
+
+    impl FakeStateMachine {
+        fn new() -> Self {
+            FakeStateMachine {
+                committed: 0,
+                snapshots_loaded: 0,
+            }
+        }
+    }
+
+    impl StateMachine for FakeStateMachine {
+        fn apply(&mut self, _operation: &Bytes) -> StateMachineResult {
+            self.committed += 1;
+            Ok(())
+        }
+        fn create_snapshot(&self) -> Bytes {
+            Bytes::from(Vec::new())
+        }
+        fn load_snapshot(&mut self, _snapshot: &Bytes) -> StateMachineResult {
+            self.snapshots_loaded += 1;
+            Ok(())
+        }
+    }
 }

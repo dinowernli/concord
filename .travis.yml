@@ -4,3 +4,5 @@ rust:
 cache: cargo
 install:
   - ./tools/install_proto.sh
+env:
+  - RUST_BACKTRACE=1

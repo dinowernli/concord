@@ -192,8 +192,15 @@ impl LogSlice {
     // log index. Must only be called if the index is known to be within range
     // of this slice.
     fn local_index(&self, index: i64) -> usize {
-        let adjusted = index - self.previous_id.get_index() - 1;
-        assert!(adjusted >= 0, "adjusted index out of range");
+        let previous = self.previous_id.get_index();
+        let adjusted = index - previous - 1;
+        assert!(
+            adjusted >= 0,
+            "adjusted index out of range: adjusted={}, index={}, previous={}",
+            adjusted,
+            index,
+            previous
+        );
         adjusted as usize
     }
 }

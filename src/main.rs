@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use keyvalue_proto::Operation;
 use protobuf::Message;
-use raft::{Client, Diagnostics, RaftImpl};
+use raft::{Client, Config, Diagnostics, RaftImpl};
 use raft_proto::{EntryId, Server};
 use raft_proto_grpc::RaftServer;
 
@@ -51,7 +51,13 @@ fn start_node(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagnostics
 
     let state_machine = Box::new(keyvalue::MapStore::new());
     let mut server_builder = grpc::ServerBuilder::new_plain();
-    let raft = RaftImpl::new(address, all, state_machine, Some(server_diagnostics));
+    let raft = RaftImpl::new(
+        address,
+        all,
+        state_machine,
+        Some(server_diagnostics),
+        Config::default(),
+    );
     raft.start();
 
     server_builder.add_service(RaftServer::new_service_def(raft));
