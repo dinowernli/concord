@@ -33,10 +33,6 @@ use raft_proto::{CommitRequest, CommitResponse, Status, StepDownRequest, StepDow
 use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 use raft_proto_grpc::{Raft, RaftClient};
 
-const DEFAULT_FOLLOWER_TIMEOUTS_MS: i64 = 2000;
-const DEFAULT_CANDIDATE_TIMEOUT_MS: i64 = 3000;
-const DEFAULT_LEADER_REPLICATE_MS: i64 = 500;
-
 // Parameters used to configure the behavior of a cluster participant.
 pub struct Config {
     // Timeout after which a server in follower state starts a new election.
@@ -50,16 +46,36 @@ pub struct Config {
     // Note that this also serves as the leader's heartbeat, so this should be
     // lower than the follower timeout.
     leader_replicate_ms: i64,
+
+    // A total number of bytes to accumulate in payloads before triggering a
+    // compaction, i.e., snapshotting the state machine and clearing the log
+    // entries stored locally.
+    compaction_threshold_bytes: i64,
+
+    // How frequently to check whether or not a compaction is necessary.
+    compaction_check_periods_ms: i64,
 }
 
 impl Config {
     pub fn default() -> Self {
         Config {
-            follower_timeout_ms: DEFAULT_FOLLOWER_TIMEOUTS_MS,
-            candidate_timeouts_ms: DEFAULT_CANDIDATE_TIMEOUT_MS,
-            leader_replicate_ms: DEFAULT_LEADER_REPLICATE_MS,
+            follower_timeout_ms: 2000,
+            candidate_timeouts_ms: 3000,
+            leader_replicate_ms: 500,
+            compaction_threshold_bytes: 10 * 1000 * 1000,
+            compaction_check_periods_ms: 500,
         }
     }
+}
+
+// Represents a snapshot of the state machine after applying a complete prefix
+// of entries since the beginning of time.
+struct LogSnapshot {
+    // The id of the latest entry included in the snapshot.
+    last: EntryId,
+
+    // The snapshot bytes as produced by the state machine.
+    snapshot: Bytes,
 }
 
 // Canonical implementation of the raft service. Acts as one server among peers
@@ -86,6 +102,7 @@ impl RaftImpl {
                 voted_for: None,
                 log: LogSlice::initial(),
                 state_machine,
+                snapshot: None,
 
                 committed: -1,
                 applied: -1,
@@ -105,10 +122,16 @@ impl RaftImpl {
     }
 
     pub fn start(&self) {
-        let mut s = self.state.lock().unwrap();
-        let term = s.term;
-        info!("[{:?}] Starting", s.address);
-        RaftImpl::become_follower(&mut s, self.state.clone(), term);
+        let arc_state = self.state.clone();
+
+        let mut state = self.state.lock().unwrap();
+        let term = state.term;
+        info!("[{:?}] Starting", state.address);
+        RaftImpl::become_follower(&mut state, arc_state.clone(), term);
+
+        task::spawn(async move {
+            RaftImpl::compaction_loop(arc_state.clone()).await;
+        });
     }
 
     fn become_follower(state: &mut RaftState, arc_state: Arc<Mutex<RaftState>>, term: i64) {
@@ -131,6 +154,35 @@ impl RaftImpl {
                 });
             },
         ));
+    }
+
+    async fn compaction_loop(arc_state: Arc<Mutex<RaftState>>) {
+        loop {
+            {
+                let mut state = arc_state.lock().unwrap();
+                if state.role == RaftRole::Stopping {
+                    return;
+                }
+                if state.log.size_bytes() > state.config.compaction_threshold_bytes {
+                    let applied_index = state.applied;
+                    let latest_id = state.log.id_at(applied_index);
+                    let snap = LogSnapshot {
+                        snapshot: state.state_machine.create_snapshot(),
+                        last: latest_id.clone(),
+                    };
+                    state.snapshot = Some(snap);
+
+                    // Note that we prefer not to clear the log slice entirely
+                    // because although losing uncommitted entries is safe, the
+                    // leader doing this could result in failed commit operations
+                    // sent to the leader.
+                    state.log.prune_until(&latest_id);
+                }
+            }
+
+            let period_ms = arc_state.lock().unwrap().config.compaction_check_periods_ms;
+            task::sleep(Duration::from_millis(add_jitter(period_ms) as u64)).await;
+        }
     }
 
     // Keeps running elections until either the term changes, a leader has emerged,
@@ -336,6 +388,7 @@ enum RaftRole {
     Follower,
     Candidate,
     Leader,
+    Stopping,
 }
 
 struct RaftState {
@@ -353,6 +406,7 @@ struct RaftState {
     applied: i64,
     role: RaftRole,
     followers: HashMap<String, FollowerPosition>,
+    snapshot: Option<LogSnapshot>,
 
     timer: Timer,
     timer_guard: Option<Guard>,
@@ -807,6 +861,11 @@ impl Raft for RaftImpl {
                 }
                 state.log = LogSlice::new(request.get_last().clone());
                 state.applied = request.get_last().get_index();
+                state.committed = request.get_last().get_index();
+                state.snapshot = Some(LogSnapshot {
+                    last: request.get_last().clone(),
+                    snapshot: request.get_snapshot().to_bytes(),
+                });
             }
         }
 
@@ -950,6 +1009,7 @@ mod tests {
             follower_timeout_ms: 100000000,
             candidate_timeouts_ms: 100000000,
             leader_replicate_ms: 100000000,
+            compaction_threshold_bytes: 100000000000,
         }
     }
 

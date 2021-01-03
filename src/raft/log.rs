@@ -188,6 +188,16 @@ impl LogSlice {
         self.entries.get(local_idx).unwrap().clone()
     }
 
+    // Removes all entries up to and including the supplied id. Once this
+    // returns, this instance starts immediately after the supplied id.
+    pub fn prune_until(&mut self, entry_id: &EntryId) {
+        assert_eq!(self.contains(entry_id), ContainsResult::PRESENT);
+        let local_idx = self.local_index(entry_id.index);
+        for entry in self.entries.drain(0..local_idx) {
+            self.size_bytes -= entry.payload.len() as i64;
+        }
+    }
+
     // Returns the position in the slice vector associated with the supplied
     // log index. Must only be called if the index is known to be within range
     // of this slice.
