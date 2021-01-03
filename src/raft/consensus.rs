@@ -968,7 +968,7 @@ mod tests {
         let mut server_builder = grpc::ServerBuilder::new_plain();
         raft.start();
         server_builder.add_service(RaftServer::new_service_def(raft));
-        server_builder.http.set_port(0);
+        server_builder.http.set_addr(("::1", 0)).unwrap();
         server_builder.build().expect("server")
     }
 
