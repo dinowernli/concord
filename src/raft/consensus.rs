@@ -808,6 +808,7 @@ impl Raft for RaftImpl {
                     ),
                 }
                 state.log = LogSlice::new(request.get_last().clone());
+                state.applied = request.get_last().get_index();
             }
         }
 
@@ -853,37 +854,69 @@ mod tests {
     }
 
     #[test]
-    fn test_append() {
+    fn test_load_snapshot_and_append() {
         let raft = create_raft();
         let raft_state = raft.state.clone();
         let server = create_grpc_server(raft);
 
+        // Make an append request coming from a supposed leader, for a bunch of
+        // entries far in the future.
         let leader = create_fake_server_list()[1].clone();
-        let mut request = AppendRequest::new();
-        request.set_term(12);
-        request.set_leader(leader.clone());
-        request.set_previous(entry_id(10, 75));
-        request.set_entries(RepeatedField::from(vec![
+        let mut append_request = AppendRequest::new();
+        append_request.set_term(12);
+        append_request.set_leader(leader.clone());
+        append_request.set_previous(entry_id(10, 75));
+        append_request.set_entries(RepeatedField::from(vec![
             entry(entry_id(10, 76), Vec::new()),
             entry(entry_id(10, 77), Vec::new()),
         ]));
-        request.set_committed(0);
+        append_request.set_committed(0);
 
         let client = create_grpc_client(&server);
-        let fut = client
-            .append(grpc::RequestOptions::new(), request.clone())
-            .drop_metadata();
-        let result: AppendResponse = executor::block_on(fut).expect("result");
+        let opts = grpc::RequestOptions::new();
+
+        let append_response_1 = executor::block_on(
+            client
+                .append(opts.clone(), append_request.clone())
+                .drop_metadata(),
+        )
+        .expect("result");
 
         // Make sure the handler has updated its term.
-        assert_eq!(result.get_term(), 12);
+        assert_eq!(append_response_1.get_term(), 12);
 
         // The entries were too far in the future, the append should fail.
-        assert!(!result.get_success());
+        assert!(!append_response_1.get_success());
 
         // The raft server should acknowledge the new leader.
         let state = raft_state.lock().unwrap();
         assert_eq!(state.last_known_leader, Some(leader.clone()));
+        drop(state);
+
+        // Now install a snapshot which should make the original append request
+        // valid.
+        let mut snapshot_request = InstallSnapshotRequest::new();
+        snapshot_request.set_leader(leader.clone());
+        snapshot_request.set_term(12);
+        snapshot_request.set_last(entry_id(10, 75));
+        snapshot_request.set_snapshot(vec![1, 2]);
+
+        let install_response_1 = executor::block_on(
+            client
+                .install_snapshot(opts.clone(), snapshot_request.clone())
+                .drop_metadata(),
+        )
+        .expect("result");
+        assert_eq!(install_response_1.get_term(), 12);
+
+        // Then, try the same append request again. This time, it should work.
+        let append_response_2 = executor::block_on(
+            client
+                .append(opts.clone(), append_request.clone())
+                .drop_metadata(),
+        )
+        .expect("result");
+        assert!(append_response_2.get_success());
     }
 
     fn entry(id: EntryId, payload: Vec<u8>) -> Entry {
@@ -905,7 +938,7 @@ mod tests {
         RaftImpl::new(
             &servers[0].clone(),
             &servers.clone(),
-            Box::new(FakeStateMachine {}),
+            Box::new(FakeStateMachine::new()),
             None,
             create_config_for_testing(),
         )
@@ -946,17 +979,31 @@ mod tests {
         RaftClient::new_plain("::1", port, client_conf).expect("client")
     }
 
-    struct FakeStateMachine {}
+    struct FakeStateMachine {
+        committed: i64,
+        snapshots_loaded: i64,
+    }
+
+    impl FakeStateMachine {
+        fn new() -> Self {
+            FakeStateMachine {
+                committed: 0,
+                snapshots_loaded: 0,
+            }
+        }
+    }
 
     impl StateMachine for FakeStateMachine {
         fn apply(&mut self, _operation: &Bytes) -> StateMachineResult {
-            unimplemented!()
+            self.committed += 1;
+            Ok(())
         }
         fn create_snapshot(&self) -> Bytes {
-            unimplemented!()
+            Bytes::from(Vec::new())
         }
         fn load_snapshot(&mut self, _snapshot: &Bytes) -> StateMachineResult {
-            unimplemented!()
+            self.snapshots_loaded += 1;
+            Ok(())
         }
     }
 }
