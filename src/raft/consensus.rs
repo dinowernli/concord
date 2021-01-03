@@ -968,14 +968,14 @@ mod tests {
         let mut server_builder = grpc::ServerBuilder::new_plain();
         raft.start();
         server_builder.add_service(RaftServer::new_service_def(raft));
-        server_builder.http.set_addr(("::1", 0)).unwrap();
+        server_builder.http.set_addr(("0.0.0.0", 0)).unwrap();
         server_builder.build().expect("server")
     }
 
     fn create_grpc_client(server: &grpc::Server) -> RaftClient {
         let client_conf = Default::default();
         let port = server.local_addr().port().expect("port");
-        RaftClient::new_plain("::1", port, client_conf).expect("client")
+        RaftClient::new_plain("0.0.0.0", port, client_conf).expect("client")
     }
 
     struct FakeStateMachine {
