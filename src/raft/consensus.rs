@@ -812,9 +812,6 @@ impl Raft for RaftImpl {
             }
         }
 
-        // TODO(dino): Need to make sure that after installing a snaphot, the
-        // leader's request to append the next entry succeeds.
-
         let mut result = InstallSnapshotResponse::new();
         result.set_term(state.term);
         return sink.finish(result);
@@ -853,6 +850,9 @@ mod tests {
         assert_eq!(state.applied, -1);
     }
 
+    // This test verifies that initially, a follower fails to accept entries
+    // too far in the future. Then, after installing an appropriate snapshot,
+    // sending those same entries succeeds.
     #[test]
     fn test_load_snapshot_and_append() {
         let raft = create_raft();
