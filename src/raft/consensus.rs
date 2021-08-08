@@ -1010,6 +1010,7 @@ mod tests {
             candidate_timeouts_ms: 100000000,
             leader_replicate_ms: 100000000,
             compaction_threshold_bytes: 100000000000,
+            compaction_check_periods_ms: 10000000000,
         }
     }
 
