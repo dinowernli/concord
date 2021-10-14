@@ -111,6 +111,12 @@ impl LogSlice {
         return ContainsResult::PRESENT;
     }
 
+    // Returns true if the supplied index lies before the range of entries present
+    // in this log instance.
+    pub fn is_index_compacted(&self, index: i64) -> bool {
+        index <= self.previous_id.get_index()
+    }
+
     // Adds the supplied entries to the end of the slice. Any conflicting
     // entries are replaced. Any existing entries with indexes higher than the
     // supplied entries are pruned.
