@@ -1147,6 +1147,7 @@ mod tests {
 
         // Now send an append request with a payload large enough to trigger compaction.
         let compaction_bytes = raft_state.lock().unwrap().config.compaction_threshold_bytes;
+
         let mut append_request_2 = AppendRequest::new();
         append_request_2.set_term(12);
         append_request_2.set_leader(leader.clone());
@@ -1159,7 +1160,7 @@ mod tests {
 
         let append_response_2 = executor::block_on(
             create_grpc_client(&server)
-                .append(grpc::RequestOptions::new(), append_request.clone())
+                .append(grpc::RequestOptions::new(), append_request_2.clone())
                 .drop_metadata(),
         )
         .expect("result");
@@ -1171,6 +1172,13 @@ mod tests {
             let state = raft_state.lock().unwrap();
             assert!(!state.log.is_index_compacted(0)); // Not compacted
             assert_eq!(state.log.next_index(), 4); // New entry incorporated
+        }
+
+        // Run a compaction, this one should actually compact things now.
+        {
+            let mut state = raft_state.lock().unwrap();
+            state.try_compact();
+            assert!(state.log.is_index_compacted(0)); // Compacted
         }
     }
 
@@ -1206,7 +1214,7 @@ mod tests {
             follower_timeout_ms: 100000000,
             candidate_timeouts_ms: 100000000,
             leader_replicate_ms: 100000000,
-            compaction_threshold_bytes: 1000 * 1000,
+            compaction_threshold_bytes: 1000,
             compaction_check_periods_ms: 10000000000,
         }
     }
