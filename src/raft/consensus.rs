@@ -1182,6 +1182,7 @@ mod tests {
             let mut state = raft_state.lock().unwrap();
             state.try_compact();
             assert!(state.log.is_index_compacted(0)); // Compacted
+            assert_eq!(state.snapshot.as_ref().expect("snapshot").last.index, 3)
         }
     }
 
