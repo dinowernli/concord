@@ -382,27 +382,30 @@ impl RaftImpl {
         follower: Server,
         request: InstallSnapshotRequest,
     ) {
-        let me = request.leader.clone();
-        // TODO DONOTMERGE make rpc, handle result
         // TODO(dino): Add timeouts to these rpcs
-
-        info!(
-            "[{:?}] Sending InstallSnapshot request to follower [{:?}]",
-            &me, &follower
-        );
-
         let result = client
             .install_snapshot(grpc::RequestOptions::new(), request.clone())
             .drop_metadata()
             .await;
 
-        let mut _state = arc_state.lock().unwrap(); // TODO
+        let mut state = arc_state.lock().unwrap();
         match result {
+            Ok(response) => {
+                let other_term = response.get_term();
+                if other_term > state.term {
+                    info!(
+                        "[{:?}] Detected higher term {} from peer {:?}",
+                        &state.address, other_term, &follower,
+                    );
+                    RaftImpl::become_follower(&mut state, arc_state.clone(), other_term);
+                    return;
+                }
+                state.record_follower_matches(&follower, request.get_last().get_index());
+            }
             Err(message) => info!(
                 "[{:?}] InstallSnapshot request failed, error: {}",
-                &me, message
+                state.address, message
             ),
-            Ok(_) => info!("[{:?}] InstallSnapshot request succeeded", &me),
         }
     }
 
@@ -414,8 +417,6 @@ impl RaftImpl {
         follower: Server,
         request: AppendRequest,
     ) {
-        let me = request.leader.clone();
-
         // TODO(dino): Add timeouts to these rpcs.
         let result = client
             .append(grpc::RequestOptions::new(), request.clone())
@@ -433,15 +434,18 @@ impl RaftImpl {
         }
 
         match result {
-            Err(message) => info!("[{:?}] Append request failed, error: {}", &me, message),
+            Err(message) => info!(
+                "[{:?}] Append request failed, error: {}",
+                &state.address, message
+            ),
             Ok(response) => {
-                let rterm = response.get_term();
-                if rterm > state.term {
+                let other_term = response.get_term();
+                if other_term > state.term {
                     info!(
                         "[{:?}] Detected higher term {} from peer {:?}",
-                        &me, rterm, &follower,
+                        &state.address, other_term, &follower,
                     );
-                    RaftImpl::become_follower(&mut state, arc_state.clone(), rterm);
+                    RaftImpl::become_follower(&mut state, arc_state.clone(), other_term);
                     return;
                 }
                 state.handle_append_response(&follower, &response, &request);
@@ -599,21 +603,28 @@ impl RaftState {
             return;
         }
 
-        // The follower has appended our entries. The next index we wish to
-        // send them is the one immediately after the last one we sent.
-        let old_f = f.clone();
+        // The follower has appended our entries, record the updated follower state.
         match request.get_entries().last() {
-            Some(e) => {
-                f.next_index = e.get_id().get_index() + 1;
-                f.match_index = e.get_id().get_index();
-                if f != &old_f {
-                    info!(
-                        "[{:?}] Follower state for peer {:?} is now (next={},match={})",
-                        &self.address, &peer, f.next_index, f.match_index
-                    );
-                }
-            }
+            Some(e) => self.record_follower_matches(&peer, e.get_id().get_index()),
             None => (),
+        }
+    }
+
+    // Called when, as a leader, we know that a follower's entries up to (and including)
+    // match_index match our entries.
+    fn record_follower_matches(&mut self, peer: &Server, match_index: i64) {
+        let follower = self
+            .followers
+            .get_mut(address_key(&peer).as_str())
+            .expect(format!("Unknown peer {:?}", &peer).as_str());
+        let old_f = follower.clone();
+        follower.match_index = match_index;
+        follower.next_index = match_index + 1;
+        if follower != &old_f {
+            info!(
+                "[{:?}] Follower state for peer {:?} is now (next={},match={})",
+                &self.address, &peer, follower.next_index, follower.match_index
+            );
         }
     }
 
