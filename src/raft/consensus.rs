@@ -1111,8 +1111,12 @@ mod tests {
         let mut append_request = AppendRequest::new();
         append_request.set_term(12);
         append_request.set_leader(leader.clone());
-        append_request.set_previous(entry_id(-1, 0));
-        append_request.set_entries(RepeatedField::from(vec![entry(entry_id(8, 1), Vec::new())]));
+        append_request.set_previous(entry_id(-1, -1));
+        append_request.set_entries(RepeatedField::from(vec![
+            entry(entry_id(8, 0), Vec::new()),
+            entry(entry_id(8, 1), Vec::new()),
+            entry(entry_id(8, 2), Vec::new()),
+        ]));
         append_request.set_committed(0);
 
         let append_response_1 = executor::block_on(
@@ -1125,6 +1129,49 @@ mod tests {
         // Make sure the handler has processed the rpc successfully.
         assert_eq!(append_response_1.get_term(), 12);
         assert!(append_response_1.get_success());
+        {
+            let state = raft_state.lock().unwrap();
+            assert_eq!(state.last_known_leader, Some(leader.clone()));
+            assert_eq!(state.term, 12);
+            assert!(!state.log.is_index_compacted(0)); // Not compacted
+            assert_eq!(state.log.next_index(), 3);
+        }
+
+        // Run a compaction, should have no effect
+        {
+            let mut state = raft_state.lock().unwrap();
+            state.try_compact();
+            assert!(!state.log.is_index_compacted(0)); // Not compacted
+            assert_eq!(state.log.next_index(), 3);
+        }
+
+        // Now send an append request with a payload large enough to trigger compaction.
+        let compaction_bytes = raft_state.lock().unwrap().config.compaction_threshold_bytes;
+        let mut append_request_2 = AppendRequest::new();
+        append_request_2.set_term(12);
+        append_request_2.set_leader(leader.clone());
+        append_request_2.set_previous(entry_id(8, 2));
+        append_request_2.set_entries(RepeatedField::from(vec![entry(
+            entry_id(8, 3),
+            vec![0; 2 * compaction_bytes as usize],
+        )]));
+        append_request_2.set_committed(0);
+
+        let append_response_2 = executor::block_on(
+            create_grpc_client(&server)
+                .append(grpc::RequestOptions::new(), append_request.clone())
+                .drop_metadata(),
+        )
+        .expect("result");
+
+        // Make sure the handler has processed the rpc successfully.
+        assert_eq!(append_response_2.get_term(), 12);
+        assert!(append_response_2.get_success());
+        {
+            let state = raft_state.lock().unwrap();
+            assert!(!state.log.is_index_compacted(0)); // Not compacted
+            assert_eq!(state.log.next_index(), 4); // New entry incorporated
+        }
     }
 
     fn entry(id: EntryId, payload: Vec<u8>) -> Entry {
