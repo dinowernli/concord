@@ -164,23 +164,8 @@ impl RaftImpl {
                 if state.role == RaftRole::Stopping {
                     return;
                 }
-                if state.log.size_bytes() > state.config.compaction_threshold_bytes {
-                    let applied_index = state.applied;
-                    let latest_id = state.log.id_at(applied_index);
-                    let snap = LogSnapshot {
-                        snapshot: state.state_machine.create_snapshot(),
-                        last: latest_id.clone(),
-                    };
-                    state.snapshot = Some(snap);
-
-                    // Note that we prefer not to clear the log slice entirely
-                    // because although losing uncommitted entries is safe, the
-                    // leader doing this could result in failed commit operations
-                    // sent to the leader.
-                    state.log.prune_until(&latest_id);
-                }
+                state.try_compact();
             }
-
             let period_ms = arc_state.lock().unwrap().config.compaction_check_periods_ms;
             task::sleep(Duration::from_millis(add_jitter(period_ms) as u64)).await;
         }
@@ -693,6 +678,30 @@ impl RaftState {
         request.set_last(self.log.last_known_id().clone());
         request
     }
+
+    // Compacts logs entries into a new snapshot if necessary.
+    fn try_compact(&mut self) {
+        if self.log.size_bytes() > self.config.compaction_threshold_bytes {
+            let applied_index = self.applied;
+            let latest_id = self.log.id_at(applied_index);
+            let snap = LogSnapshot {
+                snapshot: self.state_machine.create_snapshot(),
+                last: latest_id.clone(),
+            };
+            self.snapshot = Some(snap);
+
+            // Note that we prefer not to clear the log slice entirely
+            // because although losing uncommitted entries is safe, the
+            // leader doing this could result in failed commit operations
+            // sent to the leader.
+            self.log.prune_until(&latest_id);
+
+            info!(
+                "[{:?}] Compacted log with snapshot up to (including) index {}",
+                self.address, applied_index
+            );
+        }
+    }
 }
 
 impl Raft for RaftImpl {
@@ -1089,6 +1098,35 @@ mod tests {
         assert!(append_response_2.get_success());
     }
 
+    // This test verifies that we can append entries to a follower and that once the
+    // follower's log grows too large, it will correctly compact.
+    #[test]
+    fn test_append_and_compact() {
+        let raft = create_raft();
+        let raft_state = raft.state.clone();
+        let server = create_grpc_server(raft);
+
+        // Make an append request coming from a leader, appending one record.
+        let leader = create_fake_server_list()[1].clone();
+        let mut append_request = AppendRequest::new();
+        append_request.set_term(12);
+        append_request.set_leader(leader.clone());
+        append_request.set_previous(entry_id(-1, 0));
+        append_request.set_entries(RepeatedField::from(vec![entry(entry_id(8, 1), Vec::new())]));
+        append_request.set_committed(0);
+
+        let append_response_1 = executor::block_on(
+            create_grpc_client(&server)
+                .append(grpc::RequestOptions::new(), append_request.clone())
+                .drop_metadata(),
+        )
+        .expect("result");
+
+        // Make sure the handler has processed the rpc successfully.
+        assert_eq!(append_response_1.get_term(), 12);
+        assert!(append_response_1.get_success());
+    }
+
     fn entry(id: EntryId, payload: Vec<u8>) -> Entry {
         let mut entry = Entry::new();
         entry.set_payload(payload);
@@ -1121,7 +1159,7 @@ mod tests {
             follower_timeout_ms: 100000000,
             candidate_timeouts_ms: 100000000,
             leader_replicate_ms: 100000000,
-            compaction_threshold_bytes: 100000000000,
+            compaction_threshold_bytes: 1000 * 1000,
             compaction_check_periods_ms: 10000000000,
         }
     }
