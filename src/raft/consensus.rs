@@ -954,34 +954,46 @@ impl Raft for RaftImpl {
         let request = req.message;
         debug!("[{:?}] Handling install snapshot request", self.address);
 
-        // TODO(dino): Handle the case where the incoming snapshot is empty. This
-        // happens when the leader is sending a snapshot but has never taken one
-        // themselves (can this happen?!).
-
         let mut state = self.state.lock().unwrap();
-        if request.term >= state.term {
-            let contains = state.log.contains(request.get_last());
-
-            // If we have a copy of the latest entry in our log, there is
-            // nothing to do and we should retain any log entries that are
-            // newer than the latest entry in the snapshot.
-            if contains != ContainsResult::PRESENT {
-                let snapshot = Bytes::from(request.snapshot.clone());
-                match state.state_machine.load_snapshot(&snapshot) {
-                    Ok(_) => (),
-                    Err(message) => error!(
-                        "[{:?}] Failed to load snapshot: [{:?}]",
-                        self.address, message
-                    ),
-                }
-                state.log = LogSlice::new(request.get_last().clone());
-                state.applied = request.get_last().get_index();
-                state.committed = request.get_last().get_index();
-                state.snapshot = Some(LogSnapshot {
-                    last: request.get_last().clone(),
-                    snapshot: request.get_snapshot().to_bytes(),
-                });
+        if request.term >= state.term && !request.get_snapshot().is_empty() {
+            // Update the state machine.
+            let snapshot = Bytes::from(request.snapshot.clone());
+            match state.state_machine.load_snapshot(&snapshot) {
+                Ok(_) => (),
+                Err(message) => error!(
+                    "[{:?}] Failed to load snapshot: [{:?}]",
+                    self.address, message
+                ),
             }
+
+            // Update the log.
+            let contains = state.log.contains(request.get_last());
+            match contains {
+                ContainsResult::ABSENT => {
+                    // Common case, snapshot from the future. Just clear the log.
+                    state.log = LogSlice::new(request.get_last().clone());
+                }
+                ContainsResult::PRESENT => {
+                    // Entries that came after the latest snapshot entry might still be valid.
+                    state.log.prune_until(request.get_last());
+                }
+                ContainsResult::COMPACTED => {
+                    // Something went very wrong...
+                    warn!(
+                        "[{:?}] Got snapshot for already compacted index {}",
+                        state.address,
+                        request.get_last().get_index()
+                    );
+                }
+            }
+
+            // Update volatile state.
+            state.applied = request.get_last().get_index();
+            state.committed = request.get_last().get_index();
+            state.snapshot = Some(LogSnapshot {
+                last: request.get_last().clone(),
+                snapshot: request.get_snapshot().to_bytes(),
+            });
         }
 
         let mut result = InstallSnapshotResponse::new();
