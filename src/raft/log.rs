@@ -198,10 +198,15 @@ impl LogSlice {
     // returns, this instance starts immediately after the supplied id.
     pub fn prune_until(&mut self, entry_id: &EntryId) {
         assert_eq!(self.contains(entry_id), ContainsResult::PRESENT);
-        let local_idx = self.local_index(entry_id.index);
+
+        // We need to add 1 because the "drain()" call below is exclusive, but we want this
+        // drain to be inclusive of the supplied entry.
+        let local_idx = self.local_index(entry_id.index) + 1;
+
         for entry in self.entries.drain(0..local_idx) {
             self.size_bytes -= entry.payload.len() as i64;
         }
+        self.previous_id = entry_id.clone();
     }
 
     // Returns the position in the slice vector associated with the supplied
@@ -352,6 +357,46 @@ mod tests {
         assert!(l.is_up_to_date(&entry_id(74, 5)));
         assert!(l.is_up_to_date(&entry_id(75, 5)));
         assert!(l.is_up_to_date(&entry_id(75, 17)));
+    }
+
+    #[test]
+    fn test_prune_until() {
+        let mut l = create_default_slice();
+
+        assert_eq!(l.size_bytes(), 6);
+        assert_eq!(l.next_index(), 6);
+
+        assert!(!l.is_index_compacted(0));
+        assert!(!l.is_index_compacted(1));
+        assert!(!l.is_index_compacted(2));
+        assert!(!l.is_index_compacted(3));
+        assert!(!l.is_index_compacted(4));
+        assert!(!l.is_index_compacted(5));
+
+        // Prune up to index 3, inclusive.
+        l.prune_until(&entry_id(73, 3));
+        assert_eq!(l.previous_id, entry_id(73, 3));
+
+        assert_eq!(l.size_bytes(), 2);
+        assert_eq!(l.next_index(), 6);
+
+        assert!(l.is_index_compacted(0));
+        assert!(l.is_index_compacted(1));
+        assert!(l.is_index_compacted(2));
+        assert!(l.is_index_compacted(3));
+        assert!(!l.is_index_compacted(4));
+        assert!(!l.is_index_compacted(5));
+    }
+
+    #[test]
+    fn test_prune_until_all_entries() {
+        let mut l = create_default_slice();
+        assert_eq!(l.next_index(), 6);
+        assert_eq!(l.size_bytes(), 6);
+
+        l.prune_until(&entry_id(74, 5));
+        assert_eq!(l.next_index(), 6);
+        assert_eq!(l.size_bytes(), 0);
     }
 
     #[test]

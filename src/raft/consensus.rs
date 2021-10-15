@@ -1156,7 +1156,10 @@ mod tests {
             entry_id(8, 3),
             vec![0; 2 * compaction_bytes as usize],
         )]));
-        append_request_2.set_committed(0);
+
+        // This tells the follower that the entries are committed (only committed
+        // entries are eligible for compaction).
+        append_request_2.set_committed(3);
 
         let append_response_2 = executor::block_on(
             create_grpc_client(&server)
