@@ -111,6 +111,12 @@ impl LogSlice {
         return ContainsResult::PRESENT;
     }
 
+    // Returns true if the supplied index lies before the range of entries present
+    // in this log instance.
+    pub fn is_index_compacted(&self, index: i64) -> bool {
+        index <= self.previous_id.get_index()
+    }
+
     // Adds the supplied entries to the end of the slice. Any conflicting
     // entries are replaced. Any existing entries with indexes higher than the
     // supplied entries are pruned.
@@ -186,6 +192,21 @@ impl LogSlice {
         let local_idx = self.local_index(index);
         assert!(local_idx <= self.entries.len());
         self.entries.get(local_idx).unwrap().clone()
+    }
+
+    // Removes all entries up to and including the supplied id. Once this
+    // returns, this instance starts immediately after the supplied id.
+    pub fn prune_until(&mut self, entry_id: &EntryId) {
+        assert_eq!(self.contains(entry_id), ContainsResult::PRESENT);
+
+        // We need to add 1 because the "drain()" call below is exclusive, but we want this
+        // drain to be inclusive of the supplied entry.
+        let local_idx = self.local_index(entry_id.index) + 1;
+
+        for entry in self.entries.drain(0..local_idx) {
+            self.size_bytes -= entry.payload.len() as i64;
+        }
+        self.previous_id = entry_id.clone();
     }
 
     // Returns the position in the slice vector associated with the supplied
@@ -336,6 +357,46 @@ mod tests {
         assert!(l.is_up_to_date(&entry_id(74, 5)));
         assert!(l.is_up_to_date(&entry_id(75, 5)));
         assert!(l.is_up_to_date(&entry_id(75, 17)));
+    }
+
+    #[test]
+    fn test_prune_until() {
+        let mut l = create_default_slice();
+
+        assert_eq!(l.size_bytes(), 6);
+        assert_eq!(l.next_index(), 6);
+
+        assert!(!l.is_index_compacted(0));
+        assert!(!l.is_index_compacted(1));
+        assert!(!l.is_index_compacted(2));
+        assert!(!l.is_index_compacted(3));
+        assert!(!l.is_index_compacted(4));
+        assert!(!l.is_index_compacted(5));
+
+        // Prune up to index 3, inclusive.
+        l.prune_until(&entry_id(73, 3));
+        assert_eq!(l.previous_id, entry_id(73, 3));
+
+        assert_eq!(l.size_bytes(), 2);
+        assert_eq!(l.next_index(), 6);
+
+        assert!(l.is_index_compacted(0));
+        assert!(l.is_index_compacted(1));
+        assert!(l.is_index_compacted(2));
+        assert!(l.is_index_compacted(3));
+        assert!(!l.is_index_compacted(4));
+        assert!(!l.is_index_compacted(5));
+    }
+
+    #[test]
+    fn test_prune_until_all_entries() {
+        let mut l = create_default_slice();
+        assert_eq!(l.next_index(), 6);
+        assert_eq!(l.size_bytes(), 6);
+
+        l.prune_until(&entry_id(74, 5));
+        assert_eq!(l.next_index(), 6);
+        assert_eq!(l.size_bytes(), 0);
     }
 
     #[test]

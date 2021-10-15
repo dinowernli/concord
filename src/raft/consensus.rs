@@ -11,7 +11,6 @@ extern crate timer;
 
 use async_std::task;
 use futures::future::join_all;
-use futures::TryFutureExt;
 use grpc::{
     ClientStubExt, GrpcFuture, ServerHandlerContext, ServerRequestSingle, ServerResponseUnarySink,
 };
@@ -19,6 +18,8 @@ use log::{debug, error, info, warn};
 use protobuf::RepeatedField;
 use rand::Rng;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time;
 use std::time::Duration;
@@ -33,10 +34,6 @@ use raft_proto::{CommitRequest, CommitResponse, Status, StepDownRequest, StepDow
 use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 use raft_proto_grpc::{Raft, RaftClient};
 
-const DEFAULT_FOLLOWER_TIMEOUTS_MS: i64 = 2000;
-const DEFAULT_CANDIDATE_TIMEOUT_MS: i64 = 3000;
-const DEFAULT_LEADER_REPLICATE_MS: i64 = 500;
-
 // Parameters used to configure the behavior of a cluster participant.
 pub struct Config {
     // Timeout after which a server in follower state starts a new election.
@@ -50,16 +47,36 @@ pub struct Config {
     // Note that this also serves as the leader's heartbeat, so this should be
     // lower than the follower timeout.
     leader_replicate_ms: i64,
+
+    // A total number of bytes to accumulate in payloads before triggering a
+    // compaction, i.e., snapshotting the state machine and clearing the log
+    // entries stored locally.
+    compaction_threshold_bytes: i64,
+
+    // How frequently to check whether or not a compaction is necessary.
+    compaction_check_periods_ms: i64,
 }
 
 impl Config {
     pub fn default() -> Self {
         Config {
-            follower_timeout_ms: DEFAULT_FOLLOWER_TIMEOUTS_MS,
-            candidate_timeouts_ms: DEFAULT_CANDIDATE_TIMEOUT_MS,
-            leader_replicate_ms: DEFAULT_LEADER_REPLICATE_MS,
+            follower_timeout_ms: 2000,
+            candidate_timeouts_ms: 3000,
+            leader_replicate_ms: 500,
+            compaction_threshold_bytes: 10 * 1000 * 1000,
+            compaction_check_periods_ms: 500,
         }
     }
+}
+
+// Represents a snapshot of the state machine after applying a complete prefix
+// of entries since the beginning of time.
+struct LogSnapshot {
+    // The id of the latest entry included in the snapshot.
+    last: EntryId,
+
+    // The snapshot bytes as produced by the state machine.
+    snapshot: Bytes,
 }
 
 // Canonical implementation of the raft service. Acts as one server among peers
@@ -86,6 +103,7 @@ impl RaftImpl {
                 voted_for: None,
                 log: LogSlice::initial(),
                 state_machine,
+                snapshot: None,
 
                 committed: -1,
                 applied: -1,
@@ -105,10 +123,16 @@ impl RaftImpl {
     }
 
     pub fn start(&self) {
-        let mut s = self.state.lock().unwrap();
-        let term = s.term;
-        info!("[{:?}] Starting", s.address);
-        RaftImpl::become_follower(&mut s, self.state.clone(), term);
+        let arc_state = self.state.clone();
+
+        let mut state = self.state.lock().unwrap();
+        let term = state.term;
+        info!("[{:?}] Starting", state.address);
+        RaftImpl::become_follower(&mut state, arc_state.clone(), term);
+
+        task::spawn(async move {
+            RaftImpl::compaction_loop(arc_state.clone()).await;
+        });
     }
 
     fn become_follower(state: &mut RaftState, arc_state: Arc<Mutex<RaftState>>, term: i64) {
@@ -131,6 +155,20 @@ impl RaftImpl {
                 });
             },
         ));
+    }
+
+    async fn compaction_loop(arc_state: Arc<Mutex<RaftState>>) {
+        loop {
+            {
+                let mut state = arc_state.lock().unwrap();
+                if state.role == RaftRole::Stopping {
+                    return;
+                }
+                state.try_compact();
+            }
+            let period_ms = arc_state.lock().unwrap().config.compaction_check_periods_ms;
+            task::sleep(Duration::from_millis(add_jitter(period_ms) as u64)).await;
+        }
     }
 
     // Keeps running elections until either the term changes, a leader has emerged,
@@ -266,24 +304,45 @@ impl RaftImpl {
     // Makes a single request to all followers, heartbeating them and replicating
     // any entries they don't have.
     async fn replicate_entries(arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        let mut results = Vec::<GrpcFuture<(Server, AppendRequest, AppendResponse)>>::new();
+        // This needs to be marked as "Send" because it's being sent across await points.
+        let mut results = Vec::<Pin<Box<dyn Future<Output = ()> + Send>>>::new();
         {
             let mut state = arc_state.lock().unwrap();
             debug!("[{:?}] Replicating entries", &state.address);
-            for server in state.get_others() {
-                let request = state.create_append_request(&server);
-                let client = state.get_client(&server);
-                let s = server.clone();
-                let fut = client
-                    .append(grpc::RequestOptions::new(), request.clone())
-                    .drop_metadata()
-                    .map_ok(move |result| (s.clone(), request.clone(), result));
-                results.push(Box::pin(fut));
+            for follower in state.get_others() {
+                // Figure out which entry the follower is expecting next and decide whether to
+                // send an append request (if we have the entries) or to fast-forward the follower
+                // by installing a snapshot (if that entry has been compacted away in our log).
+                let position = state
+                    .followers
+                    .get(address_key(&follower).as_str())
+                    .unwrap();
+                if state.log.is_index_compacted(position.next_index) {
+                    let request = state.create_snapshot_request();
+                    let client = state.get_client(&follower);
+                    let fut = RaftImpl::replicate_snapshot(
+                        client,
+                        arc_state.clone(),
+                        follower.clone(),
+                        request.clone(),
+                    );
+                    results.push(Box::pin(fut));
+                } else {
+                    let request = state.create_append_request(position.next_index);
+                    let client = state.get_client(&follower);
+                    let fut = RaftImpl::replicate_append(
+                        client,
+                        arc_state.clone(),
+                        follower.clone(),
+                        request.clone(),
+                    );
+                    results.push(Box::pin(fut));
+                }
             }
         }
 
-        // TODO(dino): Add timeouts to these rpcs.
-        let results = join_all(results).await;
+        // Wait for these async replication rpcs to finish.
+        join_all(results).await;
 
         {
             let mut state = arc_state.lock().unwrap();
@@ -295,27 +354,87 @@ impl RaftImpl {
                 info!("[{:?}] No longer leader", state.address);
                 return;
             }
-
-            let me = state.address.clone();
-            for result in results {
-                match result {
-                    Err(message) => info!("[{:?}] Append request failed, error: {}", &me, message),
-                    Ok((peer, request, response)) => {
-                        let rterm = response.get_term();
-                        if rterm > state.term {
-                            info!(
-                                "[{:?}] Detected higher term {} from peer {:?}",
-                                &me, rterm, &peer,
-                            );
-                            RaftImpl::become_follower(&mut state, arc_state.clone(), rterm);
-                            return;
-                        }
-                        state.handle_append_response(&peer, &response, &request);
-                    }
-                }
-            }
             state.update_committed();
             debug!("[{:?}] Done replicating entries", &state.address);
+        }
+    }
+
+    // Send a request to the follower (baked into "client") to send the supplied request
+    // to install a snapshot.
+    async fn replicate_snapshot(
+        client: Arc<RaftClient>,
+        arc_state: Arc<Mutex<RaftState>>,
+        follower: Server,
+        request: InstallSnapshotRequest,
+    ) {
+        // TODO(dino): Add timeouts to these rpcs
+        let result = client
+            .install_snapshot(grpc::RequestOptions::new(), request.clone())
+            .drop_metadata()
+            .await;
+
+        let mut state = arc_state.lock().unwrap();
+        match result {
+            Ok(response) => {
+                let other_term = response.get_term();
+                if other_term > state.term {
+                    info!(
+                        "[{:?}] Detected higher term {} from peer {:?}",
+                        &state.address, other_term, &follower,
+                    );
+                    RaftImpl::become_follower(&mut state, arc_state.clone(), other_term);
+                    return;
+                }
+                state.record_follower_matches(&follower, request.get_last().get_index());
+            }
+            Err(message) => info!(
+                "[{:?}] InstallSnapshot request failed, error: {}",
+                state.address, message
+            ),
+        }
+    }
+
+    // Send a request to the follower (baked into "client") to send the supplied request
+    // to append entries we have but the follower might not.
+    async fn replicate_append(
+        client: Arc<RaftClient>,
+        arc_state: Arc<Mutex<RaftState>>,
+        follower: Server,
+        request: AppendRequest,
+    ) {
+        // TODO(dino): Add timeouts to these rpcs.
+        let result = client
+            .append(grpc::RequestOptions::new(), request.clone())
+            .drop_metadata()
+            .await;
+
+        let mut state = arc_state.lock().unwrap();
+        if state.term > request.get_term() {
+            info!("[{:?}] Detected higher term {}", state.address, state.term);
+            return;
+        }
+        if state.role != RaftRole::Leader {
+            info!("[{:?}] No longer leader", state.address);
+            return;
+        }
+
+        match result {
+            Err(message) => info!(
+                "[{:?}] Append request failed, error: {}",
+                &state.address, message
+            ),
+            Ok(response) => {
+                let other_term = response.get_term();
+                if other_term > state.term {
+                    info!(
+                        "[{:?}] Detected higher term {} from peer {:?}",
+                        &state.address, other_term, &follower,
+                    );
+                    RaftImpl::become_follower(&mut state, arc_state.clone(), other_term);
+                    return;
+                }
+                state.handle_append_response(&follower, &response, &request);
+            }
         }
     }
 }
@@ -336,6 +455,7 @@ enum RaftRole {
     Follower,
     Candidate,
     Leader,
+    Stopping,
 }
 
 struct RaftState {
@@ -353,6 +473,7 @@ struct RaftState {
     applied: i64,
     role: RaftRole,
     followers: HashMap<String, FollowerPosition>,
+    snapshot: Option<LogSnapshot>,
 
     timer: Timer,
     timer_guard: Option<Guard>,
@@ -360,7 +481,7 @@ struct RaftState {
     // Cluster membership.
     address: Server,
     cluster: Vec<Server>,
-    clients: HashMap<String, RaftClient>,
+    clients: HashMap<String, Arc<RaftClient>>,
     last_known_leader: Option<Server>,
 
     // If present, this instance will inform the diagnostics object of relevant
@@ -370,13 +491,12 @@ struct RaftState {
 
 impl RaftState {
     // Returns an rpc client which can be used to contact the supplied peer.
-    fn get_client(&mut self, address: &Server) -> &mut RaftClient {
+    fn get_client(&mut self, address: &Server) -> Arc<RaftClient> {
         let key = address_key(address);
-        self.clients.entry(key).or_insert_with(|| {
-            let client_conf = Default::default();
-            let port = address.get_port() as u16;
-            RaftClient::new_plain(address.get_host(), port, client_conf).unwrap()
-        })
+        self.clients
+            .entry(key)
+            .or_insert_with(|| Arc::new(make_raft_client(&address)))
+            .clone()
     }
 
     // Returns the peers in the cluster (ourself excluded).
@@ -405,15 +525,13 @@ impl RaftState {
         result
     }
 
-    // Returns the next append request to send to this follower. Must only be called
-    // while assuming the role of leader for the cluster.
-    fn create_append_request(&self, follower: &Server) -> AppendRequest {
-        // Construct the id of the last known index to be replicated on the follower.
-        let position = self.followers.get(address_key(&follower).as_str()).unwrap();
-
-        // TODO(dino): Before enabling snapshots, handle the case where the index
-        // the follower wants has already been compacted locally.
-        let previous = self.log.id_at(position.next_index - 1);
+    // Returns an append request from a leader to a follower, appending entries starting
+    // with the supplied index. Must only be called as leader, and the supplied index must
+    // exist in our current log.
+    fn create_append_request(&self, next_index: i64) -> AppendRequest {
+        // This method should only get called if we know the index is present.
+        assert!(!self.log.is_index_compacted(next_index));
+        let previous = self.log.id_at(next_index - 1);
 
         let mut request = AppendRequest::new();
         request.set_term(self.term);
@@ -421,6 +539,22 @@ impl RaftState {
         request.set_previous(previous.clone());
         request.set_entries(RepeatedField::from(self.log.get_entries_after(&previous)));
         request.set_committed(self.committed);
+        request
+    }
+
+    // Returns a request which the leader can send to a follower in order to install the
+    // same snapshot currently held on the leader.
+    fn create_snapshot_request(&self) -> InstallSnapshotRequest {
+        let mut request = InstallSnapshotRequest::new();
+        request.set_term(self.term);
+        request.set_leader(self.address.clone());
+        match &self.snapshot {
+            None => (),
+            Some(snap) => {
+                request.set_snapshot(snap.snapshot.to_vec());
+                request.set_last(snap.last.clone());
+            }
+        }
         request
     }
 
@@ -454,21 +588,28 @@ impl RaftState {
             return;
         }
 
-        // The follower has appended our entries. The next index we wish to
-        // send them is the one immediately after the last one we sent.
-        let old_f = f.clone();
+        // The follower has appended our entries, record the updated follower state.
         match request.get_entries().last() {
-            Some(e) => {
-                f.next_index = e.get_id().get_index() + 1;
-                f.match_index = e.get_id().get_index();
-                if f != &old_f {
-                    info!(
-                        "[{:?}] Follower state for peer {:?} is now (next={},match={})",
-                        &self.address, &peer, f.next_index, f.match_index
-                    );
-                }
-            }
+            Some(e) => self.record_follower_matches(&peer, e.get_id().get_index()),
             None => (),
+        }
+    }
+
+    // Called when, as a leader, we know that a follower's entries up to (and including)
+    // match_index match our entries.
+    fn record_follower_matches(&mut self, peer: &Server, match_index: i64) {
+        let follower = self
+            .followers
+            .get_mut(address_key(&peer).as_str())
+            .expect(format!("Unknown peer {:?}", &peer).as_str());
+        let old_f = follower.clone();
+        follower.match_index = match_index;
+        follower.next_index = match_index + 1;
+        if follower != &old_f {
+            info!(
+                "[{:?}] Follower state for peer {:?} is now (next={},match={})",
+                &self.address, &peer, follower.next_index, follower.match_index
+            );
         }
     }
 
@@ -536,6 +677,30 @@ impl RaftState {
         request.set_candidate(self.address.clone());
         request.set_last(self.log.last_known_id().clone());
         request
+    }
+
+    // Compacts logs entries into a new snapshot if necessary.
+    fn try_compact(&mut self) {
+        if self.log.size_bytes() > self.config.compaction_threshold_bytes {
+            let applied_index = self.applied;
+            let latest_id = self.log.id_at(applied_index);
+            let snap = LogSnapshot {
+                snapshot: self.state_machine.create_snapshot(),
+                last: latest_id.clone(),
+            };
+            self.snapshot = Some(snap);
+
+            // Note that we prefer not to clear the log slice entirely
+            // because although losing uncommitted entries is safe, the
+            // leader doing this could result in failed commit operations
+            // sent to the leader.
+            self.log.prune_until(&latest_id);
+
+            info!(
+                "[{:?}] Compacted log with snapshot up to (including) index {}",
+                self.address, applied_index
+            );
+        }
     }
 }
 
@@ -790,24 +955,45 @@ impl Raft for RaftImpl {
         debug!("[{:?}] Handling install snapshot request", self.address);
 
         let mut state = self.state.lock().unwrap();
-        if request.term >= state.term {
-            let contains = state.log.contains(request.get_last());
-
-            // If we have a copy of the latest entry in our log, there is
-            // nothing to do and we should retain any log entries that are
-            // newer than the latest entry in the snapshot.
-            if contains != ContainsResult::PRESENT {
-                let snapshot = Bytes::from(request.snapshot.clone());
-                match state.state_machine.load_snapshot(&snapshot) {
-                    Ok(_) => (),
-                    Err(message) => error!(
-                        "[{:?}] Failed to load snapshot: [{:?}]",
-                        self.address, message
-                    ),
-                }
-                state.log = LogSlice::new(request.get_last().clone());
-                state.applied = request.get_last().get_index();
+        if request.term >= state.term && !request.get_snapshot().is_empty() {
+            // Update the state machine.
+            let snapshot = Bytes::from(request.snapshot.clone());
+            match state.state_machine.load_snapshot(&snapshot) {
+                Ok(_) => (),
+                Err(message) => error!(
+                    "[{:?}] Failed to load snapshot: [{:?}]",
+                    self.address, message
+                ),
             }
+
+            // Update the log.
+            let contains = state.log.contains(request.get_last());
+            match contains {
+                ContainsResult::ABSENT => {
+                    // Common case, snapshot from the future. Just clear the log.
+                    state.log = LogSlice::new(request.get_last().clone());
+                }
+                ContainsResult::PRESENT => {
+                    // Entries that came after the latest snapshot entry might still be valid.
+                    state.log.prune_until(request.get_last());
+                }
+                ContainsResult::COMPACTED => {
+                    // Something went very wrong...
+                    warn!(
+                        "[{:?}] Got snapshot for already compacted index {}",
+                        state.address,
+                        request.get_last().get_index()
+                    );
+                }
+            }
+
+            // Update volatile state.
+            state.applied = request.get_last().get_index();
+            state.committed = request.get_last().get_index();
+            state.snapshot = Some(LogSnapshot {
+                last: request.get_last().clone(),
+                snapshot: request.get_snapshot().to_bytes(),
+            });
         }
 
         let mut result = InstallSnapshotResponse::new();
@@ -829,6 +1015,12 @@ fn address_key(address: &Server) -> String {
 
 fn entry_id_key(entry_id: &EntryId) -> String {
     format!("(term={},id={})", entry_id.term, entry_id.index)
+}
+
+fn make_raft_client(address: &Server) -> RaftClient {
+    let client_conf = Default::default();
+    let port = address.get_port() as u16;
+    RaftClient::new_plain(address.get_host(), port, client_conf).expect("Failed to create client")
 }
 
 #[cfg(test)]
@@ -918,6 +1110,94 @@ mod tests {
         assert!(append_response_2.get_success());
     }
 
+    // This test verifies that we can append entries to a follower and that once the
+    // follower's log grows too large, it will correctly compact.
+    #[test]
+    fn test_append_and_compact() {
+        let raft = create_raft();
+        let raft_state = raft.state.clone();
+        let server = create_grpc_server(raft);
+
+        // Make an append request coming from a leader, appending one record.
+        let leader = create_fake_server_list()[1].clone();
+        let mut append_request = AppendRequest::new();
+        append_request.set_term(12);
+        append_request.set_leader(leader.clone());
+        append_request.set_previous(entry_id(-1, -1));
+        append_request.set_entries(RepeatedField::from(vec![
+            entry(entry_id(8, 0), Vec::new()),
+            entry(entry_id(8, 1), Vec::new()),
+            entry(entry_id(8, 2), Vec::new()),
+        ]));
+        append_request.set_committed(0);
+
+        let append_response_1 = executor::block_on(
+            create_grpc_client(&server)
+                .append(grpc::RequestOptions::new(), append_request.clone())
+                .drop_metadata(),
+        )
+        .expect("result");
+
+        // Make sure the handler has processed the rpc successfully.
+        assert_eq!(append_response_1.get_term(), 12);
+        assert!(append_response_1.get_success());
+        {
+            let state = raft_state.lock().unwrap();
+            assert_eq!(state.last_known_leader, Some(leader.clone()));
+            assert_eq!(state.term, 12);
+            assert!(!state.log.is_index_compacted(0)); // Not compacted
+            assert_eq!(state.log.next_index(), 3);
+        }
+
+        // Run a compaction, should have no effect
+        {
+            let mut state = raft_state.lock().unwrap();
+            state.try_compact();
+            assert!(!state.log.is_index_compacted(0)); // Not compacted
+            assert_eq!(state.log.next_index(), 3);
+        }
+
+        // Now send an append request with a payload large enough to trigger compaction.
+        let compaction_bytes = raft_state.lock().unwrap().config.compaction_threshold_bytes;
+
+        let mut append_request_2 = AppendRequest::new();
+        append_request_2.set_term(12);
+        append_request_2.set_leader(leader.clone());
+        append_request_2.set_previous(entry_id(8, 2));
+        append_request_2.set_entries(RepeatedField::from(vec![entry(
+            entry_id(8, 3),
+            vec![0; 2 * compaction_bytes as usize],
+        )]));
+
+        // This tells the follower that the entries are committed (only committed
+        // entries are eligible for compaction).
+        append_request_2.set_committed(3);
+
+        let append_response_2 = executor::block_on(
+            create_grpc_client(&server)
+                .append(grpc::RequestOptions::new(), append_request_2.clone())
+                .drop_metadata(),
+        )
+        .expect("result");
+
+        // Make sure the handler has processed the rpc successfully.
+        assert_eq!(append_response_2.get_term(), 12);
+        assert!(append_response_2.get_success());
+        {
+            let state = raft_state.lock().unwrap();
+            assert!(!state.log.is_index_compacted(0)); // Not compacted
+            assert_eq!(state.log.next_index(), 4); // New entry incorporated
+        }
+
+        // Run a compaction, this one should actually compact things now.
+        {
+            let mut state = raft_state.lock().unwrap();
+            state.try_compact();
+            assert!(state.log.is_index_compacted(0)); // Compacted
+            assert_eq!(state.snapshot.as_ref().expect("snapshot").last.index, 3)
+        }
+    }
+
     fn entry(id: EntryId, payload: Vec<u8>) -> Entry {
         let mut entry = Entry::new();
         entry.set_payload(payload);
@@ -950,6 +1230,8 @@ mod tests {
             follower_timeout_ms: 100000000,
             candidate_timeouts_ms: 100000000,
             leader_replicate_ms: 100000000,
+            compaction_threshold_bytes: 1000,
+            compaction_check_periods_ms: 10000000000,
         }
     }
 
