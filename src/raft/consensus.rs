@@ -3,6 +3,7 @@ use crate::raft::diagnostics;
 use raft::raft_proto;
 use raft::raft_proto_grpc;
 use raft::StateMachine;
+use std::cmp::Ordering;
 
 extern crate chrono;
 extern crate math;
@@ -10,6 +11,7 @@ extern crate rand;
 extern crate timer;
 
 use async_std::task;
+use futures::channel::oneshot::{channel, Sender};
 use futures::future::join_all;
 use grpc::{
     ClientStubExt, GrpcFuture, ServerHandlerContext, ServerRequestSingle, ServerResponseUnarySink,
@@ -17,7 +19,7 @@ use grpc::{
 use log::{debug, error, info, warn};
 use protobuf::RepeatedField;
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -109,6 +111,10 @@ impl RaftImpl {
                 applied: -1,
                 role: RaftRole::Follower,
                 followers: HashMap::new(),
+
+                listener_uid: 0,
+                listeners: BTreeSet::new(),
+
                 timer: Timer::new(),
                 timer_guard: None,
 
@@ -450,6 +456,40 @@ struct FollowerPosition {
     match_index: i64,
 }
 
+// Each instance represents an ongoing commit operation waiting for the committed
+// index to reach the index of their tentative new entry.
+#[derive(Debug)]
+struct CommitListener {
+    // The index the listener would like to be notified about.
+    index: i64,
+
+    // Used to send the resulting entry id to the listener.
+    sender: Sender<EntryId>,
+
+    // Used to disambiguate between structs for the same index.
+    uid: i64,
+}
+
+impl Eq for CommitListener {}
+
+impl PartialEq<Self> for CommitListener {
+    fn eq(&self, other: &Self) -> bool {
+        (self.index, self.uid).eq(&(other.index, other.uid))
+    }
+}
+
+impl PartialOrd<Self> for CommitListener {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        (self.index, self.uid).partial_cmp(&(other.index, other.uid))
+    }
+}
+
+impl Ord for CommitListener {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.index, self.uid).cmp(&(other.index, other.uid))
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum RaftRole {
     Follower,
@@ -474,6 +514,9 @@ struct RaftState {
     role: RaftRole,
     followers: HashMap<String, FollowerPosition>,
     snapshot: Option<LogSnapshot>,
+
+    listener_uid: i64,
+    listeners: BTreeSet<CommitListener>,
 
     timer: Timer,
     timer_guard: Option<Guard>,
@@ -628,6 +671,7 @@ impl RaftState {
 
             if 2 * matches > self.cluster.len() {
                 self.committed = index;
+                self.resolve_listeners();
             }
         }
         if self.committed != saved_committed {
@@ -638,6 +682,21 @@ impl RaftState {
         }
 
         self.apply_committed();
+    }
+
+    // Tries to resolve the promises for listeners waiting for commits.
+    fn resolve_listeners(&mut self) {
+        while self.listeners.first().is_some()
+            && self.listeners.first().unwrap().index <= self.committed
+        {
+            let next = self.listeners.pop_first().expect("get first");
+            if !self.log.is_index_compacted(next.index) {
+                next.sender.send(self.log.id_at(next.index));
+            } else {
+                // Do nothing, we just let the sender go out of scope, which will notify the
+                // receiver of the cancellation
+            }
+        }
     }
 
     // Called to apply any committed values that haven't been applied to the
