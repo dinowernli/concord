@@ -1,5 +1,6 @@
 use crate::raft::raft_proto;
 use crate::raft::raft_proto_grpc;
+use std::sync::Mutex;
 
 use async_std::task;
 use grpc::ClientStubExt;
@@ -11,19 +12,20 @@ use raft_proto_grpc::RaftClient;
 
 pub struct Client {
     // Our current best guess as to who is the leader.
-    leader: Server,
+    leader: Mutex<Server>,
 }
 
 impl Client {
     pub fn new(servers: &Vec<Server>) -> Client {
+        let any = servers.first().expect("non-empty").clone();
         Client {
-            leader: servers.first().unwrap().clone(),
+            leader: Mutex::new(any),
         }
     }
 
     // Adds the supplied payload as the next entry in the cluster's shared log.
     // Returns once the payload has been added (or the operation has failed).
-    pub async fn commit(&mut self, payload: &[u8]) -> Result<EntryId, Error> {
+    pub async fn commit(&self, payload: &[u8]) -> Result<EntryId, Error> {
         let mut request = CommitRequest::new();
         request.set_payload(Vec::from(payload));
 
@@ -38,7 +40,7 @@ impl Client {
                 Status::SUCCESS => return Ok(result.get_entry_id().clone()),
                 Status::NOT_LEADER => {
                     if result.has_leader() {
-                        self.leader = result.get_leader().clone();
+                        self.update_leader(result.get_leader());
                     }
                 }
             }
@@ -48,7 +50,7 @@ impl Client {
 
     // Sends an rpc to the cluster leader to step down. Returns the address of
     // the leader which stepped down.
-    pub async fn preempt_leader(&mut self) -> Result<Server, Error> {
+    pub async fn preempt_leader(&self) -> Result<Server, Error> {
         loop {
             let result = self
                 .new_leader_client()
@@ -60,7 +62,7 @@ impl Client {
                 Status::SUCCESS => return Ok(result.get_leader().clone()),
                 Status::NOT_LEADER => {
                     if result.has_leader() {
-                        self.leader = result.get_leader().clone();
+                        self.update_leader(result.get_leader());
                     }
                 }
             }
@@ -68,11 +70,17 @@ impl Client {
         }
     }
 
+    // Encapsulates updating the leader in a thread-safe way.
+    fn update_leader(&self, leader: &Server) {
+        let mut locked = self.leader.lock().unwrap();
+        *locked = leader.clone();
+    }
+
     // Returns a client with an open connection to the server currently
     // believed to be the leader of the cluster.
     fn new_leader_client(&self) -> RaftClient {
         let client_conf = Default::default();
-        let address = self.leader.clone();
+        let address = self.leader.lock().unwrap().clone();
         let port = address.get_port() as u16;
         RaftClient::new_plain(address.get_host(), port, client_conf).expect("Creating client")
     }
