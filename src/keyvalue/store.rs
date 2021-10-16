@@ -15,13 +15,13 @@ use keyvalue_proto::{Entry, Operation, Snapshot};
 
 #[derive(Debug, Clone)]
 pub struct StoreError {
-    message: String,
+    _message: String,
 }
 
 impl StoreError {
     fn new(message: &str) -> Self {
         StoreError {
-            message: String::from(message),
+            _message: String::from(message),
         }
     }
 }

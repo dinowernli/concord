@@ -704,7 +704,9 @@ impl RaftState {
         {
             let next = self.listeners.pop_first().expect("get first");
             if !self.log.is_index_compacted(next.index) {
-                next.sender.send(self.log.id_at(next.index));
+                next.sender
+                    .send(self.log.id_at(next.index))
+                    .expect("receiver dropped early!");
             } else {
                 // Do nothing, we just let the sender go out of scope, which will notify the
                 // receiver of the cancellation
