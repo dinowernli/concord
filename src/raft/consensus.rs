@@ -3,6 +3,7 @@ use crate::raft::diagnostics;
 use raft::raft_proto;
 use raft::raft_proto_grpc;
 use raft::StateMachine;
+use std::cmp::Ordering;
 
 extern crate chrono;
 extern crate math;
@@ -10,6 +11,7 @@ extern crate rand;
 extern crate timer;
 
 use async_std::task;
+use futures::channel::oneshot::{channel, Receiver, Sender};
 use futures::future::join_all;
 use grpc::{
     ClientStubExt, GrpcFuture, ServerHandlerContext, ServerRequestSingle, ServerResponseUnarySink,
@@ -17,17 +19,18 @@ use grpc::{
 use log::{debug, error, info, warn};
 use protobuf::RepeatedField;
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time;
+
 use std::time::Duration;
 use timer::Guard;
 use timer::Timer;
 
 use bytes::{Buf, Bytes};
 use diagnostics::ServerDiagnostics;
+use futures::executor;
 use raft::log::{ContainsResult, LogSlice};
 use raft_proto::{AppendRequest, AppendResponse, EntryId, Server, VoteRequest, VoteResponse};
 use raft_proto::{CommitRequest, CommitResponse, Status, StepDownRequest, StepDownResponse};
@@ -109,6 +112,10 @@ impl RaftImpl {
                 applied: -1,
                 role: RaftRole::Follower,
                 followers: HashMap::new(),
+
+                listener_uid: 0,
+                listeners: BTreeSet::new(),
+
                 timer: Timer::new(),
                 timer_guard: None,
 
@@ -450,6 +457,40 @@ struct FollowerPosition {
     match_index: i64,
 }
 
+// Each instance represents an ongoing commit operation waiting for the committed
+// index to reach the index of their tentative new entry.
+#[derive(Debug)]
+struct CommitListener {
+    // The index the listener would like to be notified about.
+    index: i64,
+
+    // Used to send the resulting entry id to the listener.
+    sender: Sender<EntryId>,
+
+    // Used to disambiguate between structs for the same index.
+    uid: i64,
+}
+
+impl Eq for CommitListener {}
+
+impl PartialEq<Self> for CommitListener {
+    fn eq(&self, other: &Self) -> bool {
+        (self.index, self.uid).eq(&(other.index, other.uid))
+    }
+}
+
+impl PartialOrd<Self> for CommitListener {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        (self.index, self.uid).partial_cmp(&(other.index, other.uid))
+    }
+}
+
+impl Ord for CommitListener {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.index, self.uid).cmp(&(other.index, other.uid))
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum RaftRole {
     Follower,
@@ -474,6 +515,9 @@ struct RaftState {
     role: RaftRole,
     followers: HashMap<String, FollowerPosition>,
     snapshot: Option<LogSnapshot>,
+
+    listener_uid: i64,
+    listeners: BTreeSet<CommitListener>,
 
     timer: Timer,
     timer_guard: Option<Guard>,
@@ -628,6 +672,7 @@ impl RaftState {
 
             if 2 * matches > self.cluster.len() {
                 self.committed = index;
+                self.resolve_listeners();
             }
         }
         if self.committed != saved_committed {
@@ -638,6 +683,35 @@ impl RaftState {
         }
 
         self.apply_committed();
+    }
+
+    // Registers a listener for the supplied index.
+    fn add_listener(&mut self, index: i64) -> Receiver<EntryId> {
+        let (sender, receiver) = channel::<EntryId>();
+        self.listeners.insert(CommitListener {
+            index: index,
+            sender: sender,
+            uid: self.listener_uid,
+        });
+        self.listener_uid = self.listener_uid + 1;
+        receiver
+    }
+
+    // Tries to resolve the promises for listeners waiting for commits.
+    fn resolve_listeners(&mut self) {
+        while self.listeners.first().is_some()
+            && self.listeners.first().unwrap().index <= self.committed
+        {
+            let next = self.listeners.pop_first().expect("get first");
+            if !self.log.is_index_compacted(next.index) {
+                next.sender
+                    .send(self.log.id_at(next.index))
+                    .expect("receiver dropped early!");
+            } else {
+                // Do nothing, we just let the sender go out of scope, which will notify the
+                // receiver of the cancellation
+            }
+        }
     }
 
     // Called to apply any committed values that haven't been applied to the
@@ -866,55 +940,40 @@ impl Raft for RaftImpl {
 
         let term = state.term;
         let entry_id = state.log.append(term, request.payload);
+        let receiver = state.add_listener(entry_id.index);
 
         // Make sure the regular operations can continue while we wait.
         drop(state);
 
-        // TODO(dino): Turn this into a more efficient future-based wait (or,
-        // even better, something entirely async).
-        loop {
-            let state = self.state.lock().unwrap();
+        // TODO(dinow): This should really be async rather than blocking this rpc thread.
+        let committed = executor::block_on(receiver);
 
-            // Even if we're no longer the leader, we may have managed to
-            // get the entry committed while we were. Let the state of the
-            // replicated log and commit state be the source of truth.
-            if state.committed >= entry_id.index {
-                let mut result = CommitResponse::new();
-                state
-                    .last_known_leader
-                    .as_ref()
-                    .map(|l| result.set_leader(l.clone()));
+        let state = self.state.lock().unwrap();
+        let mut result = CommitResponse::new();
+        state
+            .last_known_leader
+            .as_ref()
+            .map(|l| result.set_leader(l.clone()));
 
-                // TODO(dino): Handle the case where the state of the world has
-                // moved on so much that the entry we committed got compacted.
-                // This would mean "contains" below returns COMPACTED.
-
-                if state.log.contains(&entry_id) == ContainsResult::PRESENT {
+        match committed {
+            Ok(committed_id) => {
+                if entry_id == committed_id {
                     result.set_entry_id(entry_id.clone());
                     result.set_status(Status::SUCCESS);
                 } else {
+                    // A different entry got committed to this index. This means
+                    // the leader must have changed, let the caller know.
                     result.set_status(Status::NOT_LEADER);
                 }
-                return sink.finish(result);
             }
-
-            // We know the log hasn't caught up. If the term has changed,
-            // chances are we the entry we appended earlier has been replaced
-            // by the new leader.
-            if state.term > entry_id.term {
-                let mut result = CommitResponse::new();
+            Err(_) => {
+                // The sender went out of scope without ever being resolved. This can
+                // happen in rare cases where the index we're interested in got compacted.
+                // In this case we don't know whether the entry was committed.
                 result.set_status(Status::NOT_LEADER);
-                state
-                    .last_known_leader
-                    .as_ref()
-                    .map(|l| result.set_leader(l.clone()));
-                return sink.finish(result);
             }
-
-            // Now we're still in the same term and we just haven't managed to
-            // commit the entry yet. Check again in the next iteration.
-            std::thread::sleep(time::Duration::from_millis(10));
         }
+        return sink.finish(result);
     }
 
     fn step_down(
