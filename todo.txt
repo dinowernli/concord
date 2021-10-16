@@ -1,7 +1,4 @@
-* More efficient commit
-* Move away from std::sync::Arc to async_std::Arc
-* Write more test for consensus.rs
+* Write more tests for consensus.rs
 * Split up consensus.rs
 * Introduce a network layer for fault injection
 * Implement cluster reconfiguration
-* Add deadlines for RPCs and tighten all timings
