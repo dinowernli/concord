@@ -5,7 +5,7 @@ syntax = "proto3";
 // to be serialized and transmitted to other participants in the Raft cluster.
 package keyvalue_proto;
 
-// A single key-value entry in the store.
+// A single key-value entry.
 message Entry {
   // The key for this entry.
   bytes key = 1;
@@ -14,7 +14,8 @@ message Entry {
   bytes value = 2;
 }
 
-// Represents an operation which modifies a store.
+// Represents an operation which modifies the key-value space. This is the type
+// used as an entry in the Raft commit log.
 message Operation {
   oneof op {
     SetOperation set = 1;
@@ -31,4 +32,42 @@ message SetOperation {
 message Snapshot {
   int64 version = 1;
   repeated Entry entries = 2;
+}
+
+// A request to retrieve an entry by key.
+message GetRequest {
+  // They key we want to retrieve.
+  bytes key = 1;
+
+  // The version at which we want to retrieve the key. If the version is less
+  // than or equal to zero, the latest version is returned.
+  int64 version = 2;
+}
+
+// A response containing the requested entry.
+message GetResponse {
+  // The requested entry. Absent if no entry exists.
+  Entry entry = 1;
+
+  // The version of the store used to respond to the request.
+  int64 version = 2;
+}
+
+// A request to set the value for a supplied key.
+message PutRequest {
+  // They key for which we are setting the value.
+  bytes key = 1;
+
+  // The value to write.
+  bytes value = 2;
+}
+
+// A response returned for a put request.
+message PutResponse {
+}
+
+// An rpc service providing access to a key-value store.
+service KeyValue {
+  rpc Get (GetRequest) returns (GetResponse) {}
+  rpc Put (PutRequest) returns (PutResponse) {}
 }
