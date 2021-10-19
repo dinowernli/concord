@@ -1,9 +1,10 @@
-use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 
 use bytes::Buf;
+use bytes::Bytes;
 use futures::executor;
 use grpc::{GrpcStatus, ServerHandlerContext, ServerRequestSingle, ServerResponseUnarySink};
+use log::{info, warn};
 use protobuf::Message;
 
 use crate::keyvalue::keyvalue_proto::{
@@ -11,25 +12,31 @@ use crate::keyvalue::keyvalue_proto::{
 };
 use crate::keyvalue::keyvalue_proto_grpc::KeyValue;
 use crate::keyvalue::{keyvalue_proto, MapStore, Store};
-use crate::make_set_operation;
 use crate::raft::raft_proto::Server;
-use crate::raft::Client;
+use crate::raft::{Client, StateMachine};
 
-use log::{info, warn};
-
-struct KeyValueService {
-    store: Arc<Mutex<dyn Store>>,
+pub struct KeyValueService {
+    address: Server,
+    store: Arc<Mutex<MapStore>>,
     raft: Client,
 }
 
 impl KeyValueService {
     // Creates a new instance of the service which will use the cluster of the
     // supplied member for its Raft consensus.
-    pub fn new(member: &Server) -> KeyValueService {
+    pub fn new(address: &Server) -> KeyValueService {
         KeyValueService {
+            address: address.clone(),
             store: Arc::new(Mutex::new(MapStore::new())),
-            raft: Client::new(member),
+
+            // We assume that every node running this service also runs a Raft service
+            // underneath, so we pass the same address twice to the Raft client.
+            raft: Client::new(address, address),
         }
+    }
+
+    pub fn raft_state_machine(&self) -> Arc<Mutex<dyn StateMachine + Send>> {
+        self.store.clone()
     }
 
     fn make_set_operation(key: &[u8], value: &[u8]) -> Operation {
@@ -98,7 +105,7 @@ impl KeyValue for KeyValueService {
             return response.send_grpc_error(GrpcStatus::Argument, "Empty value".to_string());
         }
 
-        let op = make_set_operation(&request.get_key(), &request.get_value());
+        let op = KeyValueService::make_set_operation(&request.get_key(), &request.get_value());
         let serialized = Bytes::from(op.write_to_bytes().expect("serialization"));
 
         // TODO(dino): Use await once this GRPC implementation can become async.

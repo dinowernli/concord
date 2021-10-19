@@ -11,16 +11,21 @@ use raft_proto::{CommitRequest, EntryId, Server, Status, StepDownRequest};
 use raft_proto_grpc::RaftClient;
 
 pub struct Client {
+    // The address of the server this is running on.
+    address: Server,
     // Our current best guess as to who is the leader.
     leader: Mutex<Server>,
 }
 
 impl Client {
-    // Returns a new client instance talking to the cluster with the supplied
-    // member. The client automatically discovers (via talking to this member)
-    // who is the leader of the cluster.
-    pub fn new(member: &Server) -> Client {
+    // Returns a new client instance talking to a Raft cluster.
+    // - address: The address this client is running on. Mostly used for logging.
+    // - member: The address of a (any) member of the Raft cluster.
+    //
+    // Note that "address" and "member" can be equal.
+    pub fn new(address: &Server, member: &Server) -> Client {
         Client {
+            address: address.clone(),
             leader: Mutex::new(member.clone()),
         }
     }

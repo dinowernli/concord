@@ -23,3 +23,4 @@ pub use store::MapStore;
 pub use store::Store;
 
 mod service;
+pub use service::KeyValueService;

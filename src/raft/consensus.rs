@@ -93,7 +93,7 @@ impl RaftImpl {
     pub fn new(
         server: &Server,
         all: &Vec<Server>,
-        state_machine: Box<dyn StateMachine + Send>,
+        state_machine: Arc<Mutex<dyn StateMachine + Send>>,
         diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
         config: Config,
     ) -> RaftImpl {
@@ -507,7 +507,7 @@ struct RaftState {
     term: i64,
     voted_for: Option<Server>,
     log: LogSlice,
-    state_machine: Box<dyn StateMachine + Send>, // RaftState gets sent between threads.
+    state_machine: Arc<Mutex<dyn StateMachine + Send>>, // RaftState gets sent between threads.
 
     // Volatile raft state.
     committed: i64,
@@ -722,7 +722,11 @@ impl RaftState {
             let entry = self.log.entry_at(self.applied);
             let entry_id = entry.get_id().clone();
 
-            let result = self.state_machine.apply(&entry.get_payload().to_bytes());
+            let result = self
+                .state_machine
+                .lock()
+                .unwrap()
+                .apply(&entry.get_payload().to_bytes());
             match result {
                 Ok(()) => {
                     info!(
@@ -759,7 +763,7 @@ impl RaftState {
             let applied_index = self.applied;
             let latest_id = self.log.id_at(applied_index);
             let snap = LogSnapshot {
-                snapshot: self.state_machine.create_snapshot(),
+                snapshot: self.state_machine.lock().unwrap().create_snapshot(),
                 last: latest_id.clone(),
             };
             self.snapshot = Some(snap);
@@ -1017,7 +1021,7 @@ impl Raft for RaftImpl {
         if request.term >= state.term && !request.get_snapshot().is_empty() {
             // Update the state machine.
             let snapshot = Bytes::from(request.snapshot.clone());
-            match state.state_machine.load_snapshot(&snapshot) {
+            match state.state_machine.lock().unwrap().load_snapshot(&snapshot) {
                 Ok(_) => (),
                 Err(message) => error!(
                     "[{:?}] Failed to load snapshot: [{:?}]",
@@ -1276,8 +1280,8 @@ mod tests {
         RaftImpl::new(
             &servers[0].clone(),
             &servers.clone(),
-            Box::new(FakeStateMachine::new()),
-            None,
+            Arc::new(Mutex::new(FakeStateMachine::new())),
+            None, /* diagnostics */
             create_config_for_testing(),
         )
     }
