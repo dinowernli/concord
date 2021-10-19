@@ -16,10 +16,12 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(servers: &Vec<Server>) -> Client {
-        let any = servers.first().expect("non-empty").clone();
+    // Returns a new client instance talking to the cluster with the supplied
+    // member. The client automatically discovers (via talking to this member)
+    // who is the leader of the cluster.
+    pub fn new(member: &Server) -> Client {
         Client {
-            leader: Mutex::new(any),
+            leader: Mutex::new(member.clone()),
         }
     }
 
