@@ -67,7 +67,7 @@ fn start_node(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagnostics
 
 // Starts a loop which provides a steady amount of commit traffic.
 async fn run_commit_loop(cluster: &Vec<Server>) {
-    let mut client = Client::new(cluster);
+    let client = Client::new(cluster);
     let mut sequence_number = 0;
     loop {
         let payload_value = format!("Payload number: {}", sequence_number);
@@ -94,7 +94,7 @@ async fn run_commit_loop(cluster: &Vec<Server>) {
 // Starts a loop which periodically preempts the cluster leader, forcing the
 // cluster to recover by electing a new one.
 async fn run_preempt_loop(cluster: &Vec<Server>) {
-    let mut client = Client::new(cluster);
+    let client = Client::new(cluster);
     loop {
         match client.preempt_leader().await {
             Ok(leader) => info!("Preempted cluster leader: {:?}", leader),
