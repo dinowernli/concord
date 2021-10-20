@@ -1,12 +1,8 @@
 #![feature(async_closure)]
 #![feature(map_first_last)]
+#![feature(trait_upcasting)]
 
-mod keyvalue;
-mod raft;
-
-use keyvalue::keyvalue_proto;
-use raft::raft_proto;
-use raft::raft_proto_grpc;
+use std::time::Duration;
 
 use async_std::task;
 use bytes::Bytes;
@@ -14,13 +10,21 @@ use env_logger::Env;
 use futures::executor;
 use futures::future::join3;
 use log::info;
-use std::time::Duration;
-
-use keyvalue_proto::Operation;
 use protobuf::Message;
-use raft::{Client, Config, Diagnostics, RaftImpl};
+
+use keyvalue::keyvalue_proto;
+use keyvalue_proto::Operation;
+use raft::raft_proto;
+use raft::raft_proto_grpc;
+use raft::{Config, Diagnostics, RaftImpl};
 use raft_proto::{EntryId, Server};
 use raft_proto_grpc::RaftServer;
+
+use crate::keyvalue::keyvalue_proto_grpc::KeyValueServer;
+use crate::keyvalue::KeyValueService;
+
+mod keyvalue;
+mod raft;
 
 fn make_set_operation(key: &[u8], value: &[u8]) -> Operation {
     let mut entry = keyvalue_proto::Entry::new();
@@ -47,10 +51,13 @@ fn server(host: &str, port: i32) -> Server {
 }
 
 fn start_node(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagnostics) -> grpc::Server {
-    let server_diagnostics = diagnostics.get_server(&address);
+    // A service used to serve the keyvalue store, backed by the
+    // underlying Raft cluster.
+    let keyvalue = KeyValueService::new(&address);
 
-    let state_machine = Box::new(keyvalue::MapStore::new());
-    let mut server_builder = grpc::ServerBuilder::new_plain();
+    // A service used by the Raft cluster.
+    let server_diagnostics = diagnostics.get_server(&address);
+    let state_machine = keyvalue.raft_state_machine();
     let raft = RaftImpl::new(
         address,
         all,
@@ -60,14 +67,17 @@ fn start_node(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagnostics
     );
     raft.start();
 
+    let mut server_builder = grpc::ServerBuilder::new_plain();
     server_builder.add_service(RaftServer::new_service_def(raft));
+    server_builder.add_service(KeyValueServer::new_service_def(keyvalue));
     server_builder.http.set_port(address.get_port() as u16);
     server_builder.build().expect("server")
 }
 
 // Starts a loop which provides a steady amount of commit traffic.
 async fn run_commit_loop(cluster: &Vec<Server>) {
-    let client = Client::new(cluster);
+    let member = cluster.first().unwrap().clone();
+    let client = raft::new_client(&server("main-commit", 0), &member);
     let mut sequence_number = 0;
     loop {
         let payload_value = format!("Payload number: {}", sequence_number);
@@ -94,7 +104,8 @@ async fn run_commit_loop(cluster: &Vec<Server>) {
 // Starts a loop which periodically preempts the cluster leader, forcing the
 // cluster to recover by electing a new one.
 async fn run_preempt_loop(cluster: &Vec<Server>) {
-    let client = Client::new(cluster);
+    let member = cluster.first().unwrap().clone();
+    let client = raft::new_client(&server("main-preempt", 0), &member);
     loop {
         match client.preempt_leader().await {
             Ok(leader) => info!("Preempted cluster leader: {:?}", leader),

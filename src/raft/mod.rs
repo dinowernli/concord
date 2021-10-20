@@ -17,7 +17,7 @@ pub mod raft_proto_grpc;
 mod log;
 
 mod client;
-pub use client::Client;
+pub use client::{new_client, Client};
 
 mod consensus;
 pub use consensus::{Config, RaftImpl};

@@ -15,9 +15,10 @@ timer = "0.2.0"
 chrono = "0.4.11"
 rand = "0.7.3"
 libmath = "0.2.1"
-async-std = "1.6.2"
 bytes = "0.5.6"
 im = "15.0.0"
+async-trait = "0.1.51"
+async-std = {version = "1.9.0", features = ["attributes"]}
 
 [build-dependencies]
 protoc-rust-grpc = "0.8.3"
