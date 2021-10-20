@@ -15,9 +15,13 @@ use crate::keyvalue::{keyvalue_proto, MapStore, Store};
 use crate::raft::raft_proto::Server;
 use crate::raft::{Client, StateMachine};
 
+// This allows us to combine two non-auto traits into one.
+trait StoreStateMachine: Store + StateMachine {}
+impl<T: Store + StateMachine> StoreStateMachine for T {}
+
 pub struct KeyValueService {
     address: Server,
-    store: Arc<Mutex<MapStore>>,
+    store: Arc<Mutex<dyn StoreStateMachine + Send>>,
     raft: Client,
 }
 

@@ -1,27 +1,47 @@
 #![feature(async_closure)]
 #![feature(map_first_last)]
+#![feature(trait_upcasting)]
 
 use std::time::Duration;
 
 use async_std::task;
+use bytes::Bytes;
 use env_logger::Env;
 use futures::executor;
 use futures::future::join3;
-use grpc::ClientStubExt;
-use log::{info, warn};
+use log::info;
+use protobuf::Message;
 
+use keyvalue::keyvalue_proto;
+use keyvalue_proto::Operation;
 use raft::raft_proto;
 use raft::raft_proto_grpc;
 use raft::{Client, Config, Diagnostics, RaftImpl};
-use raft_proto::Server;
+use raft_proto::{EntryId, Server};
 use raft_proto_grpc::RaftServer;
 
-use crate::keyvalue::keyvalue_proto::PutRequest;
-use crate::keyvalue::keyvalue_proto_grpc::{KeyValueClient, KeyValueServer};
+use crate::keyvalue::keyvalue_proto_grpc::KeyValueServer;
 use crate::keyvalue::KeyValueService;
 
 mod keyvalue;
 mod raft;
+
+fn make_set_operation(key: &[u8], value: &[u8]) -> Operation {
+    let mut entry = keyvalue_proto::Entry::new();
+    entry.set_key(key.to_vec());
+    entry.set_value(value.to_vec());
+
+    let mut op = keyvalue_proto::SetOperation::new();
+    op.set_entry(entry);
+
+    let mut result = Operation::new();
+    result.set_set(op);
+    result
+}
+
+fn entry_id_key(entry_id: &EntryId) -> String {
+    format!("(term={},id={})", entry_id.term, entry_id.index)
+}
 
 fn server(host: &str, port: i32) -> Server {
     let mut result = Server::new();
@@ -56,35 +76,27 @@ fn start_node(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagnostics
 
 // Starts a loop which provides a steady amount of commit traffic.
 async fn run_commit_loop(cluster: &Vec<Server>) {
+    let member = cluster.first().unwrap().clone();
+    let client = Client::new(&server("main-commit", 0), &member);
     let mut sequence_number = 0;
     loop {
-        info!(
-            "Starting commit loop for sequence number {}",
-            sequence_number
-        );
+        let payload_value = format!("Payload number: {}", sequence_number);
+        let op = make_set_operation("payload".as_bytes(), payload_value.as_bytes());
+        let serialized = Bytes::from(op.write_to_bytes().expect("serialization"));
 
-        let client_conf = Default::default();
-        let server = cluster[sequence_number % cluster.len()].clone();
-        let port = server.get_port() as u16;
-        let client = KeyValueClient::new_plain(server.get_host(), port, client_conf)
-            .expect("Creating client");
-
-        let mut request = PutRequest::new();
-        request.set_key("foo".to_string().into_bytes());
-        request.set_value(format!("value-{}", sequence_number).into_bytes());
-
-        let result = client
-            .put(grpc::RequestOptions::new(), request)
-            .drop_metadata()
-            .await;
-        match result {
-            Ok(_) => info!("Committed payload {}", sequence_number),
-            Err(message) => warn!(
-                "Failed to commit payload {}, message: {}",
-                sequence_number, message
-            ),
+        match client.commit(&serialized).await {
+            Ok(id) => {
+                info!(
+                    "Committed payload {} with id {}",
+                    sequence_number,
+                    entry_id_key(&id)
+                );
+                sequence_number = sequence_number + 1;
+            }
+            Err(message) => {
+                info!("Failed to commit payload: {}", message);
+            }
         }
-        sequence_number = sequence_number + 1;
         task::sleep(Duration::from_secs(1)).await;
     }
 }
@@ -93,7 +105,7 @@ async fn run_commit_loop(cluster: &Vec<Server>) {
 // cluster to recover by electing a new one.
 async fn run_preempt_loop(cluster: &Vec<Server>) {
     let member = cluster.first().unwrap().clone();
-    let client = Client::new(&server("MAIN", 0), &member);
+    let client = Client::new(&server("main-preempt", 0), &member);
     loop {
         match client.preempt_leader().await {
             Ok(leader) => info!("Preempted cluster leader: {:?}", leader),
