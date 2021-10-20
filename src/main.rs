@@ -16,7 +16,7 @@ use keyvalue::keyvalue_proto;
 use keyvalue_proto::Operation;
 use raft::raft_proto;
 use raft::raft_proto_grpc;
-use raft::{Client, Config, Diagnostics, RaftImpl};
+use raft::{Config, Diagnostics, RaftImpl};
 use raft_proto::{EntryId, Server};
 use raft_proto_grpc::RaftServer;
 
@@ -77,7 +77,7 @@ fn start_node(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagnostics
 // Starts a loop which provides a steady amount of commit traffic.
 async fn run_commit_loop(cluster: &Vec<Server>) {
     let member = cluster.first().unwrap().clone();
-    let client = Client::new(&server("main-commit", 0), &member);
+    let client = raft::new_client(&server("main-commit", 0), &member);
     let mut sequence_number = 0;
     loop {
         let payload_value = format!("Payload number: {}", sequence_number);
@@ -105,7 +105,7 @@ async fn run_commit_loop(cluster: &Vec<Server>) {
 // cluster to recover by electing a new one.
 async fn run_preempt_loop(cluster: &Vec<Server>) {
     let member = cluster.first().unwrap().clone();
-    let client = Client::new(&server("main-preempt", 0), &member);
+    let client = raft::new_client(&server("main-preempt", 0), &member);
     loop {
         match client.preempt_leader().await {
             Ok(leader) => info!("Preempted cluster leader: {:?}", leader),
