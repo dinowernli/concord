@@ -1,7 +1,6 @@
 use crate::raft;
 use crate::raft::diagnostics;
 use raft::raft_proto;
-use raft::raft_proto_grpc;
 use raft::StateMachine;
 use std::cmp::Ordering;
 
@@ -35,7 +34,10 @@ use raft::log::{ContainsResult, LogSlice};
 use raft_proto::{AppendRequest, AppendResponse, EntryId, Server, VoteRequest, VoteResponse};
 use raft_proto::{CommitRequest, CommitResponse, Status, StepDownRequest, StepDownResponse};
 use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
-use raft_proto_grpc::{Raft, RaftClient};
+
+use crate::raft_proto::raft_client::RaftClient;
+use crate::raft_proto::raft_server::Raft;
+use crate::raft_proto::raft_server::RaftServer;
 
 // Parameters used to configure the behavior of a cluster participant.
 pub struct Config {

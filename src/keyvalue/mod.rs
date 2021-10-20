@@ -14,9 +14,6 @@ pub mod keyvalue_proto;
 // and only expose the Request/Response types here rather than the entire module.
 // This amounts to removing "pub" here and adding more targeted "pub use" directives.
 
-#[path = "generated/keyvalue_proto_grpc.rs"]
-pub mod keyvalue_proto_grpc;
-
 // TODO(dinow): stop exposing these and make the "store" types an implementation detail.
 mod store;
 pub use store::MapStore;

@@ -15,13 +15,11 @@ use protobuf::Message;
 use keyvalue::keyvalue_proto;
 use keyvalue_proto::Operation;
 use raft::raft_proto;
-use raft::raft_proto_grpc;
 use raft::{Config, Diagnostics, RaftImpl};
 use raft_proto::{EntryId, Server};
-use raft_proto_grpc::RaftServer;
 
-use crate::keyvalue::keyvalue_proto_grpc::KeyValueServer;
 use crate::keyvalue::KeyValueService;
+use crate::raft_proto::raft_server::RaftServer;
 
 mod keyvalue;
 mod raft;

@@ -11,10 +11,14 @@ use protobuf::Message;
 use crate::keyvalue::keyvalue_proto::{
     Entry, GetRequest, GetResponse, Operation, PutRequest, PutResponse,
 };
-use crate::keyvalue::keyvalue_proto_grpc::KeyValue;
+
 use crate::keyvalue::{keyvalue_proto, MapStore, Store};
 use crate::raft::raft_proto::Server;
 use crate::raft::{new_client, Client, StateMachine};
+
+use crate::keyvalue_proto::key_value_server::KeyValueServer;
+use crate::keyvalue_proto::key_value_server::KeyValue;
+
 
 // This allows us to combine two non-auto traits into one.
 trait StoreStateMachine: Store + StateMachine {}
