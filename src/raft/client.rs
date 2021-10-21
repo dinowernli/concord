@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use grpc::ClientStubExt;
 use grpc::Error;
 use log::debug;
+use tonic::transport::Channel;
 
 use raft_proto::{CommitRequest, EntryId, Server, Status, StepDownRequest};
 
@@ -57,11 +58,9 @@ impl ClientImpl {
 
     // Returns a client with an open connection to the server currently
     // believed to be the leader of the cluster.
-    fn new_leader_client(&self) -> RaftClient {
-        let client_conf = Default::default();
+    async fn new_leader_client(&self) -> RaftClient<Channel> {
         let address = self.leader.lock().unwrap().clone();
-        let port = address.get_port() as u16;
-        RaftClient::new_plain(address.get_host(), port, client_conf).expect("Creating client")
+        RaftClient::connect(format!("http://[::1]:{}", address.port)).await.expect("connect")
     }
 }
 
@@ -98,6 +97,7 @@ impl Client for ClientImpl {
         loop {
             let result = self
                 .new_leader_client()
+                .await?
                 .step_down(grpc::RequestOptions::new(), StepDownRequest::new())
                 .drop_metadata()
                 .await?;

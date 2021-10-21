@@ -7,17 +7,15 @@ use futures::executor;
 use grpc::{GrpcStatus, ServerHandlerContext, ServerRequestSingle, ServerResponseUnarySink};
 use log::{debug, info, warn};
 use protobuf::Message;
+use tonic::{Request, Response, Status};
 
+use crate::keyvalue::{keyvalue_proto, MapStore, Store};
 use crate::keyvalue::keyvalue_proto::{
     Entry, GetRequest, GetResponse, Operation, PutRequest, PutResponse,
 };
-
-use crate::keyvalue::{keyvalue_proto, MapStore, Store};
-use crate::raft::{new_client, Client, StateMachine};
-use tonic::{Request, Response, Status};
-
 use crate::keyvalue_proto::key_value_server::KeyValue;
 use crate::keyvalue_proto::key_value_server::KeyValueServer;
+use crate::raft::{Client, new_client, StateMachine};
 use crate::raft::raft_proto::Server;
 
 // This allows us to combine two non-auto traits into one.
@@ -84,39 +82,36 @@ impl KeyValue for KeyValueService {
 
         let lookup = locked.get_at(&key, version);
         if lookup.is_err() {
-            return response.send_grpc_error(GrpcStatus::OutOfRange, "Compacted".to_string());
+            return Err(Status::out_of_range("Compacted"));
         }
 
-        let mut result = GetResponse::new();
-        result.set_version(version);
-        match lookup.unwrap() {
-            None => (),
-            Some(value) => {
-                let mut entry = Entry::new();
-                entry.set_key(key.to_vec());
-                entry.set_value(value.to_vec());
-                result.set_entry(entry);
+        Ok(Response::new(GetResponse {
+            version,
+            entry: match lookup.unwrap() {
+                None => None,
+                Some(value) => Entry {
+                    key: key.clone().into(),
+                    value: value.clone().into(),
+                }
             }
-        }
-        response.finish(result)
+        }))
     }
 
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         debug!("[{:?}] Handling PUT request", &self.address);
-        let request = request_single.message;
-        if request.get_key().is_empty() {
-            return response.send_grpc_error(GrpcStatus::Argument, "Empty key".to_string());
+        let request = request.into_inner();
+        if request.key.is_empty() {
+            return Err(Status::invalid_argument("Empty key"));
         }
-        if request.get_value().is_empty() {
-            return response.send_grpc_error(GrpcStatus::Argument, "Empty value".to_string());
+        if request.value.is_empty() {
+            return Err(Status::invalid_argument("Empty value"));
         }
 
-        let op = KeyValueService::make_set_operation(&request.get_key(), &request.get_value());
+        let op = KeyValueService::make_set_operation(&request.key.to_vec(), &request.value.to_vec());
         let serialized = Bytes::from(op.write_to_bytes().expect("serialization"));
 
-        // TODO(dino): Use await once this GRPC implementation can become async.
-        let commit = executor::block_on(self.raft.commit(&serialized));
-        return match commit {
+        let commit = self.raft.commit(&serialized).await;
+        match commit {
             Ok(id) => {
                 let key_str = String::from_utf8_lossy(request.get_key());
                 info!(
@@ -124,7 +119,7 @@ impl KeyValue for KeyValueService {
                     id.get_index(),
                     key_str
                 );
-                response.finish(PutResponse::new())
+                Ok(Response::new(PutResponse {} ))
             }
             Err(message) => {
                 let key_str = String::from_utf8_lossy(request.get_key());
@@ -132,10 +127,9 @@ impl KeyValue for KeyValueService {
                     "Failed to commit put operation for key: {}, message: {}",
                     key_str, message
                 );
-                response
-                    .send_grpc_error(GrpcStatus::Internal, "Failed to commit to Raft".to_string())
+                Err(Status::internal(format!("Failed to commit: {}", message)))
             }
-        };
+        }
     }
 }
 

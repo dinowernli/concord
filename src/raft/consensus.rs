@@ -372,7 +372,7 @@ impl RaftImpl {
     // Send a request to the follower (baked into "client") to send the supplied request
     // to install a snapshot.
     async fn replicate_snapshot(
-        client: Arc<RaftClient>,
+        client: Arc<RaftClient<Channel>>,
         arc_state: Arc<Mutex<RaftState>>,
         follower: Server,
         request: InstallSnapshotRequest,
