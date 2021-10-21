@@ -60,9 +60,6 @@ impl KeyValueService {
     }
 }
 
-// &self,
-//         request: Request<HelloRequest>,
-
 #[tonic::async_trait]
 impl KeyValue for KeyValueService {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
@@ -89,10 +86,10 @@ impl KeyValue for KeyValueService {
             version,
             entry: match lookup.unwrap() {
                 None => None,
-                Some(value) => Entry {
+                Some(value) => Some(Entry {
                     key: key.clone().into(),
                     value: value.clone().into(),
-                }
+                })
             }
         }))
     }

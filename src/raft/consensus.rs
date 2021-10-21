@@ -1,16 +1,19 @@
-use crate::raft;
-use crate::raft::diagnostics;
-use raft::raft_proto;
-use raft::StateMachine;
-use std::cmp::Ordering;
-
 extern crate chrono;
 extern crate math;
 extern crate rand;
 extern crate timer;
 
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use async_std::task;
+use bytes::{Buf, Bytes};
 use futures::channel::oneshot::{channel, Receiver, Sender};
+use futures::executor;
 use futures::future::join_all;
 use grpc::{
     ClientStubExt, GrpcFuture, ServerHandlerContext, ServerRequestSingle, ServerResponseUnarySink,
@@ -18,27 +21,25 @@ use grpc::{
 use log::{debug, error, info, warn};
 use protobuf::RepeatedField;
 use rand::Rng;
-use std::collections::{BTreeSet, HashMap};
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-
-use std::time::Duration;
 use timer::Guard;
 use timer::Timer;
-
-use bytes::{Buf, Bytes};
-use diagnostics::ServerDiagnostics;
-use futures::executor;
-use raft::log::{ContainsResult, LogSlice};
-use raft_proto::{AppendRequest, AppendResponse, EntryId, Server, VoteRequest, VoteResponse};
-use raft_proto::{CommitRequest, CommitResponse, Status, StepDownRequest, StepDownResponse};
-use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
+use tonic::{IntoRequest, Request, Response, Status};
 use tonic::transport::Channel;
 
+use diagnostics::ServerDiagnostics;
+use raft::log::{ContainsResult, LogSlice};
+use raft::raft_proto;
+use raft::StateMachine;
+use raft_proto::{AppendRequest, AppendResponse, EntryId, Server, VoteRequest, VoteResponse};
+use raft_proto::{CommitRequest, CommitResponse, StepDownRequest, StepDownResponse};
+use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
+
+use crate::raft;
+use crate::raft::diagnostics;
 use crate::raft_proto::raft_client::RaftClient;
 use crate::raft_proto::raft_server::Raft;
 use crate::raft_proto::raft_server::RaftServer;
+
 
 // Parameters used to configure the behavior of a cluster participant.
 pub struct Config {
@@ -785,14 +786,10 @@ impl RaftState {
     }
 }
 
+#[tonic::async_trait]
 impl Raft for RaftImpl {
-    fn vote(
-        &self,
-        _: ServerHandlerContext,
-        req: ServerRequestSingle<VoteRequest>,
-        sink: ServerResponseUnarySink<VoteResponse>,
-    ) -> grpc::Result<()> {
-        let request = req.message;
+    async fn vote(&self, request: Request<VoteRequest>) -> Result<Response<VoteResponse>, Status> {
+        let request = request.into_inner();
         info!(
             "[{:?}] Handling vote request: [{:?}]",
             self.address, request
@@ -801,51 +798,49 @@ impl Raft for RaftImpl {
         let mut state = self.state.lock().unwrap();
 
         // Reject anything from an outdated term.
-        if state.term > request.get_term() {
-            let mut result = VoteResponse::new();
-            result.set_term(state.term);
-            result.set_granted(false);
-            return sink.finish(result);
+        if state.term > request.term {
+            return Ok(Response::new(VoteResponse {
+                term: state.term,
+                granted: false,
+            }));
         }
 
         // If we're in an outdated term, we revert to follower in the new later
         // term and may still grant the requesting candidate our vote.
-        if request.get_term() > state.term {
-            RaftImpl::become_follower(&mut state, self.state.clone(), request.get_term());
+        if request.term > state.term {
+            RaftImpl::become_follower(&mut state, self.state.clone(), request.term);
         }
 
-        let mut result = VoteResponse::new();
-        result.set_term(state.term);
+        let candidate = request.candidate;
 
-        let candidate = request.get_candidate();
-        if candidate == state.voted_for.as_ref().unwrap_or(candidate) {
-            if state.log.is_up_to_date(request.get_last()) {
-                state.voted_for = Some(candidate.clone());
+        let mut granted;
+        if state.voted_for.is_none() || &candidate == &state.voted_for {
+            if state.log.is_up_to_date(&request.last.expect("last")) {
+                state.voted_for = candidate.clone();
                 info!("[{:?}] Granted vote", self.address);
-                result.set_granted(true);
+                granted = true;
             } else {
                 info!("[{:?}] Denied vote", self.address);
-                result.set_granted(false);
+                granted = false;
             }
-            return sink.finish(result);
         } else {
             info!(
                 "[{:?}] Rejecting, already voted for candidate [{:?}]",
                 self.address,
                 state.voted_for.as_ref()
             );
-            result.set_granted(false);
-            sink.finish(result)
+            granted = false;
         }
+
+        Ok(Response::new(VoteResponse {
+            term : state.term,
+            granted,
+
+        }))
     }
 
-    fn append(
-        &self,
-        _: ServerHandlerContext,
-        req: ServerRequestSingle<AppendRequest>,
-        sink: ServerResponseUnarySink<AppendResponse>,
-    ) -> grpc::Result<()> {
-        let request = req.message;
+    async fn append(&self, request: Request<AppendRequest>) -> Result<Response<AppendResponse>, Status> {
+        let request = request.into_inner();
         debug!(
             "[{:?}] Handling append request: [{:?}]",
             self.address, request
@@ -855,22 +850,22 @@ impl Raft for RaftImpl {
 
         // Handle the case where we are ahead of the leader. We inform the
         // leader of our (greater) term and fail the append.
-        if state.term > request.get_term() {
-            let mut result = AppendResponse::new();
-            result.set_term(state.term);
-            result.set_success(false);
-            return sink.finish(result);
+        if state.term > request.term {
+            return Ok(Response::new(AppendResponse{
+                term: state.term,
+                success: false,
+            }));
         }
 
         // If the leader's term is greater than ours, we update ours to match
         // by resetting to a "clean" follower state for the leader's (greater)
         // term. Note that we then handle the leader's append afterwards.
-        if request.get_term() > state.term {
-            RaftImpl::become_follower(&mut state, self.state.clone(), request.get_term());
+        if request.term > state.term {
+            RaftImpl::become_follower(&mut state, self.state.clone(), request.term);
         }
 
         // Record the latest leader.
-        let leader = request.get_leader().clone();
+        let leader = request.leader.expect("leader").clone();
         state.last_known_leader = Some(leader.clone());
         match &state.diagnostics {
             Some(d) => d.lock().unwrap().report_leader(state.term, &leader),
@@ -894,136 +889,123 @@ impl Raft for RaftImpl {
             },
         ));
 
-        let mut result = AppendResponse::new();
-        result.set_term(state.term);
+        let term = state.term;
 
         // Make sure we have the previous log index sent. Note that COMPACTED
         // can happen whenever we have no entries (e.g.,initially or just after
         // a snapshot install).
-        if state.log.contains(request.get_previous()) == ContainsResult::ABSENT {
+        if state.log.contains(&request.previous.expect("previous")) == ContainsResult::ABSENT {
             // Let the leader know that this entry is too far in the future, so
             // it can try again from with earlier index.
-            result.set_success(false);
-            return sink.finish(result);
+            return Ok(Response::new(AppendResult {
+                term,
+                success: false,
+            }));
         }
 
-        if !request.get_entries().is_empty() {
-            state.log.append_all(request.get_entries());
+        if !request.entries.is_empty() {
+            state.log.append_all(request.entries.as_slice());
         }
 
         // If the leader considers an entry committed, it is guaranteed that
         // all members of the cluster agree on the log up to that index, so it
         // is safe to apply the entries to the state machine.
-        let leader_commit = request.get_committed();
+        let leader_commit = request.committed;
         if leader_commit > state.committed {
             state.committed = leader_commit;
             state.apply_committed();
         }
 
         debug!("[{:?}] Successfully processed heartbeat", &state.address);
-        result.set_success(true);
-        return sink.finish(result);
+        Ok(Response::new(AppendResponse {
+            term,
+            success: true,
+        }))
     }
 
-    fn commit(
-        &self,
-        _: ServerHandlerContext,
-        req: ServerRequestSingle<CommitRequest>,
-        sink: ServerResponseUnarySink<CommitResponse>,
-    ) -> grpc::Result<()> {
-        let request = req.message;
+    async fn commit(&self, request: Request<CommitRequest>) -> Result<Response<CommitResponse>, Status> {
+        let request = request.into_inner();
         debug!("[{:?}] Handling commit request", self.address);
 
-        let mut state = self.state.lock().unwrap();
-        if state.role != RaftRole::Leader {
-            let mut result = CommitResponse::new();
-            result.set_status(Status::NOT_LEADER);
-            match &state.last_known_leader {
-                None => (),
-                Some(l) => result.set_leader(l.clone()),
+        let term;
+        let entry_id;
+        let receiver;
+
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.role != RaftRole::Leader {
+                return Ok(Response::new(CommitResponse {
+                    status: raft_proto::Status::NotLeader as i32,
+                    leader: state.last_known_leader.clone(),
+                    entry_id: None,
+                }));
             }
-            return sink.finish(result);
+
+            term = state.term;
+            entry_id = state.log.append(term, request.payload);
+            receiver = state.add_listener(entry_id.index);
         }
 
-        let term = state.term;
-        let entry_id = state.log.append(term, request.payload);
-        let receiver = state.add_listener(entry_id.index);
-
-        // Make sure the regular operations can continue while we wait.
-        drop(state);
-
-        // TODO(dinow): This should really be async rather than blocking this rpc thread.
-        let committed = executor::block_on(receiver);
+        let committed = receiver.await;
 
         let state = self.state.lock().unwrap();
-        let mut result = CommitResponse::new();
-        state
-            .last_known_leader
-            .as_ref()
-            .map(|l| result.set_leader(l.clone()));
+        let mut result = CommitResponse {
+            leader: state.last_known_leader.clone(),
+
+            // Replaced below
+            status: 0,
+            entry_id: None
+        };
 
         match committed {
             Ok(committed_id) => {
                 if entry_id == committed_id {
-                    result.set_entry_id(entry_id.clone());
-                    result.set_status(Status::SUCCESS);
+                    result.entry_id = Some(entry_id.clone());
+                    result.status = raft_proto::Status::Success as i32;
                 } else {
                     // A different entry got committed to this index. This means
                     // the leader must have changed, let the caller know.
-                    result.set_status(Status::NOT_LEADER);
+                    result.status = raft_proto::Status::NotLeader as i32;
                 }
             }
             Err(_) => {
                 // The sender went out of scope without ever being resolved. This can
                 // happen in rare cases where the index we're interested in got compacted.
                 // In this case we don't know whether the entry was committed.
-                result.set_status(Status::NOT_LEADER);
+                result.status = raft_proto::Status::NotLeader as i32;
             }
-        }
-        return sink.finish(result);
+        };
+        Ok(Response::new(result))
     }
 
-    fn step_down(
-        &self,
-        _: ServerHandlerContext,
-        _req: ServerRequestSingle<StepDownRequest>,
-        sink: ServerResponseUnarySink<StepDownResponse>,
-    ) -> grpc::Result<()> {
+    async fn step_down(&self, request: Request<StepDownRequest>) -> Result<Response<StepDownResponse>, Status> {
         debug!("[{:?}] Handling step down request", self.address);
 
         let mut state = self.state.lock().unwrap();
         if state.role != RaftRole::Leader {
-            let mut result = StepDownResponse::new();
-            result.set_status(Status::NOT_LEADER);
-            match &state.last_known_leader {
-                None => (),
-                Some(l) => result.set_leader(l.clone()),
-            }
-            return sink.finish(result);
+            return Ok(Response::new(StepDownResponse {
+                status: raft_proto::Status::NotLeader as i32,
+                leader: state.last_known_leader.clone(),
+            }));
         }
 
         let term = state.term;
         RaftImpl::become_follower(&mut state, self.state.clone(), term);
 
-        let mut result = StepDownResponse::new();
-        result.set_status(Status::SUCCESS);
-        result.set_leader(state.address.clone());
-        return sink.finish(result);
+        Ok(Response::new(StepDownResponse{
+            status: raft_proto::Status::Success as i32,
+            leader: Some(state.address.clone()),
+        }))
     }
 
-    fn install_snapshot(
-        &self,
-        _: ServerHandlerContext,
-        req: ServerRequestSingle<InstallSnapshotRequest>,
-        sink: ServerResponseUnarySink<InstallSnapshotResponse>,
-    ) -> grpc::Result<()> {
-        let request = req.message;
+    async fn install_snapshot(&self, request: Request<InstallSnapshotRequest>) -> Result<Response<InstallSnapshotResponse>, Status> {
+        let request = request.into_inner();
         debug!("[{:?}] Handling install snapshot request", self.address);
 
         let mut state = self.state.lock().unwrap();
-        if request.term >= state.term && !request.get_snapshot().is_empty() {
+        if request.term >= state.term && !request.snapshot.is_empty() {
             // Update the state machine.
-            let snapshot = Bytes::from(request.snapshot.clone());
+            let snapshot = request.snapshot.to_bytes();
             match state.state_machine.lock().unwrap().load_snapshot(&snapshot) {
                 Ok(_) => (),
                 Err(message) => error!(
@@ -1033,38 +1015,37 @@ impl Raft for RaftImpl {
             }
 
             // Update the log.
-            let contains = state.log.contains(request.get_last());
+            let contains = state.log.contains(&request.last.expect("last"));
             match contains {
                 ContainsResult::ABSENT => {
                     // Common case, snapshot from the future. Just clear the log.
-                    state.log = LogSlice::new(request.get_last().clone());
+                    state.log = LogSlice::new(request.last.expect("last").clone());
                 }
                 ContainsResult::PRESENT => {
                     // Entries that came after the latest snapshot entry might still be valid.
-                    state.log.prune_until(request.get_last());
+                    state.log.prune_until(&request.last.expect("last"));
                 }
                 ContainsResult::COMPACTED => {
                     // Something went very wrong...
                     warn!(
                         "[{:?}] Got snapshot for already compacted index {}",
                         state.address,
-                        request.get_last().get_index()
+                        request.last.expect("last").index,
                     );
                 }
             }
 
             // Update volatile state.
-            state.applied = request.get_last().get_index();
-            state.committed = request.get_last().get_index();
+            state.applied = request.last.expect("last").index;
+            state.committed = request.last.expect("last").index;
             state.snapshot = Some(LogSnapshot {
-                last: request.get_last().clone(),
-                snapshot: request.get_snapshot().to_bytes(),
+                last: request.last.expect("last").clone(),
+                snapshot: request.snapshot.to_bytes(),
             });
         }
-
-        let mut result = InstallSnapshotResponse::new();
-        result.set_term(state.term);
-        return sink.finish(result);
+        Ok(Response::new(InstallSnapshotResponse{
+            term: state.term,
+        }))
     }
 }
 
@@ -1090,11 +1071,14 @@ fn make_raft_client(address: &Server) -> Arc<RaftClient<Channel>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use futures::executor;
+
+    use raft_proto_grpc::RaftServer;
+
     use crate::raft::StateMachineResult;
     use crate::raft_proto::Entry;
-    use futures::executor;
-    use raft_proto_grpc::RaftServer;
+
+    use super::*;
 
     #[test]
     fn test_initial_state() {
