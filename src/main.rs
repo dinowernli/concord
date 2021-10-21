@@ -12,6 +12,7 @@ use futures::future::join3;
 use log::info;
 use protobuf::Message;
 
+use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
 use keyvalue::keyvalue_proto;
 use keyvalue_proto::Operation;
 use raft::raft_proto;
@@ -19,6 +20,7 @@ use raft::{Config, Diagnostics, RaftImpl};
 use raft_proto::{EntryId, Server};
 
 use crate::keyvalue::KeyValueService;
+use crate::raft::raft_proto::raft_client::RaftClient;
 use crate::raft_proto::raft_server::RaftServer;
 
 mod keyvalue;
@@ -65,11 +67,15 @@ fn start_node(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagnostics
     );
     raft.start();
 
-    let mut server_builder = grpc::ServerBuilder::new_plain();
-    server_builder.add_service(RaftServer::new_service_def(raft));
-    server_builder.add_service(KeyValueServer::new_service_def(keyvalue));
-    server_builder.http.set_port(address.get_port() as u16);
-    server_builder.build().expect("server")
+    // TODO use real address
+    let addr = "[::1]:50051".parse()?;
+    executor::block_on(
+        Server::builder()
+            .add_service(RaftServer::new(raft))
+            .add_service(KeyValueServer::new(keyvalue))
+            .serve(addr),
+    );
+    panic!("asdf");
 }
 
 // Starts a loop which provides a steady amount of commit traffic.
@@ -125,6 +131,8 @@ async fn run_validate_loop(diag: &mut Diagnostics) {
 
 fn main() {
     env_logger::from_env(Env::default().default_filter_or("concord=info")).init();
+
+    //let mut client = RaftClient::connect("http://[::1]:50051").await?;
 
     let addresses = vec![
         server("::1", 12345),

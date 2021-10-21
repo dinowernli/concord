@@ -9,9 +9,9 @@ use log::debug;
 
 use raft_proto::{CommitRequest, EntryId, Server, Status, StepDownRequest};
 
-use crate::raft_proto::raft_server::RaftServer;
-use crate::raft_proto::raft_client::RaftClient;
 use crate::raft::raft_proto;
+use crate::raft_proto::raft_client::RaftClient;
+use crate::raft_proto::raft_server::RaftServer;
 
 // Returns a new client instance talking to a Raft cluster.
 // - address: The address this client is running on. Mostly used for logging.

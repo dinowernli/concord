@@ -13,12 +13,12 @@ use crate::keyvalue::keyvalue_proto::{
 };
 
 use crate::keyvalue::{keyvalue_proto, MapStore, Store};
-use crate::raft::raft_proto::Server;
 use crate::raft::{new_client, Client, StateMachine};
+use tonic::{Request, Response, Status};
 
-use crate::keyvalue_proto::key_value_server::KeyValueServer;
 use crate::keyvalue_proto::key_value_server::KeyValue;
-
+use crate::keyvalue_proto::key_value_server::KeyValueServer;
+use crate::raft::raft_proto::Server;
 
 // This allows us to combine two non-auto traits into one.
 trait StoreStateMachine: Store + StateMachine {}
@@ -62,18 +62,18 @@ impl KeyValueService {
     }
 }
 
+// &self,
+//         request: Request<HelloRequest>,
+
+#[tonic::async_trait]
 impl KeyValue for KeyValueService {
-    fn get(
-        &self,
-        _: ServerHandlerContext,
-        request: ServerRequestSingle<GetRequest>,
-        response: ServerResponseUnarySink<GetResponse>,
-    ) -> grpc::Result<()> {
+    async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         debug!("[{:?}] Handling GET request", &self.address);
-        if request.message.get_key().is_empty() {
-            return response.send_grpc_error(GrpcStatus::Argument, "Empty key".to_string());
+        let request = request.into_inner();
+        if request.key.is_empty() {
+            return Err(Status::invalid_argument("Empty key"));
         }
-        let key = request.message.get_key().to_bytes();
+        let key = request.key.to_bytes();
 
         let locked = self.store.lock().unwrap();
         let version = if request.message.version <= 0 {
@@ -101,12 +101,7 @@ impl KeyValue for KeyValueService {
         response.finish(result)
     }
 
-    fn put(
-        &self,
-        _: ServerHandlerContext,
-        request_single: ServerRequestSingle<PutRequest>,
-        response: ServerResponseUnarySink<PutResponse>,
-    ) -> grpc::Result<()> {
+    async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         debug!("[{:?}] Handling PUT request", &self.address);
         let request = request_single.message;
         if request.get_key().is_empty() {

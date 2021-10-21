@@ -34,6 +34,7 @@ use raft::log::{ContainsResult, LogSlice};
 use raft_proto::{AppendRequest, AppendResponse, EntryId, Server, VoteRequest, VoteResponse};
 use raft_proto::{CommitRequest, CommitResponse, Status, StepDownRequest, StepDownResponse};
 use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
+use tonic::transport::Channel;
 
 use crate::raft_proto::raft_client::RaftClient;
 use crate::raft_proto::raft_server::Raft;
@@ -406,7 +407,7 @@ impl RaftImpl {
     // Send a request to the follower (baked into "client") to send the supplied request
     // to append entries we have but the follower might not.
     async fn replicate_append(
-        client: Arc<RaftClient>,
+        client: Arc<RaftClient<Channel>>,
         arc_state: Arc<Mutex<RaftState>>,
         follower: Server,
         request: AppendRequest,
@@ -527,7 +528,7 @@ struct RaftState {
     // Cluster membership.
     address: Server,
     cluster: Vec<Server>,
-    clients: HashMap<String, Arc<RaftClient>>,
+    clients: HashMap<String, Arc<RaftClient<Channel>>>,
     last_known_leader: Option<Server>,
 
     // If present, this instance will inform the diagnostics object of relevant
@@ -537,7 +538,7 @@ struct RaftState {
 
 impl RaftState {
     // Returns an rpc client which can be used to contact the supplied peer.
-    fn get_client(&mut self, address: &Server) -> Arc<RaftClient> {
+    fn get_client(&mut self, address: &Server) -> Arc<RaftClient<Channel>> {
         let key = address_key(address);
         self.clients
             .entry(key)
@@ -1082,10 +1083,9 @@ fn entry_id_key(entry_id: &EntryId) -> String {
     format!("(term={},id={})", entry_id.term, entry_id.index)
 }
 
-fn make_raft_client(address: &Server) -> RaftClient {
-    let client_conf = Default::default();
-    let port = address.get_port() as u16;
-    RaftClient::new_plain(address.get_host(), port, client_conf).expect("Failed to create client")
+fn make_raft_client(address: &Server) -> Arc<RaftClient<Channel>> {
+    let addr = format!("http://[::1]:{}", address.get_port());
+    Arc::new(executor::block_on(RaftClient::connect(addr)).expect("Failed to create client"))
 }
 
 #[cfg(test)]
