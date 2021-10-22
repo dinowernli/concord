@@ -10,7 +10,6 @@ use im::HashMap;
 use std::collections::VecDeque;
 
 use self::bytes::Buf;
-use self::protobuf::Message;
 use keyvalue_proto::{Entry, Operation, Snapshot};
 
 #[derive(Debug, Clone)]

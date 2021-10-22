@@ -69,23 +69,24 @@ impl Client for ClientImpl {
     // Adds the supplied payload as the next entry in the cluster's shared log.
     // Returns once the payload has been added (or the operation has failed).
     async fn commit(&self, payload: &[u8]) -> Result<EntryId, Error> {
-        let mut request = CommitRequest::new();
-        request.set_payload(Vec::from(payload));
+        let request = CommitRequest {
+            payload: payload.to_vec(),
+        };
 
         loop {
             let result = self
                 .new_leader_client()
-                .commit(grpc::RequestOptions::new(), request.clone())
-                .drop_metadata()
-                .await?;
+                .await
+                .commit(&request)
+                .await?
+                .into_inner();
 
-            match result.get_status() {
-                Status::SUCCESS => return Ok(result.get_entry_id().clone()),
-                Status::NOT_LEADER => {
-                    if result.has_leader() {
-                        self.update_leader(result.get_leader());
-                    }
+            match Status::from_i32(result.status) {
+                Some(Status::Success) => return Ok(result.entry_id.expect("entryid").clone()),
+                Some(Status::NotLeader) => {
+                    result.leader.into_iter().for_each(|l| self.update_leader(&l));
                 }
+                other => panic!("Unknown enum value {}", other)
             }
             task::sleep(Duration::from_secs(1)).await;
         }
@@ -97,18 +98,17 @@ impl Client for ClientImpl {
         loop {
             let result = self
                 .new_leader_client()
+                .await
+                .step_down(StepDownRequest {})
                 .await?
-                .step_down(grpc::RequestOptions::new(), StepDownRequest::new())
-                .drop_metadata()
-                .await?;
+                .into_inner();
 
-            match result.get_status() {
-                Status::SUCCESS => return Ok(result.get_leader().clone()),
-                Status::NOT_LEADER => {
-                    if result.has_leader() {
-                        self.update_leader(result.get_leader());
-                    }
+            match Status::from_i32(result.status) {
+                Some(Status::Success) => return Ok(result.leader.expect("leader").clone()),
+                Some(Status::NotLeader) => {
+                    result.leader.into_iter().for_each(|l| self.update_leader(&l));
                 }
+                _ => panic!("Unknown enum value {}", result.status)
             }
             task::sleep(Duration::from_secs(1)).await;
         }

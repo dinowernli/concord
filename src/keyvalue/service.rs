@@ -1,12 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use bytes::Buf;
 use bytes::Bytes;
 use futures::executor;
 use grpc::{GrpcStatus, ServerHandlerContext, ServerRequestSingle, ServerResponseUnarySink};
 use log::{debug, info, warn};
-use protobuf::Message;
 use tonic::{Request, Response, Status};
 
 use crate::keyvalue::{keyvalue_proto, MapStore, Store};
@@ -105,15 +103,15 @@ impl KeyValue for KeyValueService {
         }
 
         let op = KeyValueService::make_set_operation(&request.key.to_vec(), &request.value.to_vec());
-        let serialized = Bytes::from(op.write_to_bytes().expect("serialization"));
+        let serialized = op.encode_to_vec();
 
         let commit = self.raft.commit(&serialized).await;
         match commit {
             Ok(id) => {
-                let key_str = String::from_utf8_lossy(request.get_key());
+                let key_str = String::from_utf8_lossy(request.key.expect("key"));
                 info!(
                     "Committed put operation with raft index {} for key {}",
-                    id.get_index(),
+                    id.index,
                     key_str
                 );
                 Ok(Response::new(PutResponse {} ))
@@ -133,9 +131,12 @@ impl KeyValue for KeyValueService {
 #[cfg(test)]
 mod tests {
     use grpc::{ClientStubExt, Error};
+    use tonic::transport::Channel;
+    use crate::keyvalue::keyvalue_proto::key_value_client::KeyValueClient;
 
     use crate::keyvalue::keyvalue_proto_grpc::{KeyValueClient, KeyValueServer};
     use crate::raft::raft_proto::EntryId;
+    use crate::raft::raft_proto::raft_client::RaftClient;
 
     use super::*;
 
@@ -177,8 +178,7 @@ mod tests {
         request.set_key(String::from("foo").into_bytes());
 
         let response = create_grpc_client(&server)
-            .get(grpc::RequestOptions::new(), request.clone())
-            .drop_metadata()
+            .get(request.clone())
             .await
             .expect("response");
 
@@ -199,7 +199,7 @@ mod tests {
         request.set_value(String::from("bar").into_bytes());
 
         create_grpc_client(&server)
-            .put(grpc::RequestOptions::new(), request.clone())
+            .put(request.clone())
             .drop_metadata()
             .await
             .expect("response");
@@ -231,10 +231,10 @@ mod tests {
         server_builder.build().expect("server")
     }
 
-    fn create_grpc_client(server: &grpc::Server) -> KeyValueClient {
+    async fn create_grpc_client(server: &grpc::Server) -> KeyValueClient<Channel> {
         let client_conf = Default::default();
         let port = server.local_addr().port().expect("port");
-        KeyValueClient::new_plain("0.0.0.0", port, client_conf).expect("client")
+        KeyValueClient::connect(format!("http://[::1]:{}", port)).await?
     }
 
     fn make_server(host: &str, port: i32) -> Server {

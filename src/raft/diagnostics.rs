@@ -121,7 +121,7 @@ impl ServerDiagnostics {
 }
 
 fn address_key(address: &Server) -> String {
-    format!("{}:{}", address.get_host(), address.get_port())
+    format!("{}:{}", address.host, address.port)
 }
 
 #[cfg(test)]

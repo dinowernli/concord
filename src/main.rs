@@ -10,7 +10,6 @@ use env_logger::Env;
 use futures::executor;
 use futures::future::join3;
 use log::info;
-use protobuf::Message;
 
 use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
 use keyvalue::keyvalue_proto;
@@ -18,6 +17,8 @@ use keyvalue_proto::Operation;
 use raft::raft_proto;
 use raft::{Config, Diagnostics, RaftImpl};
 use raft_proto::{EntryId, Server};
+use crate::keyvalue::keyvalue_proto::operation::Op;
+use crate::keyvalue::keyvalue_proto::SetOperation;
 
 use crate::keyvalue::KeyValueService;
 use crate::raft::raft_proto::raft_client::RaftClient;
@@ -27,16 +28,14 @@ mod keyvalue;
 mod raft;
 
 fn make_set_operation(key: &[u8], value: &[u8]) -> Operation {
-    let mut entry = keyvalue_proto::Entry::new();
-    entry.set_key(key.to_vec());
-    entry.set_value(value.to_vec());
-
-    let mut op = keyvalue_proto::SetOperation::new();
-    op.set_entry(entry);
-
-    let mut result = Operation::new();
-    result.set_set(op);
-    result
+    Operation {
+        op: Some(Op::Set(SetOperation{
+            entry: Some(keyvalue_proto::Entry {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            })
+        }))
+    }
 }
 
 fn entry_id_key(entry_id: &EntryId) -> String {
@@ -86,8 +85,7 @@ async fn run_commit_loop(cluster: &Vec<Server>) {
     loop {
         let payload_value = format!("Payload number: {}", sequence_number);
         let op = make_set_operation("payload".as_bytes(), payload_value.as_bytes());
-        let serialized = Bytes::from(op.write_to_bytes().expect("serialization"));
-
+        let serialized = op.encode_to_vec();
         match client.commit(&serialized).await {
             Ok(id) => {
                 info!(

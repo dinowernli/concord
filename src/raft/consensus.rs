@@ -1005,7 +1005,7 @@ impl Raft for RaftImpl {
         let mut state = self.state.lock().unwrap();
         if request.term >= state.term && !request.snapshot.is_empty() {
             // Update the state machine.
-            let snapshot = request.snapshot.to_bytes();
+            let snapshot = Bytes::from(&request.snapshot);
             match state.state_machine.lock().unwrap().load_snapshot(&snapshot) {
                 Ok(_) => (),
                 Err(message) => error!(

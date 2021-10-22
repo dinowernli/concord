@@ -44,20 +44,17 @@ impl LogSlice {
     // Returns a new instance with no entries, representing the *beginning* of
     // the log, i.e., the next expected entry has index 0.
     pub fn initial() -> Self {
-        let mut sentinel = EntryId::new();
-        sentinel.set_term(-1);
-        sentinel.set_index(-1);
-        Self::new(sentinel)
+        Self::new(EntryId { term: -1, index: -1})
     }
 
     // Adds a new entry to the end of the slice. Returns the id of the
     // newly appended entry.
     pub fn append(&mut self, term: i64, payload: Vec<u8>) -> EntryId {
-        assert!(term >= self.last_known_id().get_term());
+        assert!(term >= self.last_known_id().term);
 
         let size_bytes = payload.len() as i64;
         let entry = create_entry(term, self.next_index(), payload);
-        let entry_id = entry.get_id().clone();
+        let entry_id = entry.id.clone().expect("entry");
 
         self.entries.push(entry);
         self.size_bytes += size_bytes;
@@ -68,45 +65,45 @@ impl LogSlice {
     // in this instance). Returns -1 if there are no known entries at all.
     pub fn last_known_id(&self) -> &EntryId {
         match self.entries.last() {
-            Some(entry) => entry.get_id(),
+            Some(entry) => &entry.id.expect("id"),
             None => &self.previous_id,
         }
     }
 
     // Returns the expected index of the next element added to the log.
     pub fn next_index(&self) -> i64 {
-        self.last_known_id().get_index() + 1
+        self.last_known_id().index + 1
     }
 
     // Returns true if the supplied last entry id is at least as up-to-date
     // as the slice of the log tracked by this instance.
     pub fn is_up_to_date(&self, other_last: &EntryId) -> bool {
         let this_last = match self.entries.last() {
-            Some(entry) => entry.get_id(),
+            Some(entry) => &entry.id.expect("id"),
             None => &self.previous_id,
         };
 
-        if this_last.get_term() != other_last.get_term() {
-            return other_last.get_term() > this_last.get_term();
+        if this_last.term != other_last.term {
+            return other_last.term > this_last.term;
         }
 
         // Terms are equal, last index decides.
-        return other_last.get_index() >= this_last.get_index();
+        return other_last.index >= this_last.index;
     }
 
     // Returns true if the supplied entry is present in this slice.
     pub fn contains(&self, query: &EntryId) -> ContainsResult {
-        if query.get_index() <= self.previous_id.get_index() {
-            assert!(query.get_term() <= self.previous_id.get_term());
+        if query.index <= self.previous_id.index {
+            assert!(query.term <= self.previous_id.term);
             return ContainsResult::COMPACTED;
         }
 
-        let idx = self.local_index(query.get_index());
+        let idx = self.local_index(query.index);
         if idx >= self.entries.len() {
             return ContainsResult::ABSENT;
         }
 
-        let &entry_id = &self.entries[idx as usize].get_id();
+        let &entry_id = &self.entries[idx as usize].id;
         assert!(entry_id == query);
         return ContainsResult::PRESENT;
     }
@@ -114,7 +111,7 @@ impl LogSlice {
     // Returns true if the supplied index lies before the range of entries present
     // in this log instance.
     pub fn is_index_compacted(&self, index: i64) -> bool {
-        index <= self.previous_id.get_index()
+        index <= self.previous_id.index
     }
 
     // Adds the supplied entries to the end of the slice. Any conflicting
