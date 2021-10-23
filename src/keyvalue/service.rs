@@ -2,14 +2,12 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::executor;
 use log::{debug, info, warn};
 use tonic::{Request, Response, Status};
 
 use crate::keyvalue::{keyvalue_proto, MapStore, Store};
 use crate::keyvalue::keyvalue_proto::{Entry, GetRequest, GetResponse, Operation, PutRequest, PutResponse, SetOperation};
 use crate::keyvalue_proto::key_value_server::KeyValue;
-use crate::keyvalue_proto::key_value_server::KeyValueServer;
 use crate::raft::{Client, new_client, StateMachine};
 use crate::raft::raft_proto::Server;
 use prost::Message;

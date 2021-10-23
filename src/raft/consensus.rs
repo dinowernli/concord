@@ -34,7 +34,6 @@ use crate::raft;
 use crate::raft::diagnostics;
 use crate::raft_proto::raft_client::RaftClient;
 use crate::raft_proto::raft_server::Raft;
-use crate::raft_proto::raft_server::RaftServer;
 
 // Parameters used to configure the behavior of a cluster participant.
 pub struct Config {
@@ -197,7 +196,7 @@ impl RaftImpl {
     // Returns whether or not the election process is deemed complete. If complete,
     // there is no need to run any further elections.
     async fn run_election(arc_state: Arc<Mutex<RaftState>>, term: i64) -> bool {
-        let mut results = Vec::new();
+        let mut futures = Vec::new();
         {
             let mut state = arc_state.lock().unwrap();
 
@@ -217,15 +216,20 @@ impl RaftImpl {
             let me = state.address.clone();
             let vote_request = state.create_vote_request();
             for server in state.get_others() {
-                let mut client = state.get_client(&server);
-                debug!("[{:?}] Making vote rpc to [{:?}]", &me, &server);
-                let mut request = Request::new(vote_request.clone());
-                request.set_timeout(Duration::from_millis(100));
-                results.push(Box::pin(client.vote(request)));
+                let client = state.get_client(&server);
+
+                // TODO(dino): Turn into an async function/method
+                let closure = async move |req: VoteRequest| {
+                    let mut c = client;
+                    let mut request = Request::new(req);
+                    request.set_timeout(Duration::from_millis(100));
+                    c.vote(request).await
+                };
+                futures.push(closure(vote_request.clone()));
             }
         }
 
-        let results = join_all(results).await;
+        let results = join_all(futures).await;
 
         {
             let mut state = arc_state.lock().unwrap();
@@ -238,7 +242,7 @@ impl RaftImpl {
             }
 
             let mut votes = 1; // Here we count our own vote for ourselves.
-            for response in &results {
+            for response in results {
                 match response {
                     Ok(result) => {
                         let message = result.into_inner();
@@ -897,7 +901,7 @@ impl Raft for RaftImpl {
         if state.log.contains(&request.previous.expect("previous")) == ContainsResult::ABSENT {
             // Let the leader know that this entry is too far in the future, so
             // it can try again from with earlier index.
-            return Ok(Response::new(AppendResult {
+            return Ok(Response::new(AppendResponse {
                 term,
                 success: false,
             }));
