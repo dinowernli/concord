@@ -19,6 +19,7 @@ use raft::{Config, Diagnostics, RaftImpl};
 use raft_proto::{EntryId, Server};
 use crate::keyvalue::keyvalue_proto::operation::Op;
 use crate::keyvalue::keyvalue_proto::SetOperation;
+use prost::Message;
 
 use crate::keyvalue::KeyValueService;
 use crate::raft::raft_proto::raft_client::RaftClient;

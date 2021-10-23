@@ -103,8 +103,8 @@ impl LogSlice {
             return ContainsResult::ABSENT;
         }
 
-        let &entry_id = &self.entries[idx as usize].id;
-        assert!(entry_id == query);
+        let &entry_id = &self.entries[idx as usize].id.expect("id");
+        assert!(&entry_id == query);
         return ContainsResult::PRESENT;
     }
 
@@ -122,7 +122,7 @@ impl LogSlice {
 
         for entry in entries {
             let size_bytes = entry.payload.len() as i64;
-            let index = entry.get_id().get_index();
+            let index = entry.id.expect("id").index;
             if index == self.next_index() {
                 self.entries.push(entry.clone());
                 self.size_bytes += size_bytes;
@@ -135,8 +135,8 @@ impl LogSlice {
         }
 
         // Remove anything that comes after the end of the provided entries.
-        let last = entries.last().unwrap().get_id();
-        let local_index = self.local_index(last.get_index());
+        let last = entries.last().unwrap().id.expect("id");
+        let local_index = self.local_index(last.index);
         for entry in self.entries.drain((local_index + 1)..) {
             self.size_bytes -= entry.payload.len() as i64;
         }
@@ -157,7 +157,7 @@ impl LogSlice {
         // the entry immediately following "self.previous_id".
         assert!(entry_id.index >= self.previous_id.index);
 
-        let local_start_idx = self.local_index(entry_id.get_index() + 1);
+        let local_start_idx = self.local_index(entry_id.index + 1);
         if local_start_idx >= self.entries.len() {
             return Vec::new();
         }
@@ -175,12 +175,12 @@ impl LogSlice {
     // Note that for the entry immediately before the start of this slice, the
     // entry id can be returned, but not the full entry.
     pub fn id_at(&self, index: i64) -> EntryId {
-        if index == self.previous_id.get_index() {
+        if index == self.previous_id.index {
             return self.previous_id.clone();
         }
         let local_idx = self.local_index(index);
         assert!(local_idx <= self.entries.len());
-        self.entries.get(local_idx).unwrap().get_id().clone()
+        self.entries.get(local_idx).unwrap().id.expect("id").clone()
     }
 
     // Returns the entry at the supplied index. Must only be called if the index
@@ -210,7 +210,7 @@ impl LogSlice {
     // log index. Must only be called if the index is known to be within range
     // of this slice.
     fn local_index(&self, index: i64) -> usize {
-        let previous = self.previous_id.get_index();
+        let previous = self.previous_id.index;
         let adjusted = index - previous - 1;
         assert!(
             adjusted >= 0,
@@ -224,14 +224,13 @@ impl LogSlice {
 }
 
 fn create_entry(term: i64, index: i64, payload: Vec<u8>) -> Entry {
-    let mut entry_id = EntryId::new();
-    entry_id.set_term(term);
-    entry_id.set_index(index);
-
-    let mut entry = Entry::new();
-    entry.set_id(entry_id);
-    entry.set_payload(payload);
-    entry
+    Entry {
+        id: Some(EntryId {
+            term,
+            index
+        }),
+        payload,
+    }
 }
 
 #[cfg(test)]
@@ -303,11 +302,11 @@ mod tests {
         let l = create_default_slice();
 
         let i = l.id_at(0);
-        assert_eq!(0, i.get_index());
+        assert_eq!(0, i.index);
         assert_eq!(71, i.get_term());
 
         let j = l.id_at(4);
-        assert_eq!(4, j.get_index());
+        assert_eq!(4, j.index);
         assert_eq!(73, j.get_term());
     }
 
@@ -408,7 +407,7 @@ mod tests {
         let mut l = create_default_slice();
         let id = l.append(74, "bad term".as_bytes().to_vec());
         assert_eq!(74, id.get_term());
-        assert_eq!(6, id.get_index());
+        assert_eq!(6, id.index);
     }
 
     #[test]
@@ -439,8 +438,8 @@ mod tests {
         let mut l = create_default_slice();
 
         // Validate the initial state.
-        assert_eq!(l.id_at(0).get_index(), 0);
-        assert_eq!(l.id_at(5).get_index(), 5);
+        assert_eq!(l.id_at(0).index, 0);
+        assert_eq!(l.id_at(5).index, 5);
         assert_eq!(l.next_index(), 6);
         let initial_size_bytes = 6;
         assert_eq!(l.size_bytes(), initial_size_bytes);
@@ -450,7 +449,7 @@ mod tests {
             entry(75, 3 /* index */, 10 /* size */),
             entry(75, 4 /* index */, 10 /* size */),
         ]);
-        assert_eq!(l.id_at(0).get_index(), 0);
+        assert_eq!(l.id_at(0).index, 0);
         assert_eq!(l.next_index(), 5);
         let size_bytes = initial_size_bytes - 3 + 20;
         assert_eq!(l.size_bytes(), size_bytes);

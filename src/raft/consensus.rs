@@ -15,15 +15,11 @@ use bytes::{Buf, Bytes};
 use futures::channel::oneshot::{channel, Receiver, Sender};
 use futures::executor;
 use futures::future::join_all;
-use grpc::{
-    ClientStubExt, GrpcFuture, ServerHandlerContext, ServerRequestSingle, ServerResponseUnarySink,
-};
 use log::{debug, error, info, warn};
-use protobuf::RepeatedField;
 use rand::Rng;
 use timer::Guard;
 use timer::Timer;
-use tonic::{IntoRequest, Request, Response, Status};
+use tonic::{Request, Response, Status};
 use tonic::transport::Channel;
 
 use diagnostics::ServerDiagnostics;
@@ -39,7 +35,6 @@ use crate::raft::diagnostics;
 use crate::raft_proto::raft_client::RaftClient;
 use crate::raft_proto::raft_server::Raft;
 use crate::raft_proto::raft_server::RaftServer;
-
 
 // Parameters used to configure the behavior of a cluster participant.
 pub struct Config {
@@ -202,7 +197,7 @@ impl RaftImpl {
     // Returns whether or not the election process is deemed complete. If complete,
     // there is no need to run any further elections.
     async fn run_election(arc_state: Arc<Mutex<RaftState>>, term: i64) -> bool {
-        let mut results = Vec::<GrpcFuture<VoteResponse>>::new();
+        let mut results = Vec::new();
         {
             let mut state = arc_state.lock().unwrap();
 
@@ -220,15 +215,13 @@ impl RaftImpl {
 
             // Request votes from all peer.
             let me = state.address.clone();
-            let request = state.create_vote_request();
+            let vote_request = state.create_vote_request();
             for server in state.get_others() {
-                let client = state.get_client(&server);
+                let mut client = state.get_client(&server);
                 debug!("[{:?}] Making vote rpc to [{:?}]", &me, &server);
-                results.push(
-                    client
-                        .vote(grpc::RequestOptions::new(), request.clone())
-                        .drop_metadata(),
-                );
+                let mut request = Request::new(vote_request.clone());
+                request.set_timeout(Duration::from_millis(100));
+                results.push(Box::pin(client.vote(request)));
             }
         }
 
@@ -247,17 +240,18 @@ impl RaftImpl {
             let mut votes = 1; // Here we count our own vote for ourselves.
             for response in &results {
                 match response {
-                    Ok(message) => {
-                        if message.get_term() > term {
-                            info!("[{:?}] Detected higher term {}", &me, message.get_term());
+                    Ok(result) => {
+                        let message = result.into_inner();
+                        if message.term > term {
+                            info!("[{:?}] Detected higher term {}", &me, message.term);
                             RaftImpl::become_follower(
                                 &mut state,
                                 arc_state.clone(),
-                                message.get_term(),
+                                message.term,
                             );
                             return true;
                         }
-                        if message.get_granted() {
+                        if message.granted {
                             votes = votes + 1;
                         }
                     }
@@ -330,9 +324,8 @@ impl RaftImpl {
                     .unwrap();
                 if state.log.is_index_compacted(position.next_index) {
                     let request = state.create_snapshot_request();
-                    let client = state.get_client(&follower);
                     let fut = RaftImpl::replicate_snapshot(
-                        client,
+                        state.get_client(&follower),
                         arc_state.clone(),
                         follower.clone(),
                         request.clone(),
@@ -340,9 +333,8 @@ impl RaftImpl {
                     results.push(Box::pin(fut));
                 } else {
                     let request = state.create_append_request(position.next_index);
-                    let client = state.get_client(&follower);
                     let fut = RaftImpl::replicate_append(
-                        client,
+                        state.get_client(&follower),
                         arc_state.clone(),
                         follower.clone(),
                         request.clone(),
@@ -373,21 +365,20 @@ impl RaftImpl {
     // Send a request to the follower (baked into "client") to send the supplied request
     // to install a snapshot.
     async fn replicate_snapshot(
-        client: Arc<RaftClient<Channel>>,
+        mut client: RaftClient<Channel>,
         arc_state: Arc<Mutex<RaftState>>,
         follower: Server,
-        request: InstallSnapshotRequest,
+        install_request: InstallSnapshotRequest,
     ) {
-        // TODO(dino): Add timeouts to these rpcs
-        let result = client
-            .install_snapshot(grpc::RequestOptions::new(), request.clone())
-            .drop_metadata()
-            .await;
+        let mut request = Request::new(install_request.clone());
+        request.set_timeout(Duration::from_millis(100));
+        let result = client.install_snapshot(request).await;
 
         let mut state = arc_state.lock().unwrap();
         match result {
-            Ok(response) => {
-                let other_term = response.get_term();
+            Ok(result) => {
+                let response = result.into_inner();
+                let other_term = response.term;
                 if other_term > state.term {
                     info!(
                         "[{:?}] Detected higher term {} from peer {:?}",
@@ -396,7 +387,7 @@ impl RaftImpl {
                     RaftImpl::become_follower(&mut state, arc_state.clone(), other_term);
                     return;
                 }
-                state.record_follower_matches(&follower, request.get_last().get_index());
+                state.record_follower_matches(&follower, install_request.last.expect("last").index);
             }
             Err(message) => info!(
                 "[{:?}] InstallSnapshot request failed, error: {}",
@@ -408,19 +399,17 @@ impl RaftImpl {
     // Send a request to the follower (baked into "client") to send the supplied request
     // to append entries we have but the follower might not.
     async fn replicate_append(
-        client: Arc<RaftClient<Channel>>,
+        mut client: RaftClient<Channel>,
         arc_state: Arc<Mutex<RaftState>>,
         follower: Server,
-        request: AppendRequest,
+        append_request: AppendRequest,
     ) {
-        // TODO(dino): Add timeouts to these rpcs.
-        let result = client
-            .append(grpc::RequestOptions::new(), request.clone())
-            .drop_metadata()
-            .await;
+        let mut request = Request::new(append_request.clone());
+        request.set_timeout(Duration::from_millis(100));
+        let result = client.append(request).await;
 
         let mut state = arc_state.lock().unwrap();
-        if state.term > request.get_term() {
+        if state.term > append_request.term {
             info!("[{:?}] Detected higher term {}", state.address, state.term);
             return;
         }
@@ -435,7 +424,8 @@ impl RaftImpl {
                 &state.address, message
             ),
             Ok(response) => {
-                let other_term = response.get_term();
+                let message = response.into_inner();
+                let other_term = message.term;
                 if other_term > state.term {
                     info!(
                         "[{:?}] Detected higher term {} from peer {:?}",
@@ -444,7 +434,7 @@ impl RaftImpl {
                     RaftImpl::become_follower(&mut state, arc_state.clone(), other_term);
                     return;
                 }
-                state.handle_append_response(&follower, &response, &request);
+                state.handle_append_response(&follower, &message, &append_request);
             }
         }
     }
@@ -539,12 +529,19 @@ struct RaftState {
 
 impl RaftState {
     // Returns an rpc client which can be used to contact the supplied peer.
-    fn get_client(&mut self, address: &Server) -> Arc<RaftClient<Channel>> {
-        let key = address_key(address);
-        self.clients
-            .entry(key)
-            .or_insert_with(|| Arc::new(make_raft_client(&address)))
-            .clone()
+    fn get_client(&mut self, address: &Server) -> RaftClient<Channel> {
+        // TODO(dino): According to the Channel docs, it seems like the right thing is to
+        // store an instance of Channel, and keep cloning it (which is cheap) and creating
+        // new client objects.
+        //
+        // Either way, we end up with a single-use client instance every time.
+        make_raft_client(&address)
+
+        // let key = address_key(address);
+        // self.clients
+        //     .entry(key)
+        //     .or_insert_with(|| make_raft_client(&address))
+        //     .clone()
     }
 
     // Returns the peers in the cluster (ourself excluded).
@@ -581,29 +578,33 @@ impl RaftState {
         assert!(!self.log.is_index_compacted(next_index));
         let previous = self.log.id_at(next_index - 1);
 
-        let mut request = AppendRequest::new();
-        request.set_term(self.term);
-        request.set_leader(self.address.clone());
-        request.set_previous(previous.clone());
-        request.set_entries(RepeatedField::from(self.log.get_entries_after(&previous)));
-        request.set_committed(self.committed);
-        request
+        AppendRequest {
+            term: self.term,
+            leader: Some(self.address.clone()),
+            previous: Some(previous.clone()),
+            entries: self.log.get_entries_after(&previous),
+            committed: self.committed,
+        }
     }
 
     // Returns a request which the leader can send to a follower in order to install the
     // same snapshot currently held on the leader.
     fn create_snapshot_request(&self) -> InstallSnapshotRequest {
-        let mut request = InstallSnapshotRequest::new();
-        request.set_term(self.term);
-        request.set_leader(self.address.clone());
+        let mut snapshot: Vec<u8> = vec![];
+        let mut last: Option<EntryId> = None;
         match &self.snapshot {
             None => (),
             Some(snap) => {
-                request.set_snapshot(snap.snapshot.to_vec());
-                request.set_last(snap.last.clone());
+                snapshot = snap.snapshot.to_vec();
+                last = Some(snap.last.clone());
             }
         }
-        request
+        InstallSnapshotRequest {
+            term: self.term,
+            leader: Some(self.address.clone()),
+            snapshot,
+            last,
+        }
     }
 
     // Incorporates the provided response corresponding to the supplied request.
@@ -624,7 +625,7 @@ impl RaftState {
         }
 
         let f = follower.unwrap();
-        if !response.get_success() {
+        if !response.success {
             // The follower has rejected our entries, presumably because they could
             // not find the entry we sent as "previous". We repeatedly reduce the
             // "next" index until we hit a "previous" entry present on the follower.
@@ -637,8 +638,8 @@ impl RaftState {
         }
 
         // The follower has appended our entries, record the updated follower state.
-        match request.get_entries().last() {
-            Some(e) => self.record_follower_matches(&peer, e.get_id().get_index()),
+        match request.entries.last() {
+            Some(e) => self.record_follower_matches(&peer, e.id.expect("id").index),
             None => (),
         }
     }
@@ -693,8 +694,8 @@ impl RaftState {
     fn add_listener(&mut self, index: i64) -> Receiver<EntryId> {
         let (sender, receiver) = channel::<EntryId>();
         self.listeners.insert(CommitListener {
-            index: index,
-            sender: sender,
+            index,
+            sender,
             uid: self.listener_uid,
         });
         self.listener_uid = self.listener_uid + 1;
@@ -724,13 +725,13 @@ impl RaftState {
         while self.applied < self.committed {
             self.applied = self.applied + 1;
             let entry = self.log.entry_at(self.applied);
-            let entry_id = entry.get_id().clone();
+            let entry_id = entry.id.expect("id").clone();
 
             let result = self
                 .state_machine
                 .lock()
                 .unwrap()
-                .apply(&entry.get_payload().to_bytes());
+                .apply(&entry.payload.to_bytes());
             match result {
                 Ok(()) => {
                     info!(
@@ -754,11 +755,11 @@ impl RaftState {
     // Returns a request which a candidate can send in order to request the vote
     // of peer servers in an election.
     fn create_vote_request(&self) -> VoteRequest {
-        let mut request = VoteRequest::new();
-        request.set_term(self.term);
-        request.set_candidate(self.address.clone());
-        request.set_last(self.log.last_known_id().clone());
-        request
+        VoteRequest {
+            term: self.term,
+            candidate: Some(self.address.clone()),
+            last: Some(self.log.last_known_id().clone()),
+        }
     }
 
     // Compacts logs entries into a new snapshot if necessary.
@@ -835,7 +836,6 @@ impl Raft for RaftImpl {
         Ok(Response::new(VoteResponse {
             term : state.term,
             granted,
-
         }))
     }
 
@@ -1005,7 +1005,7 @@ impl Raft for RaftImpl {
         let mut state = self.state.lock().unwrap();
         if request.term >= state.term && !request.snapshot.is_empty() {
             // Update the state machine.
-            let snapshot = Bytes::from(&request.snapshot);
+            let snapshot = Bytes::from(request.snapshot);
             match state.state_machine.lock().unwrap().load_snapshot(&snapshot) {
                 Ok(_) => (),
                 Err(message) => error!(
@@ -1040,7 +1040,7 @@ impl Raft for RaftImpl {
             state.committed = request.last.expect("last").index;
             state.snapshot = Some(LogSnapshot {
                 last: request.last.expect("last").clone(),
-                snapshot: request.snapshot.to_bytes(),
+                snapshot: Bytes::from(request.snapshot.clone()),
             });
         }
         Ok(Response::new(InstallSnapshotResponse{
@@ -1057,16 +1057,17 @@ fn add_jitter(lower: i64) -> i64 {
 }
 
 fn address_key(address: &Server) -> String {
-    format!("{}:{}", address.get_host(), address.get_port())
+    format!("{}:{}", address.host, address.port)
 }
 
 fn entry_id_key(entry_id: &EntryId) -> String {
     format!("(term={},id={})", entry_id.term, entry_id.index)
 }
 
-fn make_raft_client(address: &Server) -> Arc<RaftClient<Channel>> {
-    let addr = format!("http://[::1]:{}", address.get_port());
-    Arc::new(executor::block_on(RaftClient::connect(addr)).expect("Failed to create client"))
+fn make_raft_client(address: &Server) -> RaftClient<Channel> {
+    let addr = format!("http://[::1]:{}", address.port);
+    // TODO(dino): make this async, store and reuse the channels, etc
+    executor::block_on(RaftClient::connect(addr)).expect("Failed to create client")
 }
 
 #[cfg(test)]

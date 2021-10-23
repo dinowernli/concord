@@ -3,18 +3,17 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::executor;
-use grpc::{GrpcStatus, ServerHandlerContext, ServerRequestSingle, ServerResponseUnarySink};
 use log::{debug, info, warn};
 use tonic::{Request, Response, Status};
 
 use crate::keyvalue::{keyvalue_proto, MapStore, Store};
-use crate::keyvalue::keyvalue_proto::{
-    Entry, GetRequest, GetResponse, Operation, PutRequest, PutResponse,
-};
+use crate::keyvalue::keyvalue_proto::{Entry, GetRequest, GetResponse, Operation, PutRequest, PutResponse, SetOperation};
 use crate::keyvalue_proto::key_value_server::KeyValue;
 use crate::keyvalue_proto::key_value_server::KeyValueServer;
 use crate::raft::{Client, new_client, StateMachine};
 use crate::raft::raft_proto::Server;
+use prost::Message;
+use crate::keyvalue::keyvalue_proto::operation::Op;
 
 // This allows us to combine two non-auto traits into one.
 trait StoreStateMachine: Store + StateMachine {}
@@ -45,16 +44,14 @@ impl KeyValueService {
     }
 
     fn make_set_operation(key: &[u8], value: &[u8]) -> Operation {
-        let mut entry = keyvalue_proto::Entry::new();
-        entry.set_key(key.to_vec());
-        entry.set_value(value.to_vec());
-
-        let mut op = keyvalue_proto::SetOperation::new();
-        op.set_entry(entry);
-
-        let mut result = Operation::new();
-        result.set_set(op);
-        result
+        Operation {
+            op: Some(Op::Set(SetOperation{
+                entry: Some(keyvalue_proto::Entry {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                })
+            }))
+        }
     }
 }
 
@@ -66,16 +63,16 @@ impl KeyValue for KeyValueService {
         if request.key.is_empty() {
             return Err(Status::invalid_argument("Empty key"));
         }
-        let key = request.key.to_bytes();
+        let key = request.key.clone();
 
         let locked = self.store.lock().unwrap();
-        let version = if request.message.version <= 0 {
+        let version = if request.version <= 0 {
             locked.latest_version()
         } else {
-            request.message.version
+            request.version
         };
 
-        let lookup = locked.get_at(&key, version);
+        let lookup = locked.get_at(&Bytes::from(key), version);
         if lookup.is_err() {
             return Err(Status::out_of_range("Compacted"));
         }
@@ -85,8 +82,8 @@ impl KeyValue for KeyValueService {
             entry: match lookup.unwrap() {
                 None => None,
                 Some(value) => Some(Entry {
-                    key: key.clone().into(),
-                    value: value.clone().into(),
+                    key: key.clone(),
+                    value: value.to_vec(),
                 })
             }
         }))
@@ -106,9 +103,9 @@ impl KeyValue for KeyValueService {
         let serialized = op.encode_to_vec();
 
         let commit = self.raft.commit(&serialized).await;
+        let key_str = String::from_utf8_lossy(request.key.as_slice());
         match commit {
             Ok(id) => {
-                let key_str = String::from_utf8_lossy(request.key.expect("key"));
                 info!(
                     "Committed put operation with raft index {} for key {}",
                     id.index,
@@ -117,7 +114,6 @@ impl KeyValue for KeyValueService {
                 Ok(Response::new(PutResponse {} ))
             }
             Err(message) => {
-                let key_str = String::from_utf8_lossy(request.get_key());
                 warn!(
                     "Failed to commit put operation for key: {}, message: {}",
                     key_str, message

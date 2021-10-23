@@ -3,10 +3,9 @@ use std::time::Duration;
 
 use async_std::task;
 use async_trait::async_trait;
-use grpc::ClientStubExt;
-use grpc::Error;
 use log::debug;
 use tonic::transport::Channel;
+use prost::Message;
 
 use raft_proto::{CommitRequest, EntryId, Server, Status, StepDownRequest};
 
@@ -31,11 +30,11 @@ pub fn new_client(address: &Server, member: &Server) -> Box<dyn Client + Sync + 
 pub trait Client {
     // Adds the supplied payload as the next entry in the cluster's shared log.
     // Returns once the payload has been added (or the operation has failed).
-    async fn commit(&self, payload: &[u8]) -> Result<EntryId, Error>;
+    async fn commit(&self, payload: &[u8]) -> Result<EntryId, tonic::Status>;
 
     // Sends an rpc to the cluster leader to step down. Returns the address of
     // the leader which stepped down.
-    async fn preempt_leader(&self) -> Result<Server, Error>;
+    async fn preempt_leader(&self) -> Result<Server, tonic::Status>;
 }
 
 struct ClientImpl {
@@ -52,7 +51,7 @@ impl ClientImpl {
         *locked = leader.clone();
         debug!(
             "[{:?}] updated to new leader: [{:?}]",
-            &self.address, &leader
+            &self.address, leader
         );
     }
 
@@ -68,7 +67,7 @@ impl ClientImpl {
 impl Client for ClientImpl {
     // Adds the supplied payload as the next entry in the cluster's shared log.
     // Returns once the payload has been added (or the operation has failed).
-    async fn commit(&self, payload: &[u8]) -> Result<EntryId, Error> {
+    async fn commit(&self, payload: &[u8]) -> Result<EntryId, tonic::Status> {
         let request = CommitRequest {
             payload: payload.to_vec(),
         };
@@ -77,7 +76,7 @@ impl Client for ClientImpl {
             let result = self
                 .new_leader_client()
                 .await
-                .commit(&request)
+                .commit(request.clone())
                 .await?
                 .into_inner();
 
@@ -86,7 +85,7 @@ impl Client for ClientImpl {
                 Some(Status::NotLeader) => {
                     result.leader.into_iter().for_each(|l| self.update_leader(&l));
                 }
-                other => panic!("Unknown enum value {}", other)
+                _ => panic!("Unknown enum value {}", result.status)
             }
             task::sleep(Duration::from_secs(1)).await;
         }
@@ -94,7 +93,7 @@ impl Client for ClientImpl {
 
     // Sends an rpc to the cluster leader to step down. Returns the address of
     // the leader which stepped down.
-    async fn preempt_leader(&self) -> Result<Server, Error> {
+    async fn preempt_leader(&self) -> Result<Server, tonic::Status> {
         loop {
             let result = self
                 .new_leader_client()
