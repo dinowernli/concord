@@ -83,7 +83,7 @@ impl MapStore {
                     return Err(StoreError::new("No entry present in 'set' operation"));
                 }
                 let entry = set.entry.unwrap();
-                self.set(entry.key.to_bytes(), entry.value.to_bytes());
+                self.set(Bytes::from(entry.key), Bytes::from(entry.value));
                 Ok(())
             }
             _ => Err(StoreError::new("Unrecognized operation type"))

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_std::task;
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use futures::channel::oneshot::{channel, Receiver, Sender};
 use futures::executor;
 use futures::future::join_all;
@@ -735,7 +735,7 @@ impl RaftState {
                 .state_machine
                 .lock()
                 .unwrap()
-                .apply(&entry.payload.to_bytes());
+                .apply(&Bytes::from(entry.payload));
             match result {
                 Ok(()) => {
                     info!(
