@@ -5,10 +5,9 @@
 use std::time::Duration;
 
 use async_std::task;
-use bytes::Bytes;
 use env_logger::Env;
 use futures::executor;
-use futures::future::join3;
+use futures::future::{join4};
 use log::info;
 
 use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
@@ -20,9 +19,9 @@ use raft_proto::{EntryId, Server};
 use crate::keyvalue::keyvalue_proto::operation::Op;
 use crate::keyvalue::keyvalue_proto::SetOperation;
 use prost::Message;
+use futures::future::join_all;
 
 use crate::keyvalue::KeyValueService;
-use crate::raft::raft_proto::raft_client::RaftClient;
 use crate::raft_proto::raft_server::RaftServer;
 
 mod keyvalue;
@@ -44,13 +43,13 @@ fn entry_id_key(entry_id: &EntryId) -> String {
 }
 
 fn server(host: &str, port: i32) -> Server {
-    let mut result = Server::new();
-    result.set_host(host.to_string());
-    result.set_port(port);
-    return result;
+    Server {
+        host: host.into(),
+        port
+    }
 }
 
-fn start_node(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagnostics) -> grpc::Server {
+async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagnostics) {
     // A service used to serve the keyvalue store, backed by the
     // underlying Raft cluster.
     let keyvalue = KeyValueService::new(&address);
@@ -67,15 +66,11 @@ fn start_node(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagnostics
     );
     raft.start();
 
-    // TODO use real address
-    let addr = "[::1]:50051".parse()?;
-    executor::block_on(
-        Server::builder()
-            .add_service(RaftServer::new(raft))
-            .add_service(KeyValueServer::new(keyvalue))
-            .serve(addr),
-    );
-    panic!("asdf");
+    tonic::transport::Server::builder()
+        .add_service(RaftServer::new(raft))
+        .add_service(KeyValueServer::new(keyvalue))
+        .serve(format!("{}:{}", address.host, address.port).parse().unwrap())
+        .await;
 }
 
 // Starts a loop which provides a steady amount of commit traffic.
@@ -131,8 +126,6 @@ async fn run_validate_loop(diag: &mut Diagnostics) {
 fn main() {
     env_logger::from_env(Env::default().default_filter_or("concord=info")).init();
 
-    //let mut client = RaftClient::connect("http://[::1]:50051").await?;
-
     let addresses = vec![
         server("::1", 12345),
         server("::1", 12346),
@@ -141,14 +134,19 @@ fn main() {
     info!("Starting {} servers", addresses.len());
 
     let mut diag = Diagnostics::new();
-    let mut servers = Vec::<grpc::Server>::new();
+    let mut servers = Vec::new();
     for address in &addresses {
-        servers.push(start_node(&address, &addresses, &mut diag));
+        let running = run_server(&address, &addresses, &mut diag);
+        servers.push(running);
     }
 
-    executor::block_on(join3(
+    let serving = join_all(servers);
+    let all = join4(
+        serving,
         run_commit_loop(&addresses),
         run_preempt_loop(&addresses),
-        run_validate_loop(&mut diag),
-    ));
+        run_validate_loop(&mut diag));
+
+    // TODO: async main
+    executor::block_on(all);
 }

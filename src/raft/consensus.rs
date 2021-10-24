@@ -213,7 +213,6 @@ impl RaftImpl {
             state.voted_for = Some(state.address.clone());
 
             // Request votes from all peer.
-            let me = state.address.clone();
             let vote_request = state.create_vote_request();
             for server in state.get_others() {
                 let client = state.get_client(&server);
@@ -982,7 +981,7 @@ impl Raft for RaftImpl {
         Ok(Response::new(result))
     }
 
-    async fn step_down(&self, request: Request<StepDownRequest>) -> Result<Response<StepDownResponse>, Status> {
+    async fn step_down(&self, _: Request<StepDownRequest>) -> Result<Response<StepDownResponse>, Status> {
         debug!("[{:?}] Handling step down request", self.address);
 
         let mut state = self.state.lock().unwrap();
