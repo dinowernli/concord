@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use async_std::sync::Mutex;
 use std::time::Duration;
 
 use async_std::task;
@@ -44,8 +44,8 @@ struct ClientImpl {
 
 impl ClientImpl {
     // Encapsulates updating the leader in a thread-safe way.
-    fn update_leader(&self, leader: &Server) {
-        let mut locked = self.leader.lock().unwrap();
+    async fn update_leader(&self, leader: &Server) {
+        let mut locked = self.leader.lock().await;
         *locked = leader.clone();
         debug!(
             "[{:?}] updated to new leader: [{:?}]",
@@ -56,7 +56,7 @@ impl ClientImpl {
     // Returns a client with an open connection to the server currently
     // believed to be the leader of the cluster.
     async fn new_leader_client(&self) -> RaftClient<Channel> {
-        let address = self.leader.lock().unwrap().clone();
+        let address = self.leader.lock().await.clone();
         RaftClient::connect(format!("http://[::1]:{}", address.port))
             .await
             .expect("connect")
@@ -83,10 +83,9 @@ impl Client for ClientImpl {
             match Status::from_i32(result.status) {
                 Some(Status::Success) => return Ok(result.entry_id.expect("entryid").clone()),
                 Some(Status::NotLeader) => {
-                    result
-                        .leader
-                        .into_iter()
-                        .for_each(|l| self.update_leader(&l));
+                    if result.leader.is_some() {
+                        self.update_leader(&result.leader.unwrap()).await;
+                    }
                 }
                 _ => panic!("Unknown enum value {}", result.status),
             }
@@ -108,10 +107,9 @@ impl Client for ClientImpl {
             match Status::from_i32(result.status) {
                 Some(Status::Success) => return Ok(result.leader.expect("leader").clone()),
                 Some(Status::NotLeader) => {
-                    result
-                        .leader
-                        .into_iter()
-                        .for_each(|l| self.update_leader(&l));
+                    if result.leader.is_some() {
+                        self.update_leader(&result.leader.unwrap()).await;
+                    }
                 }
                 _ => panic!("Unknown enum value {}", result.status),
             }
