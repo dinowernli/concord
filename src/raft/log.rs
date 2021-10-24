@@ -68,7 +68,7 @@ impl LogSlice {
     // in this instance). Returns -1 if there are no known entries at all.
     pub fn last_known_id(&self) -> &EntryId {
         match self.entries.last() {
-            Some(entry) => &entry.id.expect("id"),
+            Some(entry) => &entry.id.as_ref().expect("id"),
             None => &self.previous_id,
         }
     }
@@ -82,7 +82,7 @@ impl LogSlice {
     // as the slice of the log tracked by this instance.
     pub fn is_up_to_date(&self, other_last: &EntryId) -> bool {
         let this_last = match self.entries.last() {
-            Some(entry) => &entry.id.expect("id"),
+            Some(entry) => &entry.id.as_ref().expect("id"),
             None => &self.previous_id,
         };
 
@@ -106,8 +106,8 @@ impl LogSlice {
             return ContainsResult::ABSENT;
         }
 
-        let &entry_id = &self.entries[idx as usize].id.expect("id");
-        assert!(&entry_id == query);
+        let &entry_id = &self.entries[idx as usize].id.as_ref().expect("id");
+        assert!(entry_id == query);
         return ContainsResult::PRESENT;
     }
 
@@ -125,7 +125,7 @@ impl LogSlice {
 
         for entry in entries {
             let size_bytes = entry.payload.len() as i64;
-            let index = entry.id.expect("id").index;
+            let index = entry.id.as_ref().expect("id").index;
             if index == self.next_index() {
                 self.entries.push(entry.clone());
                 self.size_bytes += size_bytes;
@@ -138,7 +138,7 @@ impl LogSlice {
         }
 
         // Remove anything that comes after the end of the provided entries.
-        let last = entries.last().unwrap().id.expect("id");
+        let last = entries.last().unwrap().id.as_ref().expect("id");
         let local_index = self.local_index(last.index);
         for entry in self.entries.drain((local_index + 1)..) {
             self.size_bytes -= entry.payload.len() as i64;
@@ -183,7 +183,13 @@ impl LogSlice {
         }
         let local_idx = self.local_index(index);
         assert!(local_idx <= self.entries.len());
-        self.entries.get(local_idx).unwrap().id.expect("id").clone()
+        self.entries
+            .get(local_idx)
+            .unwrap()
+            .id
+            .as_ref()
+            .expect("id")
+            .clone()
     }
 
     // Returns the entry at the supplied index. Must only be called if the index

@@ -638,7 +638,7 @@ impl RaftState {
 
         // The follower has appended our entries, record the updated follower state.
         match request.entries.last() {
-            Some(e) => self.record_follower_matches(&peer, e.id.expect("id").index),
+            Some(e) => self.record_follower_matches(&peer, e.id.as_ref().expect("id").index),
             None => (),
         }
     }
@@ -813,7 +813,7 @@ impl Raft for RaftImpl {
 
         let candidate = request.candidate;
 
-        let mut granted;
+        let granted;
         if state.voted_for.is_none() || &candidate == &state.voted_for {
             if state.log.is_up_to_date(&request.last.expect("last")) {
                 state.voted_for = candidate.clone();
@@ -1016,7 +1016,7 @@ impl Raft for RaftImpl {
         let mut state = self.state.lock().unwrap();
         if request.term >= state.term && !request.snapshot.is_empty() {
             // Update the state machine.
-            let snapshot = Bytes::from(request.snapshot);
+            let snapshot = Bytes::from(request.snapshot.to_vec());
             match state.state_machine.lock().unwrap().load_snapshot(&snapshot) {
                 Ok(_) => (),
                 Err(message) => error!(
@@ -1026,32 +1026,32 @@ impl Raft for RaftImpl {
             }
 
             // Update the log.
-            let contains = state.log.contains(&request.last.expect("last"));
+            let last = request.last.expect("last");
+            let contains = state.log.contains(&last);
             match contains {
                 ContainsResult::ABSENT => {
                     // Common case, snapshot from the future. Just clear the log.
-                    state.log = LogSlice::new(request.last.expect("last").clone());
+                    state.log = LogSlice::new(last.clone());
                 }
                 ContainsResult::PRESENT => {
                     // Entries that came after the latest snapshot entry might still be valid.
-                    state.log.prune_until(&request.last.expect("last"));
+                    state.log.prune_until(&last);
                 }
                 ContainsResult::COMPACTED => {
                     // Something went very wrong...
                     warn!(
                         "[{:?}] Got snapshot for already compacted index {}",
-                        state.address,
-                        request.last.expect("last").index,
+                        state.address, last.index,
                     );
                 }
             }
 
             // Update volatile state.
-            state.applied = request.last.expect("last").index;
-            state.committed = request.last.expect("last").index;
+            state.applied = last.index;
+            state.committed = last.index;
             state.snapshot = Some(LogSnapshot {
-                last: request.last.expect("last").clone(),
-                snapshot: Bytes::from(request.snapshot.clone()),
+                last: last.clone(),
+                snapshot: Bytes::from(request.snapshot.to_vec()),
             });
         }
         Ok(Response::new(InstallSnapshotResponse { term: state.term }))

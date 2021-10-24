@@ -62,7 +62,7 @@ impl KeyValue for KeyValueService {
         if request.key.is_empty() {
             return Err(Status::invalid_argument("Empty key"));
         }
-        let key = request.key.clone();
+        let key = request.key.to_vec();
 
         let locked = self.store.lock().unwrap();
         let version = if request.version <= 0 {
@@ -71,7 +71,7 @@ impl KeyValue for KeyValueService {
             request.version
         };
 
-        let lookup = locked.get_at(&Bytes::from(key), version);
+        let lookup = locked.get_at(&Bytes::from(key.to_vec()), version);
         if lookup.is_err() {
             return Err(Status::out_of_range("Compacted"));
         }
@@ -81,7 +81,7 @@ impl KeyValue for KeyValueService {
             entry: match lookup.unwrap() {
                 None => None,
                 Some(value) => Some(Entry {
-                    key: key.clone(),
+                    key: key.to_vec(),
                     value: value.to_vec(),
                 }),
             },
