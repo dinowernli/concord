@@ -13,7 +13,6 @@ use std::time::Duration;
 use async_std::task;
 use bytes::Bytes;
 use futures::channel::oneshot::{channel, Receiver, Sender};
-use futures::executor;
 use futures::future::join_all;
 use log::{debug, error, info, warn};
 use rand::Rng;
@@ -209,8 +208,9 @@ impl RaftImpl {
 
             // Request votes from all peer.
             let vote_request = state.create_vote_request();
-            for server in state.get_others() {
-                let client = state.get_client(&server);
+            let others = state.get_others();
+            for server in others {
+                let client = state.get_client(&server).await;
 
                 // TODO(dino): Turn into an async function/method
                 let closure = async move |req: VoteRequest| {
@@ -308,7 +308,8 @@ impl RaftImpl {
         {
             let mut state = arc_state.lock().await;
             debug!("[{:?}] Replicating entries", &state.address);
-            for follower in state.get_others() {
+            let others = state.get_others();
+            for follower in others {
                 // Figure out which entry the follower is expecting next and decide whether to
                 // send an append request (if we have the entries) or to fast-forward the follower
                 // by installing a snapshot (if that entry has been compacted away in our log).
@@ -319,7 +320,7 @@ impl RaftImpl {
                 if state.log.is_index_compacted(position.next_index) {
                     let request = state.create_snapshot_request();
                     let fut = RaftImpl::replicate_snapshot(
-                        state.get_client(&follower),
+                        state.get_client(&follower).await,
                         arc_state.clone(),
                         follower.clone(),
                         request.clone(),
@@ -328,7 +329,7 @@ impl RaftImpl {
                 } else {
                     let request = state.create_append_request(position.next_index);
                     let fut = RaftImpl::replicate_append(
-                        state.get_client(&follower),
+                        state.get_client(&follower).await,
                         arc_state.clone(),
                         follower.clone(),
                         request.clone(),
@@ -523,13 +524,13 @@ struct RaftState {
 
 impl RaftState {
     // Returns an rpc client which can be used to contact the supplied peer.
-    fn get_client(&mut self, address: &Server) -> RaftClient<Channel> {
+    async fn get_client(&mut self, address: &Server) -> RaftClient<Channel> {
         // TODO(dino): According to the Channel docs, it seems like the right thing is to
         // store an instance of Channel, and keep cloning it (which is cheap) and creating
         // new client objects.
         //
         // Either way, we end up with a single-use client instance every time.
-        make_raft_client(&address)
+        make_raft_client(&address).await
 
         // let key = address_key(address);
         // self.clients
@@ -1068,10 +1069,12 @@ fn entry_id_key(entry_id: &EntryId) -> String {
     format!("(term={},id={})", entry_id.term, entry_id.index)
 }
 
-fn make_raft_client(address: &Server) -> RaftClient<Channel> {
+async fn make_raft_client(address: &Server) -> RaftClient<Channel> {
     let addr = format!("http://[::1]:{}", address.port);
     // TODO(dino): make this async, store and reuse the channels, etc
-    executor::block_on(RaftClient::connect(addr)).expect("Failed to create client")
+    RaftClient::connect(addr)
+        .await
+        .expect("Failed to create client")
 }
 
 #[cfg(test)]

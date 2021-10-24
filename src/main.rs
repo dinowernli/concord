@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use async_std::task;
 use env_logger::Env;
-use futures::executor;
 use futures::future::join4;
 use log::info;
 
