@@ -134,7 +134,7 @@ impl RaftImpl {
         info!("[{:?}] Starting", state.address);
         RaftImpl::become_follower(&mut state, arc_state.clone(), term);
 
-        task::spawn(async move {
+        tokio::spawn(async move {
             RaftImpl::compaction_loop(arc_state.clone()).await;
         });
     }
@@ -153,7 +153,7 @@ impl RaftImpl {
             move || {
                 let arc_state = arc_state.clone();
                 let me = me.clone();
-                task::spawn(async move {
+                tokio::spawn(async move {
                     info!("[{:?}] Follower timeout in term {}", me, term);
                     RaftImpl::election_loop(arc_state.clone(), term + 1).await;
                 });
@@ -262,7 +262,7 @@ impl RaftImpl {
                 state.role = RaftRole::Leader;
                 state.followers = state.create_follower_positions();
                 state.timer_guard = None;
-                task::spawn(async move {
+                tokio::spawn(async move {
                     RaftImpl::replicate_loop(arc_state_copy.clone(), term).await;
                 });
                 true
@@ -880,7 +880,7 @@ impl Raft for RaftImpl {
             move || {
                 let arc_state = arc_state.clone();
                 let me = me.clone();
-                task::spawn(async move {
+                tokio::spawn(async move {
                     info!("[{:?}] Timed out waiting for leader heartbeat", &me);
                     RaftImpl::election_loop(arc_state.clone(), term + 1).await;
                 });
