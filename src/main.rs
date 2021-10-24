@@ -2,6 +2,7 @@
 #![feature(map_first_last)]
 #![feature(trait_upcasting)]
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_std::task;
@@ -49,13 +50,13 @@ fn server(host: &str, port: i32) -> Server {
     }
 }
 
-async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagnostics) {
+async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<Diagnostics>>) {
     // A service used to serve the keyvalue store, backed by the
     // underlying Raft cluster.
     let keyvalue = KeyValueService::new(&address);
 
     // A service used by the Raft cluster.
-    let server_diagnostics = diagnostics.get_server(&address);
+    let server_diagnostics = diagnostics.lock().unwrap().get_server(&address);
     let state_machine = keyvalue.raft_state_machine();
     let raft = RaftImpl::new(
         address,
@@ -66,7 +67,7 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagn
     );
     raft.start();
 
-    tonic::transport::Server::builder()
+    let serve = tonic::transport::Server::builder()
         .add_service(RaftServer::new(raft))
         .add_service(KeyValueServer::new(keyvalue))
         .serve(
@@ -75,6 +76,11 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagn
                 .unwrap(),
         )
         .await;
+
+    match serve {
+        Ok(()) => info!("Serving terminated successfully"),
+        Err(message) => info!("Serving terminated unsuccessfully: {}", message),
+    }
 }
 
 // Starts a loop which provides a steady amount of commit traffic.
@@ -120,9 +126,12 @@ async fn run_preempt_loop(cluster: &Vec<Server>) {
 // Starts a loop which periodically asks the diagnostics object to validate the
 // execution history of the cluster. If this fails, this indicates a bug in the
 // raft implementation.
-async fn run_validate_loop(diag: &mut Diagnostics) {
+async fn run_validate_loop(diag: Arc<Mutex<Diagnostics>>) {
     loop {
-        diag.validate().expect("Cluster execution validation");
+        diag.lock()
+            .unwrap()
+            .validate()
+            .expect("Cluster execution validation");
         task::sleep(Duration::from_secs(5)).await;
     }
 }
@@ -137,10 +146,10 @@ fn main() {
     ];
     info!("Starting {} servers", addresses.len());
 
-    let mut diag = Diagnostics::new();
+    let diag = Arc::new(Mutex::new(Diagnostics::new()));
     let mut servers = Vec::new();
     for address in &addresses {
-        let running = run_server(&address, &addresses, &mut diag);
+        let running = run_server(&address, &addresses, diag.clone());
         servers.push(running);
     }
 
@@ -149,7 +158,7 @@ fn main() {
         serving,
         run_commit_loop(&addresses),
         run_preempt_loop(&addresses),
-        run_validate_loop(&mut diag),
+        run_validate_loop(diag.clone()),
     );
 
     // TODO: async main
