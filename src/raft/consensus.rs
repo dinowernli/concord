@@ -19,8 +19,8 @@ use log::{debug, error, info, warn};
 use rand::Rng;
 use timer::Guard;
 use timer::Timer;
-use tonic::{Request, Response, Status};
 use tonic::transport::Channel;
+use tonic::{Request, Response, Status};
 
 use diagnostics::ServerDiagnostics;
 use raft::log::{ContainsResult, LogSlice};
@@ -247,11 +247,7 @@ impl RaftImpl {
                         let message = result.into_inner();
                         if message.term > term {
                             info!("[{:?}] Detected higher term {}", &me, message.term);
-                            RaftImpl::become_follower(
-                                &mut state,
-                                arc_state.clone(),
-                                message.term,
-                            );
+                            RaftImpl::become_follower(&mut state, arc_state.clone(), message.term);
                             return true;
                         }
                         if message.granted {
@@ -837,12 +833,15 @@ impl Raft for RaftImpl {
         }
 
         Ok(Response::new(VoteResponse {
-            term : state.term,
+            term: state.term,
             granted,
         }))
     }
 
-    async fn append(&self, request: Request<AppendRequest>) -> Result<Response<AppendResponse>, Status> {
+    async fn append(
+        &self,
+        request: Request<AppendRequest>,
+    ) -> Result<Response<AppendResponse>, Status> {
         let request = request.into_inner();
         debug!(
             "[{:?}] Handling append request: [{:?}]",
@@ -854,7 +853,7 @@ impl Raft for RaftImpl {
         // Handle the case where we are ahead of the leader. We inform the
         // leader of our (greater) term and fail the append.
         if state.term > request.term {
-            return Ok(Response::new(AppendResponse{
+            return Ok(Response::new(AppendResponse {
                 term: state.term,
                 success: false,
             }));
@@ -926,7 +925,10 @@ impl Raft for RaftImpl {
         }))
     }
 
-    async fn commit(&self, request: Request<CommitRequest>) -> Result<Response<CommitResponse>, Status> {
+    async fn commit(
+        &self,
+        request: Request<CommitRequest>,
+    ) -> Result<Response<CommitResponse>, Status> {
         let request = request.into_inner();
         debug!("[{:?}] Handling commit request", self.address);
 
@@ -957,7 +959,7 @@ impl Raft for RaftImpl {
 
             // Replaced below
             status: 0,
-            entry_id: None
+            entry_id: None,
         };
 
         match committed {
@@ -981,7 +983,10 @@ impl Raft for RaftImpl {
         Ok(Response::new(result))
     }
 
-    async fn step_down(&self, _: Request<StepDownRequest>) -> Result<Response<StepDownResponse>, Status> {
+    async fn step_down(
+        &self,
+        _: Request<StepDownRequest>,
+    ) -> Result<Response<StepDownResponse>, Status> {
         debug!("[{:?}] Handling step down request", self.address);
 
         let mut state = self.state.lock().unwrap();
@@ -995,13 +1000,16 @@ impl Raft for RaftImpl {
         let term = state.term;
         RaftImpl::become_follower(&mut state, self.state.clone(), term);
 
-        Ok(Response::new(StepDownResponse{
+        Ok(Response::new(StepDownResponse {
             status: raft_proto::Status::Success as i32,
             leader: Some(state.address.clone()),
         }))
     }
 
-    async fn install_snapshot(&self, request: Request<InstallSnapshotRequest>) -> Result<Response<InstallSnapshotResponse>, Status> {
+    async fn install_snapshot(
+        &self,
+        request: Request<InstallSnapshotRequest>,
+    ) -> Result<Response<InstallSnapshotResponse>, Status> {
         let request = request.into_inner();
         debug!("[{:?}] Handling install snapshot request", self.address);
 
@@ -1046,9 +1054,7 @@ impl Raft for RaftImpl {
                 snapshot: Bytes::from(request.snapshot.clone()),
             });
         }
-        Ok(Response::new(InstallSnapshotResponse{
-            term: state.term,
-        }))
+        Ok(Response::new(InstallSnapshotResponse { term: state.term }))
     }
 }
 

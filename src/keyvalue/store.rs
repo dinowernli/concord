@@ -7,12 +7,12 @@ use crate::raft::{StateMachine, StateMachineResult};
 
 use bytes::Bytes;
 use im::HashMap;
-use std::collections::VecDeque;
 use prost::Message;
+use std::collections::VecDeque;
 
 use self::bytes::Buf;
-use keyvalue_proto::{Entry, Operation, Snapshot};
 use crate::keyvalue::keyvalue_proto::operation::Op::Set;
+use keyvalue_proto::{Entry, Operation, Snapshot};
 
 #[derive(Debug, Clone)]
 pub struct StoreError {
@@ -86,7 +86,7 @@ impl MapStore {
                 self.set(Bytes::from(entry.key), Bytes::from(entry.value));
                 Ok(())
             }
-            _ => Err(StoreError::new("Unrecognized operation type"))
+            _ => Err(StoreError::new("Unrecognized operation type")),
         }
     }
 
@@ -178,7 +178,10 @@ impl StateMachine for MapStore {
     // Returns a serialized snapshot proto containing all entries present in
     // the latest version of the store.
     fn create_snapshot(&self) -> Bytes {
-        let mut snapshot = Snapshot{version: self.latest_version(), entries: vec![] };
+        let mut snapshot = Snapshot {
+            version: self.latest_version(),
+            entries: vec![],
+        };
         for (k, v) in self.latest_data() {
             snapshot.entries.push(Entry {
                 key: k.to_vec(),

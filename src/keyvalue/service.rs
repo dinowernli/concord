@@ -4,13 +4,15 @@ use bytes::Bytes;
 use log::{debug, info, warn};
 use tonic::{Request, Response, Status};
 
-use crate::keyvalue::{keyvalue_proto, MapStore, Store};
-use crate::keyvalue::keyvalue_proto::{Entry, GetRequest, GetResponse, Operation, PutRequest, PutResponse, SetOperation};
-use crate::keyvalue_proto::key_value_server::KeyValue;
-use crate::raft::{Client, new_client, StateMachine};
-use crate::raft::raft_proto::Server;
-use prost::Message;
 use crate::keyvalue::keyvalue_proto::operation::Op;
+use crate::keyvalue::keyvalue_proto::{
+    Entry, GetRequest, GetResponse, Operation, PutRequest, PutResponse, SetOperation,
+};
+use crate::keyvalue::{keyvalue_proto, MapStore, Store};
+use crate::keyvalue_proto::key_value_server::KeyValue;
+use crate::raft::raft_proto::Server;
+use crate::raft::{new_client, Client, StateMachine};
+use prost::Message;
 
 // This allows us to combine two non-auto traits into one.
 trait StoreStateMachine: Store + StateMachine {}
@@ -42,12 +44,12 @@ impl KeyValueService {
 
     fn make_set_operation(key: &[u8], value: &[u8]) -> Operation {
         Operation {
-            op: Some(Op::Set(SetOperation{
+            op: Some(Op::Set(SetOperation {
                 entry: Some(keyvalue_proto::Entry {
                     key: key.to_vec(),
                     value: value.to_vec(),
-                })
-            }))
+                }),
+            })),
         }
     }
 }
@@ -81,8 +83,8 @@ impl KeyValue for KeyValueService {
                 Some(value) => Some(Entry {
                     key: key.clone(),
                     value: value.to_vec(),
-                })
-            }
+                }),
+            },
         }))
     }
 
@@ -96,7 +98,8 @@ impl KeyValue for KeyValueService {
             return Err(Status::invalid_argument("Empty value"));
         }
 
-        let op = KeyValueService::make_set_operation(&request.key.to_vec(), &request.value.to_vec());
+        let op =
+            KeyValueService::make_set_operation(&request.key.to_vec(), &request.value.to_vec());
         let serialized = op.encode_to_vec();
 
         let commit = self.raft.commit(&serialized).await;
@@ -105,10 +108,9 @@ impl KeyValue for KeyValueService {
             Ok(id) => {
                 info!(
                     "Committed put operation with raft index {} for key {}",
-                    id.index,
-                    key_str
+                    id.index, key_str
                 );
-                Ok(Response::new(PutResponse {} ))
+                Ok(Response::new(PutResponse {}))
             }
             Err(message) => {
                 warn!(
@@ -123,13 +125,13 @@ impl KeyValue for KeyValueService {
 
 #[cfg(test)]
 mod tests {
+    use crate::keyvalue::keyvalue_proto::key_value_client::KeyValueClient;
     use grpc::{ClientStubExt, Error};
     use tonic::transport::Channel;
-    use crate::keyvalue::keyvalue_proto::key_value_client::KeyValueClient;
 
     use crate::keyvalue::keyvalue_proto_grpc::{KeyValueClient, KeyValueServer};
-    use crate::raft::raft_proto::EntryId;
     use crate::raft::raft_proto::raft_client::RaftClient;
+    use crate::raft::raft_proto::EntryId;
 
     use super::*;
 

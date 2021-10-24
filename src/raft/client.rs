@@ -57,7 +57,9 @@ impl ClientImpl {
     // believed to be the leader of the cluster.
     async fn new_leader_client(&self) -> RaftClient<Channel> {
         let address = self.leader.lock().unwrap().clone();
-        RaftClient::connect(format!("http://[::1]:{}", address.port)).await.expect("connect")
+        RaftClient::connect(format!("http://[::1]:{}", address.port))
+            .await
+            .expect("connect")
     }
 }
 
@@ -81,9 +83,12 @@ impl Client for ClientImpl {
             match Status::from_i32(result.status) {
                 Some(Status::Success) => return Ok(result.entry_id.expect("entryid").clone()),
                 Some(Status::NotLeader) => {
-                    result.leader.into_iter().for_each(|l| self.update_leader(&l));
+                    result
+                        .leader
+                        .into_iter()
+                        .for_each(|l| self.update_leader(&l));
                 }
-                _ => panic!("Unknown enum value {}", result.status)
+                _ => panic!("Unknown enum value {}", result.status),
             }
             task::sleep(Duration::from_secs(1)).await;
         }
@@ -103,9 +108,12 @@ impl Client for ClientImpl {
             match Status::from_i32(result.status) {
                 Some(Status::Success) => return Ok(result.leader.expect("leader").clone()),
                 Some(Status::NotLeader) => {
-                    result.leader.into_iter().for_each(|l| self.update_leader(&l));
+                    result
+                        .leader
+                        .into_iter()
+                        .for_each(|l| self.update_leader(&l));
                 }
-                _ => panic!("Unknown enum value {}", result.status)
+                _ => panic!("Unknown enum value {}", result.status),
             }
             task::sleep(Duration::from_secs(1)).await;
         }

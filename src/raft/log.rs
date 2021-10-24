@@ -44,7 +44,10 @@ impl LogSlice {
     // Returns a new instance with no entries, representing the *beginning* of
     // the log, i.e., the next expected entry has index 0.
     pub fn initial() -> Self {
-        Self::new(EntryId { term: -1, index: -1})
+        Self::new(EntryId {
+            term: -1,
+            index: -1,
+        })
     }
 
     // Adds a new entry to the end of the slice. Returns the id of the
@@ -225,10 +228,7 @@ impl LogSlice {
 
 fn create_entry(term: i64, index: i64, payload: Vec<u8>) -> Entry {
     Entry {
-        id: Some(EntryId {
-            term,
-            index
-        }),
+        id: Some(EntryId { term, index }),
         payload,
     }
 }

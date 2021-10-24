@@ -7,19 +7,19 @@ use std::time::Duration;
 use async_std::task;
 use env_logger::Env;
 use futures::executor;
-use futures::future::{join4};
+use futures::future::join4;
 use log::info;
 
 use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
+use crate::keyvalue::keyvalue_proto::operation::Op;
+use crate::keyvalue::keyvalue_proto::SetOperation;
+use futures::future::join_all;
 use keyvalue::keyvalue_proto;
 use keyvalue_proto::Operation;
+use prost::Message;
 use raft::raft_proto;
 use raft::{Config, Diagnostics, RaftImpl};
 use raft_proto::{EntryId, Server};
-use crate::keyvalue::keyvalue_proto::operation::Op;
-use crate::keyvalue::keyvalue_proto::SetOperation;
-use prost::Message;
-use futures::future::join_all;
 
 use crate::keyvalue::KeyValueService;
 use crate::raft_proto::raft_server::RaftServer;
@@ -29,12 +29,12 @@ mod raft;
 
 fn make_set_operation(key: &[u8], value: &[u8]) -> Operation {
     Operation {
-        op: Some(Op::Set(SetOperation{
+        op: Some(Op::Set(SetOperation {
             entry: Some(keyvalue_proto::Entry {
                 key: key.to_vec(),
                 value: value.to_vec(),
-            })
-        }))
+            }),
+        })),
     }
 }
 
@@ -45,7 +45,7 @@ fn entry_id_key(entry_id: &EntryId) -> String {
 fn server(host: &str, port: i32) -> Server {
     Server {
         host: host.into(),
-        port
+        port,
     }
 }
 
@@ -69,7 +69,11 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagn
     tonic::transport::Server::builder()
         .add_service(RaftServer::new(raft))
         .add_service(KeyValueServer::new(keyvalue))
-        .serve(format!("{}:{}", address.host, address.port).parse().unwrap())
+        .serve(
+            format!("{}:{}", address.host, address.port)
+                .parse()
+                .unwrap(),
+        )
         .await;
 }
 
@@ -145,7 +149,8 @@ fn main() {
         serving,
         run_commit_loop(&addresses),
         run_preempt_loop(&addresses),
-        run_validate_loop(&mut diag));
+        run_validate_loop(&mut diag),
+    );
 
     // TODO: async main
     executor::block_on(all);
