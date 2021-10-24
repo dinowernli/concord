@@ -2,7 +2,8 @@
 #![feature(map_first_last)]
 #![feature(trait_upcasting)]
 
-use std::sync::{Arc, Mutex};
+use async_std::sync::{Arc, Mutex};
+use std::error::Error;
 use std::time::Duration;
 
 use async_std::task;
@@ -56,7 +57,7 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
     let keyvalue = KeyValueService::new(&address);
 
     // A service used by the Raft cluster.
-    let server_diagnostics = diagnostics.lock().unwrap().get_server(&address);
+    let server_diagnostics = diagnostics.lock().await.get_server(&address);
     let state_machine = keyvalue.raft_state_machine();
     let raft = RaftImpl::new(
         address,
@@ -65,13 +66,13 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
         Some(server_diagnostics),
         Config::default(),
     );
-    raft.start();
+    raft.start().await;
 
     let serve = tonic::transport::Server::builder()
         .add_service(RaftServer::new(raft))
         .add_service(KeyValueServer::new(keyvalue))
         .serve(
-            format!("{}:{}", address.host, address.port)
+            format!("[{}]:{}", address.host, address.port)
                 .parse()
                 .unwrap(),
         )
@@ -129,14 +130,16 @@ async fn run_preempt_loop(cluster: &Vec<Server>) {
 async fn run_validate_loop(diag: Arc<Mutex<Diagnostics>>) {
     loop {
         diag.lock()
-            .unwrap()
+            .await
             .validate()
+            .await
             .expect("Cluster execution validation");
         task::sleep(Duration::from_secs(5)).await;
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::from_env(Env::default().default_filter_or("concord=info")).init();
 
     let addresses = vec![
@@ -161,6 +164,6 @@ fn main() {
         run_validate_loop(diag.clone()),
     );
 
-    // TODO: async main
-    executor::block_on(all);
+    all.await;
+    Ok(())
 }

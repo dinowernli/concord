@@ -1,9 +1,9 @@
 use crate::raft::raft_proto;
 
+use async_std::sync::{Arc, Mutex};
 use log::info;
 use raft_proto::Server;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
 
 // Holds information about the execution of a cluster over time. Can be used
 // to perform various integrity checks based on the recorded data. For
@@ -36,8 +36,8 @@ impl Diagnostics {
 
     // Performs a set of a sequence of checks on the data recorded by the
     // individual servers. Returns an error if any of the checks fail.
-    pub fn validate(&mut self) -> Result<(), String> {
-        self.validate_leaders()?;
+    pub async fn validate(&mut self) -> Result<(), String> {
+        self.validate_leaders().await?;
 
         // TODO(dino): Also collect (term, index, fprint) triples and validate.
 
@@ -48,7 +48,7 @@ impl Diagnostics {
     // compatible view of who was the leader for every term. Specifically,
     // there should be no term for which two servers recognize different peers
     // as the leader of the cluster.
-    fn validate_leaders(&mut self) -> Result<(), String> {
+    async fn validate_leaders(&mut self) -> Result<(), String> {
         let latest = match self.leaders.last_entry() {
             Some(e) => *e.key(),
             None => -1,
@@ -60,7 +60,7 @@ impl Diagnostics {
 
             let mut candidate: Option<Server> = None;
             for (_, server) in &self.servers {
-                let s = server.lock().unwrap();
+                let s = server.lock().await;
                 if s.latest_term().unwrap_or(-1) < term {
                     // This server hasn't seen a leader for this term yet. Stop.
                     return Ok(());

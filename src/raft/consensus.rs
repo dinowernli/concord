@@ -3,11 +3,11 @@ extern crate math;
 extern crate rand;
 extern crate timer;
 
+use async_std::sync::{Arc, Mutex};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_std::task;
@@ -127,10 +127,10 @@ impl RaftImpl {
         }
     }
 
-    pub fn start(&self) {
+    pub async fn start(&self) {
         let arc_state = self.state.clone();
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
         let term = state.term;
         info!("[{:?}] Starting", state.address);
         RaftImpl::become_follower(&mut state, arc_state.clone(), term);
@@ -165,13 +165,13 @@ impl RaftImpl {
     async fn compaction_loop(arc_state: Arc<Mutex<RaftState>>) {
         loop {
             {
-                let mut state = arc_state.lock().unwrap();
+                let mut state = arc_state.lock().await;
                 if state.role == RaftRole::Stopping {
                     return;
                 }
-                state.try_compact();
+                state.try_compact().await;
             }
-            let period_ms = arc_state.lock().unwrap().config.compaction_check_periods_ms;
+            let period_ms = arc_state.lock().await.config.compaction_check_periods_ms;
             task::sleep(Duration::from_millis(add_jitter(period_ms) as u64)).await;
         }
     }
@@ -179,12 +179,7 @@ impl RaftImpl {
     // Keeps running elections until either the term changes, a leader has emerged,
     // or an own election has been won.
     async fn election_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        let timeout_ms = arc_state
-            .lock()
-            .unwrap()
-            .config
-            .candidate_timeouts_ms
-            .clone();
+        let timeout_ms = arc_state.lock().await.config.candidate_timeouts_ms.clone();
         let mut term = term;
         while !RaftImpl::run_election(arc_state.clone(), term).await {
             term = term + 1;
@@ -198,7 +193,7 @@ impl RaftImpl {
     async fn run_election(arc_state: Arc<Mutex<RaftState>>, term: i64) -> bool {
         let mut futures = Vec::new();
         {
-            let mut state = arc_state.lock().unwrap();
+            let mut state = arc_state.lock().await;
 
             // The world has moved on.
             if state.term > term {
@@ -231,7 +226,7 @@ impl RaftImpl {
         let results = join_all(futures).await;
 
         {
-            let mut state = arc_state.lock().unwrap();
+            let mut state = arc_state.lock().await;
             let me = state.address.clone();
             debug!("[{:?}] Done waiting for vote requests", &me);
 
@@ -281,11 +276,11 @@ impl RaftImpl {
     // Starts the main leader replication loop. The loop stops once the term has
     // moved on (or we otherwise detect we are no longer leader).
     async fn replicate_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        let me = arc_state.lock().unwrap().address.clone();
-        let timeouts_ms = arc_state.lock().unwrap().config.leader_replicate_ms.clone();
+        let me = arc_state.lock().await.address.clone();
+        let timeouts_ms = arc_state.lock().await.config.leader_replicate_ms.clone();
         loop {
             {
-                let locked_state = arc_state.lock().unwrap();
+                let locked_state = arc_state.lock().await;
                 if locked_state.term > term {
                     info!("[{:?}] Detected higher term {}", me, locked_state.term);
                     return;
@@ -294,7 +289,7 @@ impl RaftImpl {
                     return;
                 }
                 match &locked_state.diagnostics {
-                    Some(d) => d.lock().unwrap().report_leader(term, &locked_state.address),
+                    Some(d) => d.lock().await.report_leader(term, &locked_state.address),
                     _ => (),
                 }
             }
@@ -311,7 +306,7 @@ impl RaftImpl {
         // This needs to be marked as "Send" because it's being sent across await points.
         let mut results = Vec::<Pin<Box<dyn Future<Output = ()> + Send>>>::new();
         {
-            let mut state = arc_state.lock().unwrap();
+            let mut state = arc_state.lock().await;
             debug!("[{:?}] Replicating entries", &state.address);
             for follower in state.get_others() {
                 // Figure out which entry the follower is expecting next and decide whether to
@@ -347,7 +342,7 @@ impl RaftImpl {
         join_all(results).await;
 
         {
-            let mut state = arc_state.lock().unwrap();
+            let mut state = arc_state.lock().await;
             if state.term > term {
                 info!("[{:?}] Detected higher term {}", state.address, state.term);
                 return;
@@ -356,7 +351,7 @@ impl RaftImpl {
                 info!("[{:?}] No longer leader", state.address);
                 return;
             }
-            state.update_committed();
+            state.update_committed().await;
             debug!("[{:?}] Done replicating entries", &state.address);
         }
     }
@@ -373,7 +368,7 @@ impl RaftImpl {
         request.set_timeout(Duration::from_millis(100));
         let result = client.install_snapshot(request).await;
 
-        let mut state = arc_state.lock().unwrap();
+        let mut state = arc_state.lock().await;
         match result {
             Ok(result) => {
                 let response = result.into_inner();
@@ -407,7 +402,7 @@ impl RaftImpl {
         request.set_timeout(Duration::from_millis(100));
         let result = client.append(request).await;
 
-        let mut state = arc_state.lock().unwrap();
+        let mut state = arc_state.lock().await;
         if state.term > append_request.term {
             info!("[{:?}] Detected higher term {}", state.address, state.term);
             return;
@@ -664,7 +659,7 @@ impl RaftState {
     // Scans the state of our followers in the hope of finding a new index which
     // has been replicated to a majority. If such an index is found, this updates
     // the index this leader considers committed.
-    fn update_committed(&mut self) {
+    async fn update_committed(&mut self) {
         let saved_committed = self.committed;
         for index in self.committed + 1..self.log.next_index() {
             let mut matches = 1; // We match.
@@ -686,7 +681,7 @@ impl RaftState {
             );
         }
 
-        self.apply_committed();
+        self.apply_committed().await;
     }
 
     // Registers a listener for the supplied index.
@@ -720,7 +715,7 @@ impl RaftState {
 
     // Called to apply any committed values that haven't been applied to the
     // state machine. This method is always safe to call, on leaders and followers.
-    fn apply_committed(&mut self) {
+    async fn apply_committed(&mut self) {
         while self.applied < self.committed {
             self.applied = self.applied + 1;
             let entry = self.log.entry_at(self.applied);
@@ -729,7 +724,7 @@ impl RaftState {
             let result = self
                 .state_machine
                 .lock()
-                .unwrap()
+                .await
                 .apply(&Bytes::from(entry.payload));
             match result {
                 Ok(()) => {
@@ -762,12 +757,12 @@ impl RaftState {
     }
 
     // Compacts logs entries into a new snapshot if necessary.
-    fn try_compact(&mut self) {
+    async fn try_compact(&mut self) {
         if self.log.size_bytes() > self.config.compaction_threshold_bytes {
             let applied_index = self.applied;
             let latest_id = self.log.id_at(applied_index);
             let snap = LogSnapshot {
-                snapshot: self.state_machine.lock().unwrap().create_snapshot(),
+                snapshot: self.state_machine.lock().await.create_snapshot(),
                 last: latest_id.clone(),
             };
             self.snapshot = Some(snap);
@@ -795,7 +790,7 @@ impl Raft for RaftImpl {
             self.address, request
         );
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
 
         // Reject anything from an outdated term.
         if state.term > request.term {
@@ -848,7 +843,7 @@ impl Raft for RaftImpl {
             self.address, request
         );
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
 
         // Handle the case where we are ahead of the leader. We inform the
         // leader of our (greater) term and fail the append.
@@ -870,7 +865,7 @@ impl Raft for RaftImpl {
         let leader = request.leader.expect("leader").clone();
         state.last_known_leader = Some(leader.clone());
         match &state.diagnostics {
-            Some(d) => d.lock().unwrap().report_leader(state.term, &leader),
+            Some(d) => d.lock().await.report_leader(state.term, &leader),
             _ => (),
         }
 
@@ -915,7 +910,7 @@ impl Raft for RaftImpl {
         let leader_commit = request.committed;
         if leader_commit > state.committed {
             state.committed = leader_commit;
-            state.apply_committed();
+            state.apply_committed().await;
         }
 
         debug!("[{:?}] Successfully processed heartbeat", &state.address);
@@ -937,7 +932,7 @@ impl Raft for RaftImpl {
         let receiver;
 
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().await;
             if state.role != RaftRole::Leader {
                 return Ok(Response::new(CommitResponse {
                     status: raft_proto::Status::NotLeader as i32,
@@ -953,7 +948,7 @@ impl Raft for RaftImpl {
 
         let committed = receiver.await;
 
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().await;
         let mut result = CommitResponse {
             leader: state.last_known_leader.clone(),
 
@@ -989,7 +984,7 @@ impl Raft for RaftImpl {
     ) -> Result<Response<StepDownResponse>, Status> {
         debug!("[{:?}] Handling step down request", self.address);
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
         if state.role != RaftRole::Leader {
             return Ok(Response::new(StepDownResponse {
                 status: raft_proto::Status::NotLeader as i32,
@@ -1013,11 +1008,11 @@ impl Raft for RaftImpl {
         let request = request.into_inner();
         debug!("[{:?}] Handling install snapshot request", self.address);
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
         if request.term >= state.term && !request.snapshot.is_empty() {
             // Update the state machine.
             let snapshot = Bytes::from(request.snapshot.to_vec());
-            match state.state_machine.lock().unwrap().load_snapshot(&snapshot) {
+            match state.state_machine.lock().await.load_snapshot(&snapshot) {
                 Ok(_) => (),
                 Err(message) => error!(
                     "[{:?}] Failed to load snapshot: [{:?}]",

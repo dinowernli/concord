@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use async_std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use log::{debug, info, warn};
@@ -64,7 +64,7 @@ impl KeyValue for KeyValueService {
         }
         let key = request.key.to_vec();
 
-        let locked = self.store.lock().unwrap();
+        let locked = self.store.lock().await;
         let version = if request.version <= 0 {
             locked.latest_version()
         } else {
