@@ -222,25 +222,28 @@ fn create_deque<T>(item: T) -> VecDeque<T> {
     result
 }
 
-#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keyvalue::keyvalue_proto::operation::Op;
     use keyvalue_proto::{Entry, SetOperation};
 
     fn make_entry(k: &Bytes, v: &Bytes) -> Entry {
-        let mut result = Entry::new();
-        result.set_key(k.to_vec());
-        result.set_value(v.to_vec());
-        result
+        Entry {
+            key: k.to_vec(),
+            value: v.to_vec(),
+        }
     }
 
     fn make_set_op(k: &Bytes, v: &Bytes) -> Operation {
-        let mut set_op = SetOperation::new();
-        set_op.set_entry(make_entry(k, v));
-        let mut op = Operation::new();
-        op.set_set(set_op);
-        op
+        Operation {
+            op: Some(Op::Set(SetOperation {
+                entry: Some(keyvalue_proto::Entry {
+                    key: k.to_vec(),
+                    value: v.to_vec(),
+                }),
+            })),
+        }
     }
 
     #[test]
@@ -267,10 +270,10 @@ mod tests {
         let v = Bytes::from("some-value");
 
         let op = make_set_op(&k, &v);
-        let serialized = Bytes::from(op.write_to_bytes().expect("serialize"));
+        let serialized = op.encode_to_vec();
 
         assert!(store.get(&k).is_none());
-        store.apply(&serialized).expect("apply");
+        store.apply(&Bytes::from(serialized)).expect("apply");
         assert_eq!(v, store.get(&k).unwrap());
     }
 
