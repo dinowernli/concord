@@ -300,6 +300,7 @@ dependencies = [
  "rand 0.7.3",
  "timer",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-build",
 ]

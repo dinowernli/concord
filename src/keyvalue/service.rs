@@ -12,6 +12,7 @@ use crate::keyvalue::{keyvalue_proto, MapStore, Store};
 use crate::keyvalue_proto::key_value_server::KeyValue;
 use crate::raft::raft_proto::Server;
 use crate::raft::{new_client, Client, StateMachine};
+use crate::testing::TestServer;
 use prost::Message;
 
 // This allows us to combine two non-auto traits into one.
@@ -128,7 +129,6 @@ mod tests {
     use crate::keyvalue::keyvalue_proto::key_value_client::KeyValueClient;
     use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
     use crate::raft::raft_proto::EntryId;
-    use tokio::time::Duration;
     use tonic::transport::Channel;
 
     use super::*;
@@ -160,10 +160,7 @@ mod tests {
     async fn test_get() {
         let service = create_service();
         let store = service.store.clone();
-        tokio::spawn(create_grpc_server(service, 12344));
-
-        // TODO when is the server ready?!
-        tokio::time::sleep(Duration::from_millis(3000)).await;
+        let server = TestServer::run(KeyValueServer::new(service)).await;
 
         store
             .lock()
@@ -174,7 +171,7 @@ mod tests {
             key: "foo".as_bytes().to_vec(),
             version: -1,
         };
-        let response = create_grpc_client(12344)
+        let response = create_grpc_client(server.port().unwrap() as i32)
             .await
             .get(Request::new(request.clone()))
             .await
@@ -191,18 +188,14 @@ mod tests {
     async fn test_put() {
         let service = create_service();
         let store = service.store.clone();
-        tokio::spawn(create_grpc_server(service, 12340));
-
-        // TODO when is the server ready?!
-        tokio::time::sleep(Duration::from_millis(3000)).await;
-        // HealthClient.watch?
+        let server = TestServer::run(KeyValueServer::new(service)).await;
 
         let request = PutRequest {
             key: "foo".as_bytes().to_vec(),
             value: "bar".as_bytes().to_vec(),
         };
 
-        create_grpc_client(12340)
+        create_grpc_client(server.port().unwrap() as i32)
             .await
             .put(Request::new(request.clone()))
             .await
@@ -228,19 +221,10 @@ mod tests {
         }
     }
 
-    async fn create_grpc_server(service: KeyValueService, port: i32) {
-        // TODO(dino): bind to arbitrary port (0) and figure out how to retrieve it
-        let serve = tonic::transport::Server::builder()
-            .add_service(KeyValueServer::new(service))
-            .serve(format!("[{}]:{}", "::1", port).parse().unwrap())
-            .await;
-    }
-
     async fn create_grpc_client(port: i32) -> KeyValueClient<Channel> {
-        // TODO get port from server (?)
         KeyValueClient::connect(format!("http://[::1]:{}", port))
             .await
-            .expect("server")
+            .expect("client")
     }
 
     fn make_server(host: &str, port: i32) -> Server {

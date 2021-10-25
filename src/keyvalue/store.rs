@@ -225,8 +225,7 @@ fn create_deque<T>(item: T) -> VecDeque<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keyvalue::keyvalue_proto::operation::Op;
-    use keyvalue_proto::{Entry, SetOperation};
+    use keyvalue_proto::SetOperation;
 
     fn make_set_op(k: &Bytes, v: &Bytes) -> Operation {
         Operation {
