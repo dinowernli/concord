@@ -124,7 +124,6 @@ fn address_key(address: &Server) -> String {
     format!("{}:{}", address.host, address.port)
 }
 
-#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,73 +146,73 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[should_panic]
-    fn test_catch_inconsistent_single_server() {
+    async fn test_catch_inconsistent_single_server() {
         let mut f = Fixture::new();
 
         let d1 = f.diag.get_server(&f.s1);
-        d1.lock().unwrap().report_leader(1, &f.s1);
-        d1.lock().unwrap().report_leader(1, &f.s2);
+        d1.lock().await.report_leader(1, &f.s1);
+        d1.lock().await.report_leader(1, &f.s2);
     }
 
-    #[test]
-    fn test_validate_happy() {
-        let mut f = Fixture::new();
-
-        let d1 = f.diag.get_server(&f.s1);
-        let d2 = f.diag.get_server(&f.s2);
-
-        d1.lock().unwrap().report_leader(2, &f.s1);
-        d2.lock().unwrap().report_leader(2, &f.s1);
-
-        f.diag.validate().expect("validation should succeed");
-    }
-
-    #[test]
-    fn test_validate_failure() {
+    #[tokio::test]
+    async fn test_validate_happy() {
         let mut f = Fixture::new();
 
         let d1 = f.diag.get_server(&f.s1);
         let d2 = f.diag.get_server(&f.s2);
-        let d3 = f.diag.get_server(&f.s3);
 
-        d1.lock().unwrap().report_leader(1, &f.s1);
-        d2.lock().unwrap().report_leader(1, &f.s1);
-        d3.lock().unwrap().report_leader(1, &f.s1);
+        d1.lock().await.report_leader(2, &f.s1);
+        d2.lock().await.report_leader(2, &f.s1);
 
-        d1.lock().unwrap().report_leader(2, &f.s2);
-        d2.lock().unwrap().report_leader(2, &f.s2);
-        d3.lock().unwrap().report_leader(2, &f.s3);
-
-        assert!(f.diag.validate().is_err());
+        f.diag.validate().await.expect("validation should succeed");
     }
 
-    #[test]
-    fn test_validate_skips_gaps() {
+    #[tokio::test]
+    async fn test_validate_failure() {
         let mut f = Fixture::new();
 
         let d1 = f.diag.get_server(&f.s1);
         let d2 = f.diag.get_server(&f.s2);
         let d3 = f.diag.get_server(&f.s3);
 
-        d1.lock().unwrap().report_leader(1, &f.s1);
-        d2.lock().unwrap().report_leader(1, &f.s1);
-        d3.lock().unwrap().report_leader(1, &f.s1);
+        d1.lock().await.report_leader(1, &f.s1);
+        d2.lock().await.report_leader(1, &f.s1);
+        d3.lock().await.report_leader(1, &f.s1);
+
+        d1.lock().await.report_leader(2, &f.s2);
+        d2.lock().await.report_leader(2, &f.s2);
+        d3.lock().await.report_leader(2, &f.s3);
+
+        assert!(f.diag.validate().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_skips_gaps() {
+        let mut f = Fixture::new();
+
+        let d1 = f.diag.get_server(&f.s1);
+        let d2 = f.diag.get_server(&f.s2);
+        let d3 = f.diag.get_server(&f.s3);
+
+        d1.lock().await.report_leader(1, &f.s1);
+        d2.lock().await.report_leader(1, &f.s1);
+        d3.lock().await.report_leader(1, &f.s1);
 
         // Whole bunch of missing terms, then a conflict.
 
-        d1.lock().unwrap().report_leader(6, &f.s2);
-        d2.lock().unwrap().report_leader(6, &f.s2);
-        d3.lock().unwrap().report_leader(6, &f.s3);
+        d1.lock().await.report_leader(6, &f.s2);
+        d2.lock().await.report_leader(6, &f.s2);
+        d3.lock().await.report_leader(6, &f.s3);
 
-        assert!(f.diag.validate().is_err());
+        assert!(f.diag.validate().await.is_err());
     }
 
     fn make_server(host: &str, port: i16) -> Server {
-        let mut result = Server::new();
-        result.set_host(host.to_string());
-        result.set_port(port as i32);
-        return result;
+        Server {
+            host: host.to_string(),
+            port: port as i32,
+        }
     }
 }
