@@ -1173,93 +1173,93 @@ mod tests {
         assert!(append_response_2.success);
     }
 
-    // // This test verifies that we can append entries to a follower and that once the
-    // // follower's log grows too large, it will correctly compact.
-    // #[test]
-    // fn test_append_and_compact() {
-    //     let raft = create_raft();
-    //     let raft_state = raft.state.clone();
-    //     let server = create_grpc_server(raft);
-    //
-    //     // Make an append request coming from a leader, appending one record.
-    //     let leader = create_fake_server_list()[1].clone();
-    //     let mut append_request = AppendRequest::new();
-    //     append_request.set_term(12);
-    //     append_request.set_leader(leader.clone());
-    //     append_request.set_previous(entry_id(-1, -1));
-    //     append_request.set_entries(RepeatedField::from(vec![
-    //         entry(entry_id(8, 0), Vec::new()),
-    //         entry(entry_id(8, 1), Vec::new()),
-    //         entry(entry_id(8, 2), Vec::new()),
-    //     ]));
-    //     append_request.set_committed(0);
-    //
-    //     let append_response_1 = executor::block_on(
-    //         create_grpc_client(&server)
-    //             .append(grpc::RequestOptions::new(), append_request.clone())
-    //             .drop_metadata(),
-    //     )
-    //     .expect("result");
-    //
-    //     // Make sure the handler has processed the rpc successfully.
-    //     assert_eq!(append_response_1.get_term(), 12);
-    //     assert!(append_response_1.get_success());
-    //     {
-    //         let state = raft_state.lock().unwrap();
-    //         assert_eq!(state.last_known_leader, Some(leader.clone()));
-    //         assert_eq!(state.term, 12);
-    //         assert!(!state.log.is_index_compacted(0)); // Not compacted
-    //         assert_eq!(state.log.next_index(), 3);
-    //     }
-    //
-    //     // Run a compaction, should have no effect
-    //     {
-    //         let mut state = raft_state.lock().unwrap();
-    //         state.try_compact();
-    //         assert!(!state.log.is_index_compacted(0)); // Not compacted
-    //         assert_eq!(state.log.next_index(), 3);
-    //     }
-    //
-    //     // Now send an append request with a payload large enough to trigger compaction.
-    //     let compaction_bytes = raft_state.lock().unwrap().config.compaction_threshold_bytes;
-    //
-    //     let mut append_request_2 = AppendRequest::new();
-    //     append_request_2.set_term(12);
-    //     append_request_2.set_leader(leader.clone());
-    //     append_request_2.set_previous(entry_id(8, 2));
-    //     append_request_2.set_entries(RepeatedField::from(vec![entry(
-    //         entry_id(8, 3),
-    //         vec![0; 2 * compaction_bytes as usize],
-    //     )]));
-    //
-    //     // This tells the follower that the entries are committed (only committed
-    //     // entries are eligible for compaction).
-    //     append_request_2.set_committed(3);
-    //
-    //     let append_response_2 = executor::block_on(
-    //         create_grpc_client(&server)
-    //             .append(grpc::RequestOptions::new(), append_request_2.clone())
-    //             .drop_metadata(),
-    //     )
-    //     .expect("result");
-    //
-    //     // Make sure the handler has processed the rpc successfully.
-    //     assert_eq!(append_response_2.get_term(), 12);
-    //     assert!(append_response_2.get_success());
-    //     {
-    //         let state = raft_state.lock().unwrap();
-    //         assert!(!state.log.is_index_compacted(0)); // Not compacted
-    //         assert_eq!(state.log.next_index(), 4); // New entry incorporated
-    //     }
-    //
-    //     // Run a compaction, this one should actually compact things now.
-    //     {
-    //         let mut state = raft_state.lock().unwrap();
-    //         state.try_compact();
-    //         assert!(state.log.is_index_compacted(0)); // Compacted
-    //         assert_eq!(state.snapshot.as_ref().expect("snapshot").last.index, 3)
-    //     }
-    // }
+    // This test verifies that we can append entries to a follower and that once the
+    // follower's log grows too large, it will correctly compact.
+    #[tokio::test]
+    async fn test_append_and_compact() {
+        let raft = create_raft();
+        let raft_state = raft.state.clone();
+        let server = TestServer::run(RaftServer::new(raft)).await;
+
+        // Make an append request coming from a leader, appending one record.
+        let leader = create_fake_server_list()[1].clone();
+        let append_request = AppendRequest {
+            term: 12,
+            leader: Some(leader.clone()),
+            previous: Some(entry_id(-1, -1)),
+            entries: vec![
+                entry(entry_id(8, 0), Vec::new()),
+                entry(entry_id(8, 1), Vec::new()),
+                entry(entry_id(8, 2), Vec::new()),
+            ],
+            committed: 0,
+        };
+
+        let mut client = create_grpc_client(server.port().unwrap() as i32).await;
+        let append_response_1 = client
+            .append(append_request)
+            .await
+            .expect("append")
+            .into_inner();
+
+        // Make sure the handler has processed the rpc successfully.
+        assert_eq!(append_response_1.term, 12);
+        assert!(append_response_1.success);
+        {
+            let state = raft_state.lock().await;
+            assert_eq!(state.last_known_leader, Some(leader.clone()));
+            assert_eq!(state.term, 12);
+            assert!(!state.log.is_index_compacted(0)); // Not compacted
+            assert_eq!(state.log.next_index(), 3);
+        }
+
+        // Run a compaction, should have no effect
+        {
+            let mut state = raft_state.lock().await;
+            state.try_compact().await;
+            assert!(!state.log.is_index_compacted(0)); // Not compacted
+            assert_eq!(state.log.next_index(), 3);
+        }
+
+        // Now send an append request with a payload large enough to trigger compaction.
+        let compaction_bytes = raft_state.lock().await.config.compaction_threshold_bytes;
+
+        let append_request_2 = AppendRequest {
+            term: 12,
+            leader: Some(leader.clone()),
+            previous: Some(entry_id(8, 2)),
+            entries: vec![entry(
+                entry_id(8, 3),
+                vec![0; 2 * compaction_bytes as usize],
+            )],
+            // This tells the follower that the entries are committed (only committed
+            // entries are eligible for compaction).
+            committed: 3,
+        };
+
+        let append_response_2 = client
+            .append(append_request_2)
+            .await
+            .expect("append")
+            .into_inner();
+
+        // Make sure the handler has processed the rpc successfully.
+        assert_eq!(append_response_2.term, 12);
+        assert!(append_response_2.success);
+        {
+            let state = raft_state.lock().await;
+            assert!(!state.log.is_index_compacted(0)); // Not compacted
+            assert_eq!(state.log.next_index(), 4); // New entry incorporated
+        }
+
+        // Run a compaction, this one should actually compact things now.
+        {
+            let mut state = raft_state.lock().await;
+            state.try_compact().await;
+            assert!(state.log.is_index_compacted(0)); // Compacted
+            assert_eq!(state.snapshot.as_ref().expect("snapshot").last.index, 3)
+        }
+    }
 
     fn entry(id: EntryId, payload: Vec<u8>) -> Entry {
         Entry {
