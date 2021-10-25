@@ -16,8 +16,8 @@ use futures::FutureExt;
 use log::{debug, error, info, warn};
 use rand::Rng;
 use tokio::task::JoinHandle;
-use tonic::{Request, Response, Status};
 use tonic::transport::Channel;
+use tonic::{Request, Response, Status};
 
 use diagnostics::ServerDiagnostics;
 use raft::log::{ContainsResult, LogSlice};
@@ -1088,11 +1088,10 @@ async fn make_raft_client(address: &Server) -> RaftClient<Channel> {
         .expect("Failed to create client")
 }
 
+#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
     use futures::executor;
-
-    use raft_proto_grpc::RaftServer;
 
     use crate::raft::StateMachineResult;
     use crate::raft_proto::Entry;

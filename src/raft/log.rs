@@ -239,6 +239,7 @@ fn create_entry(term: i64, index: i64, payload: Vec<u8>) -> Entry {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
     use super::*;

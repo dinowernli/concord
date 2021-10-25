@@ -126,12 +126,10 @@ impl KeyValue for KeyValueService {
 #[cfg(test)]
 mod tests {
     use crate::keyvalue::keyvalue_proto::key_value_client::KeyValueClient;
-    use grpc::{ClientStubExt, Error};
-    use tonic::transport::Channel;
-
-    use crate::keyvalue::keyvalue_proto_grpc::{KeyValueClient, KeyValueServer};
-    use crate::raft::raft_proto::raft_client::RaftClient;
+    use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
     use crate::raft::raft_proto::EntryId;
+    use tokio::time::Duration;
+    use tonic::transport::Channel;
 
     use super::*;
 
@@ -141,67 +139,78 @@ mod tests {
         store: Arc<Mutex<MapStore>>,
     }
 
-    #[async_trait]
+    #[tonic::async_trait]
     impl Client for FakeRaftClient {
-        async fn commit(&self, payload: &[u8]) -> Result<EntryId, Error> {
-            let copy = payload.clone().to_bytes();
+        async fn commit(&self, payload: &[u8]) -> Result<EntryId, Status> {
+            let copy = payload.to_vec();
             self.store
                 .lock()
-                .unwrap()
-                .apply(&copy)
+                .await
+                .apply(&Bytes::from(copy))
                 .expect("bad payload");
-            Ok(EntryId::new())
+            Ok(EntryId { term: 0, index: 0 })
         }
 
-        async fn preempt_leader(&self) -> Result<Server, Error> {
+        async fn preempt_leader(&self) -> Result<Server, Status> {
             unimplemented!();
         }
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_get() {
         let service = create_service();
         let store = service.store.clone();
-        let server = create_grpc_server(service);
+        let server = tokio::spawn(create_grpc_server(service, 12344));
+
+        // TODO when is the server ready?!
+        tokio::time::sleep(Duration::from_millis(3000)).await;
 
         store
             .lock()
-            .unwrap()
+            .await
             .set(Bytes::from("foo"), Bytes::from("bar"));
 
-        let mut request = GetRequest::new();
-        request.set_key(String::from("foo").into_bytes());
-
-        let response = create_grpc_client(&server)
-            .get(request.clone())
+        let request = GetRequest {
+            key: "foo".as_bytes().to_vec(),
+            version: -1,
+        };
+        let response = create_grpc_client(12344)
             .await
-            .expect("response");
+            .get(Request::new(request.clone()))
+            .await
+            .expect("response")
+            .into_inner();
 
-        assert!(response.has_entry());
-        let entry = response.get_entry().clone();
-        assert_eq!(Bytes::from("foo").as_ref(), entry.get_key());
-        assert_eq!(Bytes::from("bar").as_ref(), entry.get_value());
+        assert!(response.entry.is_some());
+        let entry = response.entry.clone().expect("entry");
+        assert_eq!(Bytes::from("foo").as_ref(), entry.key);
+        assert_eq!(Bytes::from("bar").as_ref(), entry.value);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_put() {
         let service = create_service();
         let store = service.store.clone();
-        let server = create_grpc_server(service);
+        let server = tokio::spawn(create_grpc_server(service, 12340));
 
-        let mut request = PutRequest::new();
-        request.set_key(String::from("foo").into_bytes());
-        request.set_value(String::from("bar").into_bytes());
+        // TODO when is the server ready?!
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        // HealthClient.watch?
 
-        create_grpc_client(&server)
-            .put(request.clone())
-            .drop_metadata()
+        let request = PutRequest {
+            key: "foo".as_bytes().to_vec(),
+            value: "bar".as_bytes().to_vec(),
+        };
+
+        create_grpc_client(12340)
+            .await
+            .put(Request::new(request.clone()))
             .await
             .expect("response");
 
         let value = store
             .lock()
-            .unwrap()
+            .await
             .get(&Bytes::from("foo"))
             .expect("present");
         assert_eq!(Bytes::from("bar"), value);
@@ -219,23 +228,25 @@ mod tests {
         }
     }
 
-    fn create_grpc_server(service: KeyValueService) -> grpc::Server {
-        let mut server_builder = grpc::ServerBuilder::new_plain();
-        server_builder.add_service(KeyValueServer::new_service_def(service));
-        server_builder.http.set_addr(("0.0.0.0", 0)).unwrap();
-        server_builder.build().expect("server")
+    async fn create_grpc_server(service: KeyValueService, port: i32) {
+        // TODO(dino): bind to arbitrary port (0) and figure out how to retrieve it
+        let serve = tonic::transport::Server::builder()
+            .add_service(KeyValueServer::new(service))
+            .serve(format!("[{}]:{}", "::1", port).parse().unwrap())
+            .await;
     }
 
-    async fn create_grpc_client(server: &grpc::Server) -> KeyValueClient<Channel> {
-        let client_conf = Default::default();
-        let port = server.local_addr().port().expect("port");
-        KeyValueClient::connect(format!("http://[::1]:{}", port)).await?
+    async fn create_grpc_client(port: i32) -> KeyValueClient<Channel> {
+        // TODO get port from server (?)
+        KeyValueClient::connect(format!("http://[::1]:{}", port))
+            .await
+            .expect("server")
     }
 
     fn make_server(host: &str, port: i32) -> Server {
-        let mut result = Server::new();
-        result.set_host(host.to_string());
-        result.set_port(port);
-        result
+        Server {
+            host: host.to_string(),
+            port,
+        }
     }
 }

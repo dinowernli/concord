@@ -222,11 +222,11 @@ fn create_deque<T>(item: T) -> VecDeque<T> {
     result
 }
 
+#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
     use super::*;
     use keyvalue_proto::{Entry, SetOperation};
-    use protobuf::Message;
 
     fn make_entry(k: &Bytes, v: &Bytes) -> Entry {
         let mut result = Entry::new();

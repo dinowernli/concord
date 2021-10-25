@@ -124,6 +124,7 @@ fn address_key(address: &Server) -> String {
     format!("{}:{}", address.host, address.port)
 }
 
+#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
     use super::*;
