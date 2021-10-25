@@ -160,7 +160,7 @@ mod tests {
     async fn test_get() {
         let service = create_service();
         let store = service.store.clone();
-        let server = tokio::spawn(create_grpc_server(service, 12344));
+        tokio::spawn(create_grpc_server(service, 12344));
 
         // TODO when is the server ready?!
         tokio::time::sleep(Duration::from_millis(3000)).await;
@@ -191,7 +191,7 @@ mod tests {
     async fn test_put() {
         let service = create_service();
         let store = service.store.clone();
-        let server = tokio::spawn(create_grpc_server(service, 12340));
+        tokio::spawn(create_grpc_server(service, 12340));
 
         // TODO when is the server ready?!
         tokio::time::sleep(Duration::from_millis(3000)).await;

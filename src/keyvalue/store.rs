@@ -228,16 +228,9 @@ mod tests {
     use crate::keyvalue::keyvalue_proto::operation::Op;
     use keyvalue_proto::{Entry, SetOperation};
 
-    fn make_entry(k: &Bytes, v: &Bytes) -> Entry {
-        Entry {
-            key: k.to_vec(),
-            value: v.to_vec(),
-        }
-    }
-
     fn make_set_op(k: &Bytes, v: &Bytes) -> Operation {
         Operation {
-            op: Some(Op::Set(SetOperation {
+            op: Some(Set(SetOperation {
                 entry: Some(keyvalue_proto::Entry {
                     key: k.to_vec(),
                     value: v.to_vec(),

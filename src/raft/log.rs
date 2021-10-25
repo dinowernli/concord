@@ -239,7 +239,6 @@ fn create_entry(term: i64, index: i64, payload: Vec<u8>) -> Entry {
     }
 }
 
-#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,11 +309,11 @@ mod tests {
 
         let i = l.id_at(0);
         assert_eq!(0, i.index);
-        assert_eq!(71, i.get_term());
+        assert_eq!(71, i.term);
 
         let j = l.id_at(4);
         assert_eq!(4, j.index);
-        assert_eq!(73, j.get_term());
+        assert_eq!(73, j.term);
     }
 
     #[test]
@@ -413,7 +412,7 @@ mod tests {
     fn test_append() {
         let mut l = create_default_slice();
         let id = l.append(74, "bad term".as_bytes().to_vec());
-        assert_eq!(74, id.get_term());
+        assert_eq!(74, id.term);
         assert_eq!(6, id.index);
     }
 
@@ -512,16 +511,13 @@ mod tests {
     }
 
     fn entry_id(term: i64, index: i64) -> EntryId {
-        let mut result = EntryId::new();
-        result.set_index(index);
-        result.set_term(term);
-        return result;
+        EntryId { index, term }
     }
 
     fn entry(term: i64, index: i64, payload_size_bytes: i64) -> Entry {
-        let mut result = Entry::new();
-        result.set_payload(payload_of_size(payload_size_bytes));
-        result.set_id(entry_id(term, index));
-        return result;
+        Entry {
+            id: Some(entry_id(term, index)),
+            payload: payload_of_size(payload_size_bytes),
+        }
     }
 }
