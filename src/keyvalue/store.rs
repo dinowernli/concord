@@ -1,6 +1,5 @@
 extern crate bytes;
 extern crate im;
-extern crate protobuf;
 
 use crate::keyvalue::keyvalue_proto;
 use crate::raft::{StateMachine, StateMachineResult};

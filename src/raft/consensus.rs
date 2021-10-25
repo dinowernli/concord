@@ -1,23 +1,21 @@
 extern crate chrono;
 extern crate math;
 extern crate rand;
-extern crate timer;
 
 use async_std::sync::{Arc, Mutex};
+use futures::FutureExt;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use async_std::task;
 use bytes::Bytes;
 use futures::channel::oneshot::{channel, Receiver, Sender};
 use futures::future::join_all;
 use log::{debug, error, info, warn};
 use rand::Rng;
-use timer::Guard;
-use timer::Timer;
+use tokio::task::JoinHandle;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
@@ -113,7 +111,6 @@ impl RaftImpl {
                 listener_uid: 0,
                 listeners: BTreeSet::new(),
 
-                timer: Timer::new(),
                 timer_guard: None,
 
                 address: server.clone(),
@@ -148,17 +145,20 @@ impl RaftImpl {
         state.role = RaftRole::Follower;
         state.voted_for = None;
         let timeout_ms = state.config.follower_timeout_ms;
-        state.timer_guard = Some(state.timer.schedule_with_delay(
-            chrono::Duration::milliseconds(add_jitter(timeout_ms)),
-            move || {
-                let arc_state = arc_state.clone();
-                let me = me.clone();
-                tokio::spawn(async move {
-                    info!("[{:?}] Follower timeout in term {}", me, term);
-                    RaftImpl::election_loop(arc_state.clone(), term + 1).await;
-                });
-            },
-        ));
+
+        // TODO - CLEANUP
+        let d = tokio::time::Duration::from_millis(add_jitter(timeout_ms) as u64);
+        let handle = tokio::time::sleep(d).map(move |_| {
+            let arc_state = arc_state.clone();
+            let me = me.clone();
+            tokio::spawn(async move {
+                info!("[{:?}] Follower timeout in term {}", me, term);
+                RaftImpl::election_loop(arc_state.clone(), term + 1).await;
+            });
+        });
+        state.timer_guard = Some(TimerGuard {
+            handle: tokio::spawn(handle),
+        });
     }
 
     async fn compaction_loop(arc_state: Arc<Mutex<RaftState>>) {
@@ -480,6 +480,16 @@ impl Ord for CommitListener {
     }
 }
 
+struct TimerGuard {
+    handle: JoinHandle<()>,
+}
+
+impl Drop for TimerGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum RaftRole {
     Follower,
@@ -508,8 +518,7 @@ struct RaftState {
     listener_uid: i64,
     listeners: BTreeSet<CommitListener>,
 
-    timer: Timer,
-    timer_guard: Option<Guard>,
+    timer_guard: Option<TimerGuard>,
 
     // Cluster membership.
     address: Server,
@@ -875,17 +884,19 @@ impl Raft for RaftImpl {
         let arc_state = self.state.clone();
         let me = state.address.clone();
         let timeout_ms = state.config.follower_timeout_ms;
-        state.timer_guard = Some(state.timer.schedule_with_delay(
-            chrono::Duration::milliseconds(add_jitter(timeout_ms)),
-            move || {
-                let arc_state = arc_state.clone();
-                let me = me.clone();
-                tokio::spawn(async move {
-                    info!("[{:?}] Timed out waiting for leader heartbeat", &me);
-                    RaftImpl::election_loop(arc_state.clone(), term + 1).await;
-                });
-            },
-        ));
+
+        let d = tokio::time::Duration::from_millis(add_jitter(timeout_ms) as u64);
+        let handle = tokio::time::sleep(d).map(move |_| {
+            let arc_state = arc_state.clone();
+            let me = me.clone();
+            tokio::spawn(async move {
+                info!("[{:?}] Timed out waiting for leader heartbeat", &me);
+                RaftImpl::election_loop(arc_state.clone(), term + 1).await;
+            });
+        });
+        state.timer_guard = Some(TimerGuard {
+            handle: tokio::spawn(handle),
+        });
 
         let term = state.term;
 
