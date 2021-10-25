@@ -171,7 +171,7 @@ impl RaftImpl {
                 state.try_compact().await;
             }
             let period_ms = arc_state.lock().await.config.compaction_check_periods_ms;
-            task::sleep(Duration::from_millis(add_jitter(period_ms) as u64)).await;
+            tokio::time::sleep(Duration::from_millis(add_jitter(period_ms) as u64)).await;
         }
     }
 
@@ -183,7 +183,7 @@ impl RaftImpl {
         while !RaftImpl::run_election(arc_state.clone(), term).await {
             term = term + 1;
             let sleep_ms = add_jitter(timeout_ms) as u64;
-            task::sleep(Duration::from_millis(sleep_ms)).await;
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         }
     }
 
@@ -296,7 +296,7 @@ impl RaftImpl {
 
             RaftImpl::replicate_entries(arc_state.clone(), term).await;
             let sleep_ms = add_jitter(timeouts_ms) as u64;
-            task::sleep(Duration::from_millis(sleep_ms)).await;
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         }
     }
 
