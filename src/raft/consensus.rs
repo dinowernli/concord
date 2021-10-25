@@ -2,22 +2,22 @@ extern crate chrono;
 extern crate math;
 extern crate rand;
 
-use async_std::sync::{Arc, Mutex};
-use futures::FutureExt;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::channel::oneshot::{channel, Receiver, Sender};
 use futures::future::join_all;
+use futures::FutureExt;
 use log::{debug, error, info, warn};
 use rand::Rng;
 use tokio::task::JoinHandle;
-use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
+use tonic::transport::Channel;
 
 use diagnostics::ServerDiagnostics;
 use raft::log::{ContainsResult, LogSlice};
