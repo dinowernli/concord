@@ -3,6 +3,7 @@ use std::time::Duration;
 use async_std::sync::Mutex;
 use async_trait::async_trait;
 use log::debug;
+use tokio::time::sleep;
 use tonic::transport::{Channel, Error};
 use tonic::Request;
 
@@ -80,7 +81,7 @@ impl Client for ClientImpl {
             let mut request = Request::new(CommitRequest {
                 payload: payload.to_vec(),
             });
-            request.set_timeout(Duration::from_secs(1));
+            request.set_timeout(Duration::from_secs(3));
 
             let result: CommitResponse = self
                 .new_leader_client()
@@ -105,6 +106,7 @@ impl Client for ClientImpl {
                     )))
                 }
             }
+            sleep(Duration::from_millis(100)).await;
         }
         Err(tonic::Status::internal(format!(
             "Failed to contact leader after {} attempts",
@@ -142,6 +144,7 @@ impl Client for ClientImpl {
                     )))
                 }
             }
+            sleep(Duration::from_millis(100)).await;
         }
         Err(tonic::Status::internal(format!(
             "Failed to contact leader after {} attempts",

@@ -16,6 +16,7 @@ use futures::FutureExt;
 use log::{debug, error, info, warn};
 use rand::Rng;
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
@@ -58,11 +59,11 @@ pub struct Config {
 impl Config {
     pub fn default() -> Self {
         Config {
-            follower_timeout_ms: 2000,
-            candidate_timeouts_ms: 3000,
-            leader_replicate_ms: 500,
+            follower_timeout_ms: 100,
+            candidate_timeouts_ms: 300,
+            leader_replicate_ms: 50,
             compaction_threshold_bytes: 10 * 1000 * 1000,
-            compaction_check_periods_ms: 500,
+            compaction_check_periods_ms: 5000,
         }
     }
 }
@@ -146,18 +147,14 @@ impl RaftImpl {
         state.voted_for = None;
         let timeout_ms = state.config.follower_timeout_ms;
 
-        // TODO - CLEANUP
-        let d = tokio::time::Duration::from_millis(add_jitter(timeout_ms) as u64);
-        let handle = tokio::time::sleep(d).map(move |_| {
-            let arc_state = arc_state.clone();
-            let me = me.clone();
+        let task = sleep(Duration::from_millis(add_jitter(timeout_ms))).then(async move |_| {
             tokio::spawn(async move {
-                info!("[{:?}] Follower timeout in term {}", me, term);
+                info!("[{:?}] Follower timeout in term {}", me.clone(), term);
                 RaftImpl::election_loop(arc_state.clone(), term + 1).await;
             });
         });
         state.timer_guard = Some(TimerGuard {
-            handle: tokio::spawn(handle),
+            handle: tokio::spawn(task),
         });
     }
 
@@ -171,7 +168,7 @@ impl RaftImpl {
                 state.try_compact().await;
             }
             let period_ms = arc_state.lock().await.config.compaction_check_periods_ms;
-            tokio::time::sleep(Duration::from_millis(add_jitter(period_ms) as u64)).await;
+            sleep(Duration::from_millis(add_jitter(period_ms))).await;
         }
     }
 
@@ -182,8 +179,7 @@ impl RaftImpl {
         let mut term = term;
         while !RaftImpl::run_election(arc_state.clone(), term).await {
             term = term + 1;
-            let sleep_ms = add_jitter(timeout_ms) as u64;
-            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            sleep(Duration::from_millis(add_jitter(timeout_ms))).await;
         }
     }
 
@@ -295,8 +291,7 @@ impl RaftImpl {
             }
 
             RaftImpl::replicate_entries(arc_state.clone(), term).await;
-            let sleep_ms = add_jitter(timeouts_ms) as u64;
-            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            sleep(Duration::from_millis(add_jitter(timeouts_ms))).await;
         }
     }
 
@@ -712,10 +707,12 @@ impl RaftState {
             && self.listeners.first().unwrap().index <= self.committed
         {
             let next = self.listeners.pop_first().expect("get first");
-            if !self.log.is_index_compacted(next.index) {
+            let index = next.index;
+            if !self.log.is_index_compacted(index) {
                 next.sender
-                    .send(self.log.id_at(next.index))
-                    .expect("receiver dropped early!");
+                    .send(self.log.id_at(index))
+                    .map_err(|_| warn!("Listener for commit {} no longer listening", index))
+                    .ok();
             } else {
                 // Do nothing, we just let the sender go out of scope, which will notify the
                 // receiver of the cancellation
@@ -885,8 +882,8 @@ impl Raft for RaftImpl {
         let me = state.address.clone();
         let timeout_ms = state.config.follower_timeout_ms;
 
-        let d = tokio::time::Duration::from_millis(add_jitter(timeout_ms) as u64);
-        let handle = tokio::time::sleep(d).map(move |_| {
+        let d = tokio::time::Duration::from_millis(add_jitter(timeout_ms));
+        let handle = sleep(d).map(move |_| {
             let arc_state = arc_state.clone();
             let me = me.clone();
             tokio::spawn(async move {
@@ -1066,10 +1063,10 @@ impl Raft for RaftImpl {
 }
 
 // Returns a value no lower than the supplied bound, with some additive jitter.
-fn add_jitter(lower: i64) -> i64 {
+fn add_jitter(lower: i64) -> u64 {
     let mut rng = rand::thread_rng();
     let upper = (lower as f64 * 1.3) as i64;
-    rng.gen_range(lower, upper)
+    rng.gen_range(lower, upper) as u64
 }
 
 fn address_key(address: &Server) -> String {
