@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use async_std::sync::Mutex;
-use async_std::task;
 use async_trait::async_trait;
 use log::debug;
 use tonic::transport::{Channel, Error};
