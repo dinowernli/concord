@@ -1,9 +1,11 @@
-use crate::raft::raft_proto;
+use std::collections::{BTreeMap, HashMap};
 
 use async_std::sync::{Arc, Mutex};
 use log::info;
+
 use raft_proto::Server;
-use std::collections::{BTreeMap, HashMap};
+
+use crate::raft::raft_proto;
 
 // Holds information about the execution of a cluster over time. Can be used
 // to perform various integrity checks based on the recorded data. For

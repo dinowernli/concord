@@ -1,17 +1,19 @@
 extern crate bytes;
 extern crate im;
 
-use crate::keyvalue::keyvalue_proto;
-use crate::raft::{StateMachine, StateMachineResult};
+use std::collections::VecDeque;
 
 use bytes::Bytes;
 use im::HashMap;
 use prost::Message;
-use std::collections::VecDeque;
+
+use keyvalue_proto::{Entry, Operation, Snapshot};
+
+use crate::keyvalue::keyvalue_proto;
+use crate::keyvalue::keyvalue_proto::operation::Op::Set;
+use crate::raft::{StateMachine, StateMachineResult};
 
 use self::bytes::Buf;
-use crate::keyvalue::keyvalue_proto::operation::Op::Set;
-use keyvalue_proto::{Entry, Operation, Snapshot};
 
 #[derive(Debug, Clone)]
 pub struct StoreError {
@@ -224,8 +226,9 @@ fn create_deque<T>(item: T) -> VecDeque<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use keyvalue_proto::SetOperation;
+
+    use super::*;
 
     fn make_set_op(k: &Bytes, v: &Bytes) -> Operation {
         Operation {

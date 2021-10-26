@@ -1,19 +1,18 @@
 use async_std::sync::{Arc, Mutex};
-
 use bytes::Bytes;
 use log::{debug, info, warn};
+use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::keyvalue::keyvalue_proto::operation::Op;
+use crate::keyvalue::{keyvalue_proto, MapStore, Store};
 use crate::keyvalue::keyvalue_proto::{
     Entry, GetRequest, GetResponse, Operation, PutRequest, PutResponse, SetOperation,
 };
-use crate::keyvalue::{keyvalue_proto, MapStore, Store};
+use crate::keyvalue::keyvalue_proto::operation::Op;
 use crate::keyvalue_proto::key_value_server::KeyValue;
+use crate::raft::{Client, new_client, StateMachine};
 use crate::raft::raft_proto::Server;
-use crate::raft::{new_client, Client, StateMachine};
 use crate::testing::TestServer;
-use prost::Message;
 
 // This allows us to combine two non-auto traits into one.
 trait StoreStateMachine: Store + StateMachine {}
@@ -126,10 +125,11 @@ impl KeyValue for KeyValueService {
 
 #[cfg(test)]
 mod tests {
+    use tonic::transport::Channel;
+
     use crate::keyvalue::keyvalue_proto::key_value_client::KeyValueClient;
     use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
     use crate::raft::raft_proto::EntryId;
-    use tonic::transport::Channel;
 
     use super::*;
 

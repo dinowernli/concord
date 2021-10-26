@@ -1,6 +1,6 @@
-use crate::raft::raft_proto;
-
 use raft_proto::{Entry, EntryId};
+
+use crate::raft::raft_proto;
 
 // Represents a contiguous slice of a raft log.
 pub struct LogSlice {

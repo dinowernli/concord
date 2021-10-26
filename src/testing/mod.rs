@@ -1,2 +1,3 @@
-mod server;
 pub use server::TestServer;
+
+mod server;

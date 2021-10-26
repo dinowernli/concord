@@ -2,10 +2,6 @@
 #![feature(map_first_last)]
 #![feature(trait_upcasting)]
 
-mod keyvalue;
-mod raft;
-mod testing;
-
 use std::error::Error;
 use std::time::Duration;
 
@@ -19,8 +15,8 @@ use prost::Message;
 
 use keyvalue::keyvalue_proto;
 use keyvalue_proto::Operation;
-use raft::raft_proto;
 use raft::{Config, Diagnostics, RaftImpl};
+use raft::raft_proto;
 use raft_proto::{EntryId, Server};
 
 use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
@@ -28,6 +24,10 @@ use crate::keyvalue::keyvalue_proto::operation::Op::Set;
 use crate::keyvalue::keyvalue_proto::SetOperation;
 use crate::keyvalue::KeyValueService;
 use crate::raft_proto::raft_server::RaftServer;
+
+mod keyvalue;
+mod raft;
+mod testing;
 
 fn make_set_operation(key: &[u8], value: &[u8]) -> Operation {
     Operation {

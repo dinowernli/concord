@@ -16,8 +16,8 @@ use futures::FutureExt;
 use log::{debug, error, info, warn};
 use rand::Rng;
 use tokio::task::JoinHandle;
-use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
+use tonic::transport::Channel;
 
 use diagnostics::ServerDiagnostics;
 use raft::log::{ContainsResult, LogSlice};
@@ -1090,12 +1090,12 @@ async fn make_raft_client(address: &Server) -> RaftClient<Channel> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::raft::raft_proto::raft_server::RaftServer;
-
     use crate::raft::StateMachineResult;
     use crate::raft_proto::Entry;
     use crate::testing::TestServer;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_initial_state() {
