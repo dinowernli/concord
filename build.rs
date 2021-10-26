@@ -7,11 +7,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let raft_gen_dir = "src/raft/generated";
     std::fs::create_dir_all(raft_gen_dir).expect("create-dir");
-
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .out_dir("src/raft/generated") // you can change the generated code's location
+        .out_dir(raft_gen_dir)
         .compile(&["src/raft/raft_proto.proto"], &["src/raft"])?;
 
     let keyvalue_gen_dir = "src/keyvalue/generated";
@@ -19,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .out_dir("src/keyvalue/generated") // you can change the generated code's location
+        .out_dir(keyvalue_gen_dir)
         .compile(&["src/keyvalue/keyvalue_proto.proto"], &["src/keyvalue"])?;
 
     Ok(())
