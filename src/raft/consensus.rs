@@ -207,15 +207,8 @@ impl RaftImpl {
             let others = state.get_others();
             for server in others {
                 let client = state.get_client(&server).await;
-
-                // TODO(dino): Turn into an async function/method
-                let closure = async move |req: VoteRequest| {
-                    let mut c = client;
-                    let mut request = Request::new(req);
-                    request.set_timeout(Duration::from_millis(100));
-                    c.vote(request).await
-                };
-                futures.push(closure(vote_request.clone()));
+                let fut = RaftState::request_vote(client, vote_request.clone());
+                futures.push(fut);
             }
         }
 
@@ -785,6 +778,16 @@ impl RaftState {
                 self.address, applied_index
             );
         }
+    }
+
+    // Requests a vote from another follower. Used to run leader elections.
+    async fn request_vote(
+        mut client: RaftClient<Channel>,
+        req: VoteRequest,
+    ) -> Result<Response<VoteResponse>, Status> {
+        let mut request = Request::new(req);
+        request.set_timeout(Duration::from_millis(100));
+        client.vote(request).await
     }
 }
 
