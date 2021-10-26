@@ -1,6 +1,6 @@
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
-use log::{debug, info, warn};
+use log::{debug, warn};
 use prost::Message;
 use tonic::{Request, Response, Status};
 
@@ -72,7 +72,10 @@ impl KeyValue for KeyValueService {
 
         let lookup = locked.get_at(&Bytes::from(key.to_vec()), version);
         if lookup.is_err() {
-            return Err(Status::out_of_range("Compacted"));
+            return Err(Status::out_of_range(format!(
+                "Version {} compacted",
+                version
+            )));
         }
 
         Ok(Response::new(GetResponse {
@@ -105,7 +108,7 @@ impl KeyValue for KeyValueService {
         let key_str = String::from_utf8_lossy(request.key.as_slice());
         match commit {
             Ok(id) => {
-                info!(
+                debug!(
                     "Committed put operation with raft index {} for key {}",
                     id.index, key_str
                 );
