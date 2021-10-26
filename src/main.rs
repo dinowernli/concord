@@ -15,8 +15,8 @@ use prost::Message;
 
 use keyvalue::keyvalue_proto;
 use keyvalue_proto::Operation;
-use raft::{Config, Diagnostics, RaftImpl};
 use raft::raft_proto;
+use raft::{Config, Diagnostics, RaftImpl};
 use raft_proto::{EntryId, Server};
 
 use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;

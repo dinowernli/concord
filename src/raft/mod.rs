@@ -8,7 +8,7 @@
 // The implementation in this module is based on the paper at:
 // https://raft.github.io/raft.pdf
 
-pub use client::{Client, new_client};
+pub use client::{new_client, Client};
 pub use consensus::{Config, RaftImpl};
 pub use diagnostics::Diagnostics;
 pub use state_machine::{StateMachine, StateMachineResult};

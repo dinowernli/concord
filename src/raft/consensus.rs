@@ -16,8 +16,8 @@ use futures::FutureExt;
 use log::{debug, error, info, warn};
 use rand::Rng;
 use tokio::task::JoinHandle;
-use tonic::{Request, Response, Status};
 use tonic::transport::Channel;
+use tonic::{Request, Response, Status};
 
 use diagnostics::ServerDiagnostics;
 use raft::log::{ContainsResult, LogSlice};
