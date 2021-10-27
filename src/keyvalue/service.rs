@@ -1,18 +1,15 @@
-use std::sync::{Arc, Mutex};
-
-use async_trait::async_trait;
-use bytes::Buf;
+use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
-use futures::executor;
-use grpc::{GrpcStatus, ServerHandlerContext, ServerRequestSingle, ServerResponseUnarySink};
-use log::{debug, info, warn};
-use protobuf::Message;
+use log::{debug, warn};
+use prost::Message;
+use tonic::{Request, Response, Status};
 
+use crate::keyvalue::keyvalue_proto::operation::Op;
 use crate::keyvalue::keyvalue_proto::{
-    Entry, GetRequest, GetResponse, Operation, PutRequest, PutResponse,
+    Entry, GetRequest, GetResponse, Operation, PutRequest, PutResponse, SetOperation,
 };
-use crate::keyvalue::keyvalue_proto_grpc::KeyValue;
 use crate::keyvalue::{keyvalue_proto, MapStore, Store};
+use crate::keyvalue_proto::key_value_server::KeyValue;
 use crate::raft::raft_proto::Server;
 use crate::raft::{new_client, Client, StateMachine};
 
@@ -45,107 +42,97 @@ impl KeyValueService {
     }
 
     fn make_set_operation(key: &[u8], value: &[u8]) -> Operation {
-        let mut entry = keyvalue_proto::Entry::new();
-        entry.set_key(key.to_vec());
-        entry.set_value(value.to_vec());
-
-        let mut op = keyvalue_proto::SetOperation::new();
-        op.set_entry(entry);
-
-        let mut result = Operation::new();
-        result.set_set(op);
-        result
+        Operation {
+            op: Some(Op::Set(SetOperation {
+                entry: Some(keyvalue_proto::Entry {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                }),
+            })),
+        }
     }
 }
 
+#[tonic::async_trait]
 impl KeyValue for KeyValueService {
-    fn get(
-        &self,
-        _: ServerHandlerContext,
-        request: ServerRequestSingle<GetRequest>,
-        response: ServerResponseUnarySink<GetResponse>,
-    ) -> grpc::Result<()> {
+    async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         debug!("[{:?}] Handling GET request", &self.address);
-        if request.message.get_key().is_empty() {
-            return response.send_grpc_error(GrpcStatus::Argument, "Empty key".to_string());
+        let request = request.into_inner();
+        if request.key.is_empty() {
+            return Err(Status::invalid_argument("Empty key"));
         }
-        let key = request.message.get_key().to_bytes();
+        let key = request.key.to_vec();
 
-        let locked = self.store.lock().unwrap();
-        let version = if request.message.version <= 0 {
+        let locked = self.store.lock().await;
+        let version = if request.version <= 0 {
             locked.latest_version()
         } else {
-            request.message.version
+            request.version
         };
 
-        let lookup = locked.get_at(&key, version);
+        let lookup = locked.get_at(&Bytes::from(key.to_vec()), version);
         if lookup.is_err() {
-            return response.send_grpc_error(GrpcStatus::OutOfRange, "Compacted".to_string());
+            return Err(Status::out_of_range(format!(
+                "Version {} compacted",
+                version
+            )));
         }
 
-        let mut result = GetResponse::new();
-        result.set_version(version);
-        match lookup.unwrap() {
-            None => (),
-            Some(value) => {
-                let mut entry = Entry::new();
-                entry.set_key(key.to_vec());
-                entry.set_value(value.to_vec());
-                result.set_entry(entry);
-            }
-        }
-        response.finish(result)
+        Ok(Response::new(GetResponse {
+            version,
+            entry: match lookup.unwrap() {
+                None => None,
+                Some(value) => Some(Entry {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                }),
+            },
+        }))
     }
 
-    fn put(
-        &self,
-        _: ServerHandlerContext,
-        request_single: ServerRequestSingle<PutRequest>,
-        response: ServerResponseUnarySink<PutResponse>,
-    ) -> grpc::Result<()> {
+    async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         debug!("[{:?}] Handling PUT request", &self.address);
-        let request = request_single.message;
-        if request.get_key().is_empty() {
-            return response.send_grpc_error(GrpcStatus::Argument, "Empty key".to_string());
+        let request = request.into_inner();
+        if request.key.is_empty() {
+            return Err(Status::invalid_argument("Empty key"));
         }
-        if request.get_value().is_empty() {
-            return response.send_grpc_error(GrpcStatus::Argument, "Empty value".to_string());
+        if request.value.is_empty() {
+            return Err(Status::invalid_argument("Empty value"));
         }
 
-        let op = KeyValueService::make_set_operation(&request.get_key(), &request.get_value());
-        let serialized = Bytes::from(op.write_to_bytes().expect("serialization"));
+        let op =
+            KeyValueService::make_set_operation(&request.key.to_vec(), &request.value.to_vec());
+        let serialized = op.encode_to_vec();
 
-        // TODO(dino): Use await once this GRPC implementation can become async.
-        let commit = executor::block_on(self.raft.commit(&serialized));
-        return match commit {
+        let commit = self.raft.commit(&serialized).await;
+        let key_str = String::from_utf8_lossy(request.key.as_slice());
+        match commit {
             Ok(id) => {
-                let key_str = String::from_utf8_lossy(request.get_key());
-                info!(
+                debug!(
                     "Committed put operation with raft index {} for key {}",
-                    id.get_index(),
-                    key_str
+                    id.index, key_str
                 );
-                response.finish(PutResponse::new())
+                Ok(Response::new(PutResponse {}))
             }
             Err(message) => {
-                let key_str = String::from_utf8_lossy(request.get_key());
                 warn!(
                     "Failed to commit put operation for key: {}, message: {}",
                     key_str, message
                 );
-                response
-                    .send_grpc_error(GrpcStatus::Internal, "Failed to commit to Raft".to_string())
+                Err(Status::internal(format!("Failed to commit: {}", message)))
             }
-        };
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use grpc::{ClientStubExt, Error};
+    use tonic::transport::Channel;
 
-    use crate::keyvalue::keyvalue_proto_grpc::{KeyValueClient, KeyValueServer};
+    use crate::keyvalue::keyvalue_proto::key_value_client::KeyValueClient;
+    use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
     use crate::raft::raft_proto::EntryId;
+    use crate::testing::TestServer;
 
     use super::*;
 
@@ -155,68 +142,71 @@ mod tests {
         store: Arc<Mutex<MapStore>>,
     }
 
-    #[async_trait]
+    #[tonic::async_trait]
     impl Client for FakeRaftClient {
-        async fn commit(&self, payload: &[u8]) -> Result<EntryId, Error> {
-            let copy = payload.clone().to_bytes();
+        async fn commit(&self, payload: &[u8]) -> Result<EntryId, Status> {
+            let copy = payload.to_vec();
             self.store
                 .lock()
-                .unwrap()
-                .apply(&copy)
+                .await
+                .apply(&Bytes::from(copy))
                 .expect("bad payload");
-            Ok(EntryId::new())
+            Ok(EntryId { term: 0, index: 0 })
         }
 
-        async fn preempt_leader(&self) -> Result<Server, Error> {
+        async fn preempt_leader(&self) -> Result<Server, Status> {
             unimplemented!();
         }
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_get() {
         let service = create_service();
         let store = service.store.clone();
-        let server = create_grpc_server(service);
+        let server = TestServer::run(KeyValueServer::new(service)).await;
 
         store
             .lock()
-            .unwrap()
+            .await
             .set(Bytes::from("foo"), Bytes::from("bar"));
 
-        let mut request = GetRequest::new();
-        request.set_key(String::from("foo").into_bytes());
-
-        let response = create_grpc_client(&server)
-            .get(grpc::RequestOptions::new(), request.clone())
-            .drop_metadata()
+        let request = GetRequest {
+            key: "foo".as_bytes().to_vec(),
+            version: -1,
+        };
+        let response = create_grpc_client(server.port().unwrap() as i32)
             .await
-            .expect("response");
+            .get(Request::new(request.clone()))
+            .await
+            .expect("response")
+            .into_inner();
 
-        assert!(response.has_entry());
-        let entry = response.get_entry().clone();
-        assert_eq!(Bytes::from("foo").as_ref(), entry.get_key());
-        assert_eq!(Bytes::from("bar").as_ref(), entry.get_value());
+        assert!(response.entry.is_some());
+        let entry = response.entry.clone().expect("entry");
+        assert_eq!(Bytes::from("foo").as_ref(), entry.key);
+        assert_eq!(Bytes::from("bar").as_ref(), entry.value);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_put() {
         let service = create_service();
         let store = service.store.clone();
-        let server = create_grpc_server(service);
+        let server = TestServer::run(KeyValueServer::new(service)).await;
 
-        let mut request = PutRequest::new();
-        request.set_key(String::from("foo").into_bytes());
-        request.set_value(String::from("bar").into_bytes());
+        let request = PutRequest {
+            key: "foo".as_bytes().to_vec(),
+            value: "bar".as_bytes().to_vec(),
+        };
 
-        create_grpc_client(&server)
-            .put(grpc::RequestOptions::new(), request.clone())
-            .drop_metadata()
+        create_grpc_client(server.port().unwrap() as i32)
+            .await
+            .put(Request::new(request.clone()))
             .await
             .expect("response");
 
         let value = store
             .lock()
-            .unwrap()
+            .await
             .get(&Bytes::from("foo"))
             .expect("present");
         assert_eq!(Bytes::from("bar"), value);
@@ -234,23 +224,16 @@ mod tests {
         }
     }
 
-    fn create_grpc_server(service: KeyValueService) -> grpc::Server {
-        let mut server_builder = grpc::ServerBuilder::new_plain();
-        server_builder.add_service(KeyValueServer::new_service_def(service));
-        server_builder.http.set_addr(("0.0.0.0", 0)).unwrap();
-        server_builder.build().expect("server")
-    }
-
-    fn create_grpc_client(server: &grpc::Server) -> KeyValueClient {
-        let client_conf = Default::default();
-        let port = server.local_addr().port().expect("port");
-        KeyValueClient::new_plain("0.0.0.0", port, client_conf).expect("client")
+    async fn create_grpc_client(port: i32) -> KeyValueClient<Channel> {
+        KeyValueClient::connect(format!("http://[::1]:{}", port))
+            .await
+            .expect("client")
     }
 
     fn make_server(host: &str, port: i32) -> Server {
-        let mut result = Server::new();
-        result.set_host(host.to_string());
-        result.set_port(port);
-        result
+        Server {
+            host: host.to_string(),
+            port,
+        }
     }
 }

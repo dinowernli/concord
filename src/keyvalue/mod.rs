@@ -8,19 +8,16 @@
 // StateMachine with a Raft consensus cluster (as provided by the raft module)
 // and expose the result as a service.
 
+pub use service::KeyValueService;
+pub use store::MapStore;
+pub use store::Store;
+
 #[path = "generated/keyvalue_proto.rs"]
 pub mod keyvalue_proto;
 // TODO(dinow): switch "main.rs" from using the (internal) "Operation" directly
 // and only expose the Request/Response types here rather than the entire module.
 // This amounts to removing "pub" here and adding more targeted "pub use" directives.
 
-#[path = "generated/keyvalue_proto_grpc.rs"]
-pub mod keyvalue_proto_grpc;
-
 // TODO(dinow): stop exposing these and make the "store" types an implementation detail.
-mod store;
-pub use store::MapStore;
-pub use store::Store;
-
 mod service;
-pub use service::KeyValueService;
+mod store;

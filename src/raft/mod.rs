@@ -8,22 +8,17 @@
 // The implementation in this module is based on the paper at:
 // https://raft.github.io/raft.pdf
 
+pub use client::{new_client, Client};
+pub use consensus::{Config, RaftImpl};
+pub use diagnostics::Diagnostics;
+pub use state_machine::{StateMachine, StateMachineResult};
+
 #[path = "generated/raft_proto.rs"]
 pub mod raft_proto;
-
-#[path = "generated/raft_proto_grpc.rs"]
-pub mod raft_proto_grpc;
 
 mod log;
 
 mod client;
-pub use client::{new_client, Client};
-
 mod consensus;
-pub use consensus::{Config, RaftImpl};
-
 mod diagnostics;
-pub use diagnostics::Diagnostics;
-
 mod state_machine;
-pub use state_machine::{StateMachine, StateMachineResult};

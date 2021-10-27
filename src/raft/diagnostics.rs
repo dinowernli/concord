@@ -1,9 +1,11 @@
-use crate::raft::raft_proto;
-
-use log::info;
-use raft_proto::Server;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+
+use async_std::sync::{Arc, Mutex};
+use log::info;
+
+use raft_proto::Server;
+
+use crate::raft::raft_proto;
 
 // Holds information about the execution of a cluster over time. Can be used
 // to perform various integrity checks based on the recorded data. For
@@ -36,8 +38,8 @@ impl Diagnostics {
 
     // Performs a set of a sequence of checks on the data recorded by the
     // individual servers. Returns an error if any of the checks fail.
-    pub fn validate(&mut self) -> Result<(), String> {
-        self.validate_leaders()?;
+    pub async fn validate(&mut self) -> Result<(), String> {
+        self.validate_leaders().await?;
 
         // TODO(dino): Also collect (term, index, fprint) triples and validate.
 
@@ -48,7 +50,7 @@ impl Diagnostics {
     // compatible view of who was the leader for every term. Specifically,
     // there should be no term for which two servers recognize different peers
     // as the leader of the cluster.
-    fn validate_leaders(&mut self) -> Result<(), String> {
+    async fn validate_leaders(&mut self) -> Result<(), String> {
         let latest = match self.leaders.last_entry() {
             Some(e) => *e.key(),
             None => -1,
@@ -60,7 +62,7 @@ impl Diagnostics {
 
             let mut candidate: Option<Server> = None;
             for (_, server) in &self.servers {
-                let s = server.lock().unwrap();
+                let s = server.lock().await;
                 if s.latest_term().unwrap_or(-1) < term {
                     // This server hasn't seen a leader for this term yet. Stop.
                     return Ok(());
@@ -121,7 +123,7 @@ impl ServerDiagnostics {
 }
 
 fn address_key(address: &Server) -> String {
-    format!("{}:{}", address.get_host(), address.get_port())
+    format!("{}:{}", address.host, address.port)
 }
 
 #[cfg(test)]
@@ -146,73 +148,73 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[should_panic]
-    fn test_catch_inconsistent_single_server() {
+    async fn test_catch_inconsistent_single_server() {
         let mut f = Fixture::new();
 
         let d1 = f.diag.get_server(&f.s1);
-        d1.lock().unwrap().report_leader(1, &f.s1);
-        d1.lock().unwrap().report_leader(1, &f.s2);
+        d1.lock().await.report_leader(1, &f.s1);
+        d1.lock().await.report_leader(1, &f.s2);
     }
 
-    #[test]
-    fn test_validate_happy() {
-        let mut f = Fixture::new();
-
-        let d1 = f.diag.get_server(&f.s1);
-        let d2 = f.diag.get_server(&f.s2);
-
-        d1.lock().unwrap().report_leader(2, &f.s1);
-        d2.lock().unwrap().report_leader(2, &f.s1);
-
-        f.diag.validate().expect("validation should succeed");
-    }
-
-    #[test]
-    fn test_validate_failure() {
+    #[tokio::test]
+    async fn test_validate_happy() {
         let mut f = Fixture::new();
 
         let d1 = f.diag.get_server(&f.s1);
         let d2 = f.diag.get_server(&f.s2);
-        let d3 = f.diag.get_server(&f.s3);
 
-        d1.lock().unwrap().report_leader(1, &f.s1);
-        d2.lock().unwrap().report_leader(1, &f.s1);
-        d3.lock().unwrap().report_leader(1, &f.s1);
+        d1.lock().await.report_leader(2, &f.s1);
+        d2.lock().await.report_leader(2, &f.s1);
 
-        d1.lock().unwrap().report_leader(2, &f.s2);
-        d2.lock().unwrap().report_leader(2, &f.s2);
-        d3.lock().unwrap().report_leader(2, &f.s3);
-
-        assert!(f.diag.validate().is_err());
+        f.diag.validate().await.expect("validation should succeed");
     }
 
-    #[test]
-    fn test_validate_skips_gaps() {
+    #[tokio::test]
+    async fn test_validate_failure() {
         let mut f = Fixture::new();
 
         let d1 = f.diag.get_server(&f.s1);
         let d2 = f.diag.get_server(&f.s2);
         let d3 = f.diag.get_server(&f.s3);
 
-        d1.lock().unwrap().report_leader(1, &f.s1);
-        d2.lock().unwrap().report_leader(1, &f.s1);
-        d3.lock().unwrap().report_leader(1, &f.s1);
+        d1.lock().await.report_leader(1, &f.s1);
+        d2.lock().await.report_leader(1, &f.s1);
+        d3.lock().await.report_leader(1, &f.s1);
+
+        d1.lock().await.report_leader(2, &f.s2);
+        d2.lock().await.report_leader(2, &f.s2);
+        d3.lock().await.report_leader(2, &f.s3);
+
+        assert!(f.diag.validate().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_skips_gaps() {
+        let mut f = Fixture::new();
+
+        let d1 = f.diag.get_server(&f.s1);
+        let d2 = f.diag.get_server(&f.s2);
+        let d3 = f.diag.get_server(&f.s3);
+
+        d1.lock().await.report_leader(1, &f.s1);
+        d2.lock().await.report_leader(1, &f.s1);
+        d3.lock().await.report_leader(1, &f.s1);
 
         // Whole bunch of missing terms, then a conflict.
 
-        d1.lock().unwrap().report_leader(6, &f.s2);
-        d2.lock().unwrap().report_leader(6, &f.s2);
-        d3.lock().unwrap().report_leader(6, &f.s3);
+        d1.lock().await.report_leader(6, &f.s2);
+        d2.lock().await.report_leader(6, &f.s2);
+        d3.lock().await.report_leader(6, &f.s3);
 
-        assert!(f.diag.validate().is_err());
+        assert!(f.diag.validate().await.is_err());
     }
 
     fn make_server(host: &str, port: i16) -> Server {
-        let mut result = Server::new();
-        result.set_host(host.to_string());
-        result.set_port(port as i32);
-        return result;
+        Server {
+            host: host.to_string(),
+            port: port as i32,
+        }
     }
 }

@@ -1,17 +1,19 @@
 extern crate bytes;
 extern crate im;
-extern crate protobuf;
 
-use crate::keyvalue::keyvalue_proto;
-use crate::raft::{StateMachine, StateMachineResult};
+use std::collections::VecDeque;
 
 use bytes::Bytes;
 use im::HashMap;
-use std::collections::VecDeque;
+use prost::Message;
+
+use keyvalue_proto::{Entry, Operation, Snapshot};
+
+use crate::keyvalue::keyvalue_proto;
+use crate::keyvalue::keyvalue_proto::operation::Op::Set;
+use crate::raft::{StateMachine, StateMachineResult};
 
 use self::bytes::Buf;
-use self::protobuf::Message;
-use keyvalue_proto::{Entry, Operation, Snapshot};
 
 #[derive(Debug, Clone)]
 pub struct StoreError {
@@ -76,17 +78,17 @@ impl MapStore {
     }
 
     fn apply_operation(&mut self, operation: Operation) -> Result<(), StoreError> {
-        if operation.has_set() {
-            let set_op = operation.get_set();
-            if !set_op.has_entry() {
-                return Err(StoreError::new("No entry present in 'set' operation"));
+        match operation.op {
+            Some(Set(set)) => {
+                if !set.entry.is_some() {
+                    return Err(StoreError::new("No entry present in 'set' operation"));
+                }
+                let entry = set.entry.unwrap();
+                self.set(Bytes::from(entry.key), Bytes::from(entry.value));
+                Ok(())
             }
-
-            let entry = set_op.get_entry();
-            self.set(entry.get_key().to_bytes(), entry.get_value().to_bytes());
-            return Ok(());
+            _ => Err(StoreError::new("Unrecognized operation type")),
         }
-        Err(StoreError::new("Unrecognized operation type"))
     }
 
     fn latest_data(&self) -> &HashMap<Bytes, Bytes> {
@@ -157,7 +159,7 @@ impl Store for MapStore {
 
 impl StateMachine for MapStore {
     fn apply(&mut self, payload: &Bytes) -> StateMachineResult {
-        let parsed = protobuf::parse_from_bytes(payload.bytes());
+        let parsed = Operation::decode(payload.bytes());
         if parsed.is_err() {
             return Err(format!(
                 "Failed to parse bytes: {:?}",
@@ -177,21 +179,23 @@ impl StateMachine for MapStore {
     // Returns a serialized snapshot proto containing all entries present in
     // the latest version of the store.
     fn create_snapshot(&self) -> Bytes {
-        let mut snapshot = Snapshot::new();
-        snapshot.set_version(self.latest_version());
+        let mut snapshot = Snapshot {
+            version: self.latest_version(),
+            entries: vec![],
+        };
         for (k, v) in self.latest_data() {
-            let mut entry = Entry::new();
-            entry.set_key(k.to_vec());
-            entry.set_value(v.to_vec());
-            snapshot.mut_entries().push(entry);
+            snapshot.entries.push(Entry {
+                key: k.to_vec(),
+                value: v.to_vec(),
+            });
         }
-        Bytes::from(snapshot.write_to_bytes().expect("serialization"))
+        Bytes::from(snapshot.encode_to_vec())
     }
 
     // Discards all versions present in the current store instance, replacing
     // them with the supplied version.
     fn load_snapshot(&mut self, snapshot: &Bytes) -> StateMachineResult {
-        let parsed = protobuf::parse_from_bytes(snapshot.bytes());
+        let parsed = Snapshot::decode(snapshot.bytes());
         if parsed.is_err() {
             return Err(format!(
                 "Failed to parse snapshot: {:?}",
@@ -202,12 +206,12 @@ impl StateMachine for MapStore {
         let contents: Snapshot = parsed.unwrap();
 
         let mut data: HashMap<Bytes, Bytes> = HashMap::new();
-        for entry in contents.get_entries() {
-            data.insert(entry.get_key().to_bytes(), entry.get_value().to_bytes());
+        for entry in contents.entries {
+            data.insert(Bytes::from(entry.key), Bytes::from(entry.value));
         }
 
         self.versions = create_deque(MapVersion {
-            version: contents.get_version(),
+            version: contents.version,
             data,
         });
         Ok(())
@@ -222,23 +226,19 @@ fn create_deque<T>(item: T) -> VecDeque<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use keyvalue_proto::{Entry, SetOperation};
-    use protobuf::Message;
+    use keyvalue_proto::SetOperation;
 
-    fn make_entry(k: &Bytes, v: &Bytes) -> Entry {
-        let mut result = Entry::new();
-        result.set_key(k.to_vec());
-        result.set_value(v.to_vec());
-        result
-    }
+    use super::*;
 
     fn make_set_op(k: &Bytes, v: &Bytes) -> Operation {
-        let mut set_op = SetOperation::new();
-        set_op.set_entry(make_entry(k, v));
-        let mut op = Operation::new();
-        op.set_set(set_op);
-        op
+        Operation {
+            op: Some(Set(SetOperation {
+                entry: Some(keyvalue_proto::Entry {
+                    key: k.to_vec(),
+                    value: v.to_vec(),
+                }),
+            })),
+        }
     }
 
     #[test]
@@ -265,10 +265,10 @@ mod tests {
         let v = Bytes::from("some-value");
 
         let op = make_set_op(&k, &v);
-        let serialized = Bytes::from(op.write_to_bytes().expect("serialize"));
+        let serialized = op.encode_to_vec();
 
         assert!(store.get(&k).is_none());
-        store.apply(&serialized).expect("apply");
+        store.apply(&Bytes::from(serialized)).expect("apply");
         assert_eq!(v, store.get(&k).unwrap());
     }
 

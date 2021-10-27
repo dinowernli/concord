@@ -2,41 +2,42 @@
 #![feature(map_first_last)]
 #![feature(trait_upcasting)]
 
+use std::error::Error;
 use std::time::Duration;
 
+use async_std::sync::{Arc, Mutex};
 use async_std::task;
-use bytes::Bytes;
 use env_logger::Env;
-use futures::executor;
-use futures::future::join3;
+use futures::future::join4;
+use futures::future::join_all;
 use log::info;
-use protobuf::Message;
+use prost::Message;
 
 use keyvalue::keyvalue_proto;
 use keyvalue_proto::Operation;
 use raft::raft_proto;
-use raft::raft_proto_grpc;
 use raft::{Config, Diagnostics, RaftImpl};
 use raft_proto::{EntryId, Server};
-use raft_proto_grpc::RaftServer;
 
-use crate::keyvalue::keyvalue_proto_grpc::KeyValueServer;
+use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
+use crate::keyvalue::keyvalue_proto::operation::Op::Set;
+use crate::keyvalue::keyvalue_proto::SetOperation;
 use crate::keyvalue::KeyValueService;
+use crate::raft_proto::raft_server::RaftServer;
 
 mod keyvalue;
 mod raft;
+mod testing;
 
 fn make_set_operation(key: &[u8], value: &[u8]) -> Operation {
-    let mut entry = keyvalue_proto::Entry::new();
-    entry.set_key(key.to_vec());
-    entry.set_value(value.to_vec());
-
-    let mut op = keyvalue_proto::SetOperation::new();
-    op.set_entry(entry);
-
-    let mut result = Operation::new();
-    result.set_set(op);
-    result
+    Operation {
+        op: Some(Set(SetOperation {
+            entry: Some(keyvalue_proto::Entry {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            }),
+        })),
+    }
 }
 
 fn entry_id_key(entry_id: &EntryId) -> String {
@@ -44,19 +45,19 @@ fn entry_id_key(entry_id: &EntryId) -> String {
 }
 
 fn server(host: &str, port: i32) -> Server {
-    let mut result = Server::new();
-    result.set_host(host.to_string());
-    result.set_port(port);
-    return result;
+    Server {
+        host: host.into(),
+        port,
+    }
 }
 
-fn start_node(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagnostics) -> grpc::Server {
+async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<Diagnostics>>) {
     // A service used to serve the keyvalue store, backed by the
     // underlying Raft cluster.
     let keyvalue = KeyValueService::new(&address);
 
     // A service used by the Raft cluster.
-    let server_diagnostics = diagnostics.get_server(&address);
+    let server_diagnostics = diagnostics.lock().await.get_server(&address);
     let state_machine = keyvalue.raft_state_machine();
     let raft = RaftImpl::new(
         address,
@@ -65,13 +66,22 @@ fn start_node(address: &Server, all: &Vec<Server>, diagnostics: &mut Diagnostics
         Some(server_diagnostics),
         Config::default(),
     );
-    raft.start();
+    raft.start().await;
 
-    let mut server_builder = grpc::ServerBuilder::new_plain();
-    server_builder.add_service(RaftServer::new_service_def(raft));
-    server_builder.add_service(KeyValueServer::new_service_def(keyvalue));
-    server_builder.http.set_port(address.get_port() as u16);
-    server_builder.build().expect("server")
+    let serve = tonic::transport::Server::builder()
+        .add_service(RaftServer::new(raft))
+        .add_service(KeyValueServer::new(keyvalue))
+        .serve(
+            format!("[{}]:{}", address.host, address.port)
+                .parse()
+                .unwrap(),
+        )
+        .await;
+
+    match serve {
+        Ok(()) => info!("Serving terminated successfully"),
+        Err(message) => info!("Serving terminated unsuccessfully: {}", message),
+    }
 }
 
 // Starts a loop which provides a steady amount of commit traffic.
@@ -82,8 +92,7 @@ async fn run_commit_loop(cluster: &Vec<Server>) {
     loop {
         let payload_value = format!("Payload number: {}", sequence_number);
         let op = make_set_operation("payload".as_bytes(), payload_value.as_bytes());
-        let serialized = Bytes::from(op.write_to_bytes().expect("serialization"));
-
+        let serialized = op.encode_to_vec();
         match client.commit(&serialized).await {
             Ok(id) => {
                 info!(
@@ -118,14 +127,19 @@ async fn run_preempt_loop(cluster: &Vec<Server>) {
 // Starts a loop which periodically asks the diagnostics object to validate the
 // execution history of the cluster. If this fails, this indicates a bug in the
 // raft implementation.
-async fn run_validate_loop(diag: &mut Diagnostics) {
+async fn run_validate_loop(diag: Arc<Mutex<Diagnostics>>) {
     loop {
-        diag.validate().expect("Cluster execution validation");
+        diag.lock()
+            .await
+            .validate()
+            .await
+            .expect("Cluster execution validation");
         task::sleep(Duration::from_secs(5)).await;
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::from_env(Env::default().default_filter_or("concord=info")).init();
 
     let addresses = vec![
@@ -135,15 +149,21 @@ fn main() {
     ];
     info!("Starting {} servers", addresses.len());
 
-    let mut diag = Diagnostics::new();
-    let mut servers = Vec::<grpc::Server>::new();
+    let diag = Arc::new(Mutex::new(Diagnostics::new()));
+    let mut servers = Vec::new();
     for address in &addresses {
-        servers.push(start_node(&address, &addresses, &mut diag));
+        let running = run_server(&address, &addresses, diag.clone());
+        servers.push(running);
     }
 
-    executor::block_on(join3(
+    let serving = join_all(servers);
+    let all = join4(
+        serving,
         run_commit_loop(&addresses),
         run_preempt_loop(&addresses),
-        run_validate_loop(&mut diag),
-    ));
+        run_validate_loop(diag.clone()),
+    );
+
+    all.await;
+    Ok(())
 }
