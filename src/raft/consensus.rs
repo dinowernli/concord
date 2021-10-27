@@ -17,8 +17,8 @@ use log::{debug, error, info, warn};
 use rand::Rng;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tonic::transport::{Channel, Endpoint, Error};
 use tonic::{Request, Response, Status};
+use tonic::transport::{Channel, Endpoint, Error};
 
 use diagnostics::ServerDiagnostics;
 use raft::log::{ContainsResult, LogSlice};

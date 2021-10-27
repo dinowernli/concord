@@ -13,14 +13,13 @@ use log::{error, info};
 use rand::seq::SliceRandom;
 use tokio::time::sleep;
 
-use keyvalue::keyvalue_proto;
 use raft::raft_proto;
 use raft::{Config, Diagnostics, RaftImpl};
 use raft_proto::Server;
 
-use crate::keyvalue::keyvalue_proto::key_value_client::KeyValueClient;
-use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
-use crate::keyvalue::keyvalue_proto::PutRequest;
+use crate::keyvalue::grpc::KeyValueClient;
+use crate::keyvalue::grpc::KeyValueServer;
+use crate::keyvalue::grpc::PutRequest;
 use crate::keyvalue::KeyValueService;
 use crate::raft_proto::raft_server::RaftServer;
 

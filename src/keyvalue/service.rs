@@ -4,14 +4,15 @@ use log::{debug, warn};
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::keyvalue::keyvalue_proto::operation::Op;
+use crate::keyvalue::keyvalue_proto;
 use crate::keyvalue::keyvalue_proto::{
     Entry, GetRequest, GetResponse, Operation, PutRequest, PutResponse, SetOperation,
 };
-use crate::keyvalue::{keyvalue_proto, MapStore, Store};
-use crate::keyvalue_proto::key_value_server::KeyValue;
+use crate::keyvalue::keyvalue_proto::key_value_server::KeyValue;
+use crate::keyvalue::keyvalue_proto::operation::Op;
+use crate::keyvalue::store::{MapStore, Store};
+use crate::raft::{Client, new_client, StateMachine};
 use crate::raft::raft_proto::Server;
-use crate::raft::{new_client, Client, StateMachine};
 
 // This allows us to combine two non-auto traits into one.
 trait StoreStateMachine: Store + StateMachine {}
