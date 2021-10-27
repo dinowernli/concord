@@ -17,7 +17,7 @@ use log::{debug, error, info, warn};
 use rand::Rng;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tonic::transport::{Channel, Error};
+use tonic::transport::{Channel, Endpoint, Error};
 use tonic::{Request, Response, Status};
 
 use diagnostics::ServerDiagnostics;
@@ -116,7 +116,7 @@ impl RaftImpl {
 
                 address: server.clone(),
                 cluster: all.clone(),
-                clients: HashMap::new(),
+                channels: HashMap::new(),
                 last_known_leader: None,
 
                 diagnostics,
@@ -536,7 +536,7 @@ struct RaftState {
     // Cluster membership.
     address: Server,
     cluster: Vec<Server>,
-    clients: HashMap<String, Arc<RaftClient<Channel>>>,
+    channels: HashMap<String, Channel>,
     last_known_leader: Option<Server>,
 
     // If present, this instance will inform the diagnostics object of relevant
@@ -547,18 +547,19 @@ struct RaftState {
 impl RaftState {
     // Returns an rpc client which can be used to contact the supplied peer.
     async fn get_client(&mut self, address: &Server) -> Result<RaftClient<Channel>, Error> {
-        // TODO(dino): According to the Channel docs, it seems like the right thing is to
-        // store an instance of Channel, and keep cloning it (which is cheap) and creating
-        // new client objects.
-        //
-        // Either way, we end up with a single-use client instance every time.
-        make_raft_client(&address).await
+        let key = address_key(address);
+        let cached = self.channels.get_mut(&key);
+        if let Some(channel) = cached {
+            // The "clone()" operation on channels is advertized as cheap and is the
+            // recommended way to reuse channels.
+            return Ok(RaftClient::new(channel.clone()));
+        }
 
-        // let key = address_key(address);
-        // self.clients
-        //     .entry(key)
-        //     .or_insert_with(|| make_raft_client(&address))
-        //     .clone()
+        // Cache miss, create a new channel.
+        let dst = format!("http://[::1]:{}", address.port);
+        let channel = Endpoint::new(dst)?.connect().await?;
+        self.channels.insert(key, channel.clone());
+        Ok(RaftClient::new(channel))
     }
 
     // Returns the peers in the cluster (ourself excluded).
@@ -1100,10 +1101,6 @@ fn address_key(address: &Server) -> String {
 
 fn entry_id_key(entry_id: &EntryId) -> String {
     format!("(term={},id={})", entry_id.term, entry_id.index)
-}
-
-async fn make_raft_client(address: &Server) -> Result<RaftClient<Channel>, Error> {
-    RaftClient::connect(format!("http://[::1]:{}", address.port)).await
 }
 
 #[cfg(test)]
