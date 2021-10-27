@@ -22,7 +22,7 @@ pub fn new_client(address: &Server, member: &Server) -> Box<dyn Client + Sync + 
     Box::new(ClientImpl {
         address: address.clone(),
         leader: Mutex::new(member.clone()),
-        max_leader_follow_attempts: 3,
+        max_leader_follow_attempts: 10,
     })
 }
 
@@ -106,7 +106,7 @@ impl Client for ClientImpl {
                     )))
                 }
             }
-            sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(300)).await;
         }
         Err(tonic::Status::internal(format!(
             "Failed to contact leader after {} attempts",
@@ -144,7 +144,7 @@ impl Client for ClientImpl {
                     )))
                 }
             }
-            sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(300)).await;
         }
         Err(tonic::Status::internal(format!(
             "Failed to contact leader after {} attempts",

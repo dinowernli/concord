@@ -1,23 +1,16 @@
-// This module provides an implementation of a Raft StateMachine whose payloads
-// are updates to a simple versioned map from bytes to bytes (called a Store).
-//
-// This module contains a pure data structure and has no concept of service,
-// networking, cluster, etc.
-//
-// Users of this module are expected to combine this implementation of
-// StateMachine with a Raft consensus cluster (as provided by the raft module)
-// and expose the result as a service.
+// This module provides a keyvalue store grpc service which is backed by a raft
+// cluster. Users of this module are expected to run the service in their grpc
+// server and/or use the generated grpc client code to make requests.
 
 pub use service::KeyValueService;
-pub use store::MapStore;
-pub use store::Store;
+
+pub mod grpc {
+    pub use crate::keyvalue::keyvalue_proto::key_value_client::KeyValueClient;
+    pub use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
+    pub use crate::keyvalue::keyvalue_proto::{GetRequest, GetResponse, PutRequest, PutResponse};
+}
 
 #[path = "generated/keyvalue_proto.rs"]
-pub mod keyvalue_proto;
-// TODO(dinow): switch "main.rs" from using the (internal) "Operation" directly
-// and only expose the Request/Response types here rather than the entire module.
-// This amounts to removing "pub" here and adding more targeted "pub use" directives.
-
-// TODO(dinow): stop exposing these and make the "store" types an implementation detail.
-mod service;
-mod store;
+pub(in crate::keyvalue) mod keyvalue_proto;
+pub(in crate::keyvalue) mod service;
+pub(in crate::keyvalue) mod store;

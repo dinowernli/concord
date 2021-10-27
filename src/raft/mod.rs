@@ -16,9 +16,8 @@ pub use state_machine::{StateMachine, StateMachineResult};
 #[path = "generated/raft_proto.rs"]
 pub mod raft_proto;
 
-mod log;
-
 mod client;
 mod consensus;
 mod diagnostics;
+mod log;
 mod state_machine;
