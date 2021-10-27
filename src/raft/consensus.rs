@@ -11,13 +11,13 @@ use std::time::Duration;
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::channel::oneshot::{channel, Receiver, Sender};
-use futures::future::join_all;
+use futures::future::{err, join_all};
 use futures::FutureExt;
 use log::{debug, error, info, warn};
 use rand::Rng;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Error};
 use tonic::{Request, Response, Status};
 
 use diagnostics::ServerDiagnostics;
@@ -186,7 +186,9 @@ impl RaftImpl {
     // Returns whether or not the election process is deemed complete. If complete,
     // there is no need to run any further elections.
     async fn run_election(arc_state: Arc<Mutex<RaftState>>, term: i64) -> bool {
-        let mut futures = Vec::new();
+        type Res = Result<Response<VoteResponse>, Status>;
+        type Fut = Pin<Box<dyn Future<Output = Res> + Send>>;
+        let mut futures = Vec::<Fut>::new();
         {
             let mut state = arc_state.lock().await;
 
@@ -203,12 +205,20 @@ impl RaftImpl {
             state.voted_for = Some(state.address.clone());
 
             // Request votes from all peer.
-            let vote_request = state.create_vote_request();
+            let request = state.create_vote_request();
             let others = state.get_others();
             for server in others {
-                let client = state.get_client(&server).await;
-                let fut = RaftState::request_vote(client, vote_request.clone());
-                futures.push(fut);
+                match state.get_client(&server).await {
+                    Ok(client) => {
+                        futures.push(Box::pin(RaftState::request_vote(client, request.clone())));
+                    }
+                    Err(msg) => {
+                        futures.push(Box::pin(err(Status::unavailable(format!(
+                            "Unable to connect to {:?} : {}",
+                            &server, msg
+                        )))));
+                    }
+                }
             }
         }
 
@@ -292,7 +302,7 @@ impl RaftImpl {
     // any entries they don't have.
     async fn replicate_entries(arc_state: Arc<Mutex<RaftState>>, term: i64) {
         // This needs to be marked as "Send" because it's being sent across await points.
-        let mut results = Vec::<Pin<Box<dyn Future<Output = ()> + Send>>>::new();
+        let mut results = Vec::<Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>>::new();
         {
             let mut state = arc_state.lock().await;
             debug!("[{:?}] Replicating entries", &state.address);
@@ -301,28 +311,40 @@ impl RaftImpl {
                 // Figure out which entry the follower is expecting next and decide whether to
                 // send an append request (if we have the entries) or to fast-forward the follower
                 // by installing a snapshot (if that entry has been compacted away in our log).
-                let position = state
+                let next_index = state
                     .followers
                     .get(address_key(&follower).as_str())
-                    .unwrap();
-                if state.log.is_index_compacted(position.next_index) {
+                    .unwrap()
+                    .next_index;
+
+                let client = state.get_client(&follower).await;
+                if let Err(msg) = &client {
+                    results.push(Box::pin(err(Status::unavailable(format!(
+                        "Unable to connect to {:?} : {}",
+                        &follower, msg
+                    )))));
+                    continue;
+                }
+
+                let client = client.unwrap();
+                if state.log.is_index_compacted(next_index) {
                     let request = state.create_snapshot_request();
                     let fut = RaftImpl::replicate_snapshot(
-                        state.get_client(&follower).await,
+                        client,
                         arc_state.clone(),
                         follower.clone(),
                         request.clone(),
                     );
-                    results.push(Box::pin(fut));
+                    results.push(Box::pin(fut.map(|_| Ok(()))));
                 } else {
-                    let request = state.create_append_request(position.next_index);
+                    let request = state.create_append_request(next_index);
                     let fut = RaftImpl::replicate_append(
-                        state.get_client(&follower).await,
+                        client,
                         arc_state.clone(),
                         follower.clone(),
                         request.clone(),
                     );
-                    results.push(Box::pin(fut));
+                    results.push(Box::pin(fut.map(|_| Ok(()))));
                 }
             }
         }
@@ -468,6 +490,9 @@ impl Ord for CommitListener {
     }
 }
 
+// Holds on to the handle of a timed operation and cancels it upon destruction.
+// This allows callers to just replace the guard in order to refresh a timer,
+// ensuring that there is only one timer active at any given time.
 struct TimerGuard {
     handle: JoinHandle<()>,
 }
@@ -521,7 +546,7 @@ struct RaftState {
 
 impl RaftState {
     // Returns an rpc client which can be used to contact the supplied peer.
-    async fn get_client(&mut self, address: &Server) -> RaftClient<Channel> {
+    async fn get_client(&mut self, address: &Server) -> Result<RaftClient<Channel>, Error> {
         // TODO(dino): According to the Channel docs, it seems like the right thing is to
         // store an instance of Channel, and keep cloning it (which is cheap) and creating
         // new client objects.
@@ -780,7 +805,7 @@ impl RaftState {
         }
     }
 
-    // Requests a vote from another follower. Used to run leader elections.
+    // Requests a vote from a follower. Used to run leader elections.
     async fn request_vote(
         mut client: RaftClient<Channel>,
         req: VoteRequest,
@@ -885,17 +910,14 @@ impl Raft for RaftImpl {
         let me = state.address.clone();
         let timeout_ms = state.config.follower_timeout_ms;
 
-        let d = tokio::time::Duration::from_millis(add_jitter(timeout_ms));
-        let handle = sleep(d).map(move |_| {
-            let arc_state = arc_state.clone();
-            let me = me.clone();
+        let task = sleep(Duration::from_millis(add_jitter(timeout_ms))).then(async move |_| {
             tokio::spawn(async move {
-                info!("[{:?}] Timed out waiting for leader heartbeat", &me);
+                info!("[{:?}] Timed out waiting for leader heartbeat", me.clone());
                 RaftImpl::election_loop(arc_state.clone(), term + 1).await;
             });
         });
         state.timer_guard = Some(TimerGuard {
-            handle: tokio::spawn(handle),
+            handle: tokio::spawn(task),
         });
 
         let term = state.term;
@@ -1080,12 +1102,8 @@ fn entry_id_key(entry_id: &EntryId) -> String {
     format!("(term={},id={})", entry_id.term, entry_id.index)
 }
 
-async fn make_raft_client(address: &Server) -> RaftClient<Channel> {
-    let addr = format!("http://[::1]:{}", address.port);
-    // TODO(dino): make this async, store and reuse the channels, etc
-    RaftClient::connect(addr)
-        .await
-        .expect("Failed to create client")
+async fn make_raft_client(address: &Server) -> Result<RaftClient<Channel>, Error> {
+    RaftClient::connect(format!("http://[::1]:{}", address.port)).await
 }
 
 #[cfg(test)]
