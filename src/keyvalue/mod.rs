@@ -5,12 +5,12 @@
 pub use service::KeyValueService;
 
 pub mod grpc {
-    pub use crate::keyvalue::keyvalue_proto::{GetRequest, GetResponse, PutRequest, PutResponse};
     pub use crate::keyvalue::keyvalue_proto::key_value_client::KeyValueClient;
     pub use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
+    pub use crate::keyvalue::keyvalue_proto::{GetRequest, GetResponse, PutRequest, PutResponse};
 }
 
 #[path = "generated/keyvalue_proto.rs"]
-pub (in crate::keyvalue) mod keyvalue_proto;
-pub (in crate::keyvalue) mod service;
-pub (in crate::keyvalue) mod store;
+pub(in crate::keyvalue) mod keyvalue_proto;
+pub(in crate::keyvalue) mod service;
+pub(in crate::keyvalue) mod store;

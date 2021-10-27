@@ -38,6 +38,7 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
     // A service used to serve the keyvalue store, backed by the
     // underlying Raft cluster.
     let keyvalue = KeyValueService::new(&address);
+    info!("Created keyvalue service for {:?}", &address);
 
     // A service used by the Raft cluster.
     let server_diagnostics = diagnostics.lock().await.get_server(&address);
@@ -50,6 +51,7 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
         Config::default(),
     );
     raft.start().await;
+    info!("Created raft service for {:?}", &address);
 
     let serve = tonic::transport::Server::builder()
         .add_service(RaftServer::new(raft))
