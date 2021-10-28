@@ -19,22 +19,24 @@ trait StoreStateMachine: Store + StateMachine {}
 impl<T: Store + StateMachine> StoreStateMachine for T {}
 
 pub struct KeyValueService {
-    address: Server,
+    // A name for this service, used for debugging, log messages, etc.
+    name: String,
+
+    // Holds the actual key-value data.
     store: Arc<Mutex<dyn StoreStateMachine + Send>>,
+
+    // A client talking to the underlying Raft cluster.
     raft: Box<dyn Client + Sync + Send>,
 }
 
 impl KeyValueService {
     // Creates a new instance of the service which will use the cluster of the
     // supplied member for its Raft consensus.
-    pub fn new(address: &Server) -> KeyValueService {
+    pub fn new(name: &str, raft_member: &Server) -> KeyValueService {
         KeyValueService {
-            address: address.clone(),
+            name: name.into(),
             store: Arc::new(Mutex::new(MapStore::new())),
-
-            // We assume that every node running this service also runs a Raft service
-            // underneath, so we pass the same address twice to the Raft client.
-            raft: new_client(address, address),
+            raft: new_client(name.into(), raft_member),
         }
     }
 
@@ -57,7 +59,7 @@ impl KeyValueService {
 #[tonic::async_trait]
 impl KeyValue for KeyValueService {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
-        debug!("[{:?}] Handling GET request", &self.address);
+        debug!("[{:?}] Handling GET request", &self.name);
         let request = request.into_inner();
         if request.key.is_empty() {
             return Err(Status::invalid_argument("Empty key"));
@@ -92,7 +94,7 @@ impl KeyValue for KeyValueService {
     }
 
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
-        debug!("[{:?}] Handling PUT request", &self.address);
+        debug!("[{:?}] Handling PUT request", &self.name);
         let request = request.into_inner();
         if request.key.is_empty() {
             return Err(Status::invalid_argument("Empty key"));
@@ -217,7 +219,7 @@ mod tests {
     fn create_service() -> KeyValueService {
         let store = Arc::new(Mutex::new(MapStore::new()));
         KeyValueService {
-            address: make_server("test", 1234),
+            name: "test".into(),
             store: store.clone(),
             raft: Box::new(FakeRaftClient {
                 store: store.clone(),
@@ -235,6 +237,7 @@ mod tests {
         Server {
             host: host.to_string(),
             port,
+            name: port.to_string(),
         }
     }
 }

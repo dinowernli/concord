@@ -18,10 +18,12 @@ use crate::raft_proto::raft_client::RaftClient;
 // - member: The address of a (any) member of the Raft cluster.
 //
 // Note that "address" and "member" can be equal.
-pub fn new_client(address: &Server, member: &Server) -> Box<dyn Client + Sync + Send> {
+pub fn new_client(name: &str, member: &Server) -> Box<dyn Client + Sync + Send> {
+    // Arbitrary, this member will redirect us if necessary.
+    let initial_leader = member.clone();
     Box::new(ClientImpl {
-        address: address.clone(),
-        leader: Mutex::new(member.clone()),
+        name: name.into(),
+        leader: Mutex::new(initial_leader),
         max_leader_follow_attempts: 10,
     })
 }
@@ -40,7 +42,7 @@ pub trait Client {
 
 struct ClientImpl {
     // The address of the server this is running on.
-    address: Server,
+    name: String,
 
     // Our current best guess as to who is the leader.
     leader: Mutex<Server>,
@@ -55,10 +57,7 @@ impl ClientImpl {
     async fn update_leader(&self, leader: &Server) {
         let mut locked = self.leader.lock().await;
         *locked = leader.clone();
-        debug!(
-            "[{:?}] updated to new leader: [{:?}]",
-            &self.address, leader
-        );
+        debug!("[{:?}] updated to new leader: [{:?}]", &self.name, leader);
     }
 
     // Returns a client with an open connection to the server currently
