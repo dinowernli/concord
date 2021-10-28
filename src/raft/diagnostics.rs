@@ -89,7 +89,8 @@ impl Diagnostics {
             // term. Note that we may or may not have an actual leader.
             info!(
                 "Validated agreed leader for term {} to be {:?}",
-                term, &candidate
+                term,
+                candidate.clone().map(|x| x.name)
             );
             candidate.map(|c| self.leaders.insert(term, c.clone()));
         }
@@ -215,6 +216,7 @@ mod tests {
         Server {
             host: host.to_string(),
             port: port as i32,
+            name: port.to_string(),
         }
     }
 }

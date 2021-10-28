@@ -27,18 +27,23 @@ mod keyvalue;
 mod raft;
 mod testing;
 
-fn server(host: &str, port: i32) -> Server {
+fn server(host: &str, port: i32, name: &str) -> Server {
     Server {
         host: host.into(),
         port,
+        name: name.into(),
     }
 }
 
 async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<Diagnostics>>) {
     // A service used to serve the keyvalue store, backed by the
     // underlying Raft cluster.
-    let keyvalue = KeyValueService::new(&address);
-    info!("Created keyvalue service for {:?}", &address);
+    let name = address.name.to_string();
+    let keyvalue = KeyValueService::new(name.as_str(), &address);
+    info!(
+        "Created keyvalue service with name {} at {:?}",
+        name, &address
+    );
 
     // A service used by the Raft cluster.
     let server_diagnostics = diagnostics.lock().await.get_server(&address);
@@ -73,10 +78,11 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
 // cluster to recover by electing a new one.
 async fn run_preempt_loop(cluster: &Vec<Server>) {
     let member = cluster.first().unwrap().clone();
-    let client = raft::new_client(&server("main-preempt", 0), &member);
+    let name = "main-preempt";
+    let client = raft::new_client(name, &member);
     loop {
         match client.preempt_leader().await {
-            Ok(leader) => info!("Preempted cluster leader: {:?}", leader),
+            Ok(leader) => info!("Preempted cluster leader: {}", leader.name),
             Err(message) => error!("Failed to preempt leader: {}", message),
         }
         sleep(Duration::from_secs(10)).await;
@@ -121,10 +127,12 @@ async fn run_put_loop(cluster: &Vec<Server>) {
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::from_env(Env::default().default_filter_or("concord=info")).init();
 
+    // Note that we use the port as the name because we're running all these servers
+    // locally and so the port is sufficient to identify the server.
     let addresses = vec![
-        server("::1", 12345),
-        server("::1", 12346),
-        server("::1", 12347),
+        server("::1", 12345, "12345"),
+        server("::1", 12346, "12346"),
+        server("::1", 12347, "12347"),
     ];
     info!("Starting {} servers", addresses.len());
 

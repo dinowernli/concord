@@ -5,8 +5,14 @@ syntax = "proto3";
 package raft_proto;
 
 message Server {
+  // The hostname which can be used to contact the server.
   string host = 1;
+
+  // The port the server is listening on.
   int32 port = 2;
+
+  // A name used for debugging, printing logs, etc.
+  string name = 3;
 }
 
 // Identifies an entry in a given log.

@@ -129,7 +129,7 @@ impl RaftImpl {
 
         let mut state = self.state.lock().await;
         let term = state.term;
-        info!("[{:?}] Starting", state.address);
+        info!("[{}] Starting", state.address.name);
         RaftImpl::become_follower(&mut state, arc_state.clone(), term);
 
         tokio::spawn(async move {
@@ -139,7 +139,7 @@ impl RaftImpl {
 
     fn become_follower(state: &mut RaftState, arc_state: Arc<Mutex<RaftState>>, term: i64) {
         let me = state.address.clone();
-        info!("[{:?}] Becoming follower for term {}", &me, term);
+        info!("[{}] Becoming follower for term {}", &me.name, term);
         assert!(term >= state.term, "Term should never decrease");
 
         state.term = term;
@@ -149,7 +149,7 @@ impl RaftImpl {
 
         let task = sleep(Duration::from_millis(add_jitter(timeout_ms))).then(async move |_| {
             tokio::spawn(async move {
-                info!("[{:?}] Follower timeout in term {}", me.clone(), term);
+                info!("[{}] Follower timeout in term {}", me.clone().name, term);
                 RaftImpl::election_loop(arc_state.clone(), term + 1).await;
             });
         });
@@ -198,7 +198,10 @@ impl RaftImpl {
             }
 
             // Prepare the election.
-            info!("[{:?}] Starting election for term {}", state.address, term);
+            info!(
+                "[{}] Starting election for term {}",
+                state.address.name, term
+            );
             state.role = RaftRole::Candidate;
             state.term = term;
             state.timer_guard = None;
@@ -214,8 +217,8 @@ impl RaftImpl {
                     }
                     Err(msg) => {
                         futures.push(Box::pin(err(Status::unavailable(format!(
-                            "Unable to connect to {:?} : {}",
-                            &server, msg
+                            "Unable to connect to {} : {}",
+                            &server.name, msg
                         )))));
                     }
                 }
@@ -226,8 +229,8 @@ impl RaftImpl {
 
         {
             let mut state = arc_state.lock().await;
-            let me = state.address.clone();
-            debug!("[{:?}] Done waiting for vote requests", &me);
+            let me = state.address.name.to_string();
+            debug!("[{}] Done waiting for vote requests", &me);
 
             // The world has moved on or someone else has won in this term.
             if state.term > term || state.role != RaftRole::Candidate {
@@ -240,7 +243,7 @@ impl RaftImpl {
                     Ok(result) => {
                         let message = result.into_inner();
                         if message.term > term {
-                            info!("[{:?}] Detected higher term {}", &me, message.term);
+                            info!("[{}] Detected higher term {}", &me, message.term);
                             RaftImpl::become_follower(&mut state, arc_state.clone(), message.term);
                             return true;
                         }
@@ -248,14 +251,14 @@ impl RaftImpl {
                             votes = votes + 1;
                         }
                     }
-                    Err(message) => info!("[{:?}] Vote request error: {:?}", &me, message),
+                    Err(message) => info!("[{}] Vote request error: {}", &me, message),
                 }
             }
 
             let arc_state_copy = arc_state.clone();
             return if 2 * votes > state.cluster.len() {
                 info!(
-                    "[{:?}] Won election with {} votes, becoming leader for term {}",
+                    "[{}] Won election with {} votes, becoming leader for term {}",
                     &me, votes, term
                 );
                 state.role = RaftRole::Leader;
@@ -266,7 +269,7 @@ impl RaftImpl {
                 });
                 true
             } else {
-                info!("[{:?}] Lost election with {} votes", &me, votes);
+                info!("[{}] Lost election with {} votes", &me, votes);
                 false
             };
         }
@@ -275,13 +278,13 @@ impl RaftImpl {
     // Starts the main leader replication loop. The loop stops once the term has
     // moved on (or we otherwise detect we are no longer leader).
     async fn replicate_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        let me = arc_state.lock().await.address.clone();
+        let me = arc_state.lock().await.address.clone().name;
         let timeouts_ms = arc_state.lock().await.config.leader_replicate_ms.clone();
         loop {
             {
                 let locked_state = arc_state.lock().await;
                 if locked_state.term > term {
-                    info!("[{:?}] Detected higher term {}", me, locked_state.term);
+                    info!("[{}] Detected higher term {}", me, locked_state.term);
                     return;
                 }
                 if locked_state.role != RaftRole::Leader {
@@ -305,7 +308,7 @@ impl RaftImpl {
         let mut results = Vec::<Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>>::new();
         {
             let mut state = arc_state.lock().await;
-            debug!("[{:?}] Replicating entries", &state.address);
+            debug!("[{}] Replicating entries", &state.address.name);
             let others = state.get_others();
             for follower in others {
                 // Figure out which entry the follower is expecting next and decide whether to
@@ -320,8 +323,8 @@ impl RaftImpl {
                 let client = state.get_client(&follower).await;
                 if let Err(msg) = &client {
                     results.push(Box::pin(err(Status::unavailable(format!(
-                        "Unable to connect to {:?} : {}",
-                        &follower, msg
+                        "Unable to connect to {} : {}",
+                        &follower.name, msg
                     )))));
                     continue;
                 }
@@ -354,16 +357,17 @@ impl RaftImpl {
 
         {
             let mut state = arc_state.lock().await;
+            let me = state.address.clone().name;
             if state.term > term {
-                info!("[{:?}] Detected higher term {}", state.address, state.term);
+                info!("[{}] Detected higher term {}", &me, state.term);
                 return;
             }
             if state.role != RaftRole::Leader {
-                info!("[{:?}] No longer leader", state.address);
+                info!("[{}] No longer leader", &me);
                 return;
             }
             state.update_committed().await;
-            debug!("[{:?}] Done replicating entries", &state.address);
+            debug!("[{}] Done replicating entries", &me);
         }
     }
 
@@ -380,14 +384,15 @@ impl RaftImpl {
         let result = client.install_snapshot(request).await;
 
         let mut state = arc_state.lock().await;
+        let me = state.address.clone().name;
         match result {
             Ok(result) => {
                 let response = result.into_inner();
                 let other_term = response.term;
                 if other_term > state.term {
                     info!(
-                        "[{:?}] Detected higher term {} from peer {:?}",
-                        &state.address, other_term, &follower,
+                        "[{}] Detected higher term {} from peer {}",
+                        &me, other_term, &follower.name,
                     );
                     RaftImpl::become_follower(&mut state, arc_state.clone(), other_term);
                     return;
@@ -395,8 +400,8 @@ impl RaftImpl {
                 state.record_follower_matches(&follower, install_request.last.expect("last").index);
             }
             Err(message) => info!(
-                "[{:?}] InstallSnapshot request failed, error: {}",
-                state.address, message
+                "[{}] InstallSnapshot request failed, error: {}",
+                &me, message
             ),
         }
     }
@@ -414,27 +419,25 @@ impl RaftImpl {
         let result = client.append(request).await;
 
         let mut state = arc_state.lock().await;
+        let me = state.address.clone().name;
         if state.term > append_request.term {
-            info!("[{:?}] Detected higher term {}", state.address, state.term);
+            info!("[{}] Detected higher term {}", &me, state.term);
             return;
         }
         if state.role != RaftRole::Leader {
-            info!("[{:?}] No longer leader", state.address);
+            info!("[{}] No longer leader", &me);
             return;
         }
 
         match result {
-            Err(message) => info!(
-                "[{:?}] Append request failed, error: {}",
-                &state.address, message
-            ),
+            Err(message) => info!("[{}] Append request failed, error: {}", &me, message),
             Ok(response) => {
                 let message = response.into_inner();
                 let other_term = message.term;
                 if other_term > state.term {
                     info!(
-                        "[{:?}] Detected higher term {} from peer {:?}",
-                        &state.address, other_term, &follower,
+                        "[{}] Detected higher term {} from peer {}",
+                        &me, other_term, &follower.name,
                     );
                     RaftImpl::become_follower(&mut state, arc_state.clone(), other_term);
                     return;
@@ -634,10 +637,11 @@ impl RaftState {
         request: &AppendRequest,
     ) {
         let follower = self.followers.get_mut(address_key(&peer).as_str());
+        let me = self.address.clone().name;
         if follower.is_none() {
             info!(
-                "[{:?}] Ignoring append response for unknown peer {:?}",
-                &self.address, &peer
+                "[{}] Ignoring append response for unknown peer {}",
+                &me, &peer.name
             );
             return;
         }
@@ -649,8 +653,8 @@ impl RaftState {
             // "next" index until we hit a "previous" entry present on the follower.
             f.next_index = f.next_index - 1;
             info!(
-                "[{:?}] Decremented follower next_index for peer {:?} to {}",
-                &self.address, &peer, f.next_index
+                "[{}] Decremented follower next_index for peer {} to {}",
+                &me, &peer.name, f.next_index
             );
             return;
         }
@@ -668,14 +672,14 @@ impl RaftState {
         let follower = self
             .followers
             .get_mut(address_key(&peer).as_str())
-            .expect(format!("Unknown peer {:?}", &peer).as_str());
+            .expect(format!("Unknown peer {}", &peer.name).as_str());
         let old_f = follower.clone();
         follower.match_index = match_index;
         follower.next_index = match_index + 1;
         if follower != &old_f {
             info!(
-                "[{:?}] Follower state for peer {:?} is now (next={},match={})",
-                &self.address, &peer, follower.next_index, follower.match_index
+                "[{}] Follower state for peer {} is now (next={},match={})",
+                &self.address.name, &peer.name, follower.next_index, follower.match_index
             );
         }
     }
@@ -700,8 +704,8 @@ impl RaftState {
         }
         if self.committed != saved_committed {
             debug!(
-                "[{:?}] Updated committed index from {} to {}",
-                &self.address, saved_committed, self.committed
+                "[{}] Updated committed index from {} to {}",
+                &self.address.name, saved_committed, self.committed
             );
         }
 
@@ -752,18 +756,15 @@ impl RaftState {
                 .lock()
                 .await
                 .apply(&Bytes::from(entry.payload));
+            let me = self.address.clone().name;
             match result {
                 Ok(()) => {
-                    info!(
-                        "[{:?}] Applied entry: {}",
-                        self.address,
-                        entry_id_key(&entry_id)
-                    );
+                    info!("[{}] Applied entry: {}", &me, entry_id_key(&entry_id));
                 }
                 Err(msg) => {
                     warn!(
-                        "[{:?}] Failed to apply {}: {}",
-                        self.address,
+                        "[{}] Failed to apply {}: {}",
+                        &me,
                         entry_id_key(&entry_id),
                         msg,
                     );
@@ -800,8 +801,8 @@ impl RaftState {
             self.log.prune_until(&latest_id);
 
             info!(
-                "[{:?}] Compacted log with snapshot up to (including) index {}",
-                self.address, applied_index
+                "[{}] Compacted log with snapshot up to (including) index {}",
+                self.address.name, applied_index
             );
         }
     }
@@ -821,9 +822,9 @@ impl RaftState {
 impl Raft for RaftImpl {
     async fn vote(&self, request: Request<VoteRequest>) -> Result<Response<VoteResponse>, Status> {
         let request = request.into_inner();
-        info!(
-            "[{:?}] Handling vote request: [{:?}]",
-            self.address, request
+        debug!(
+            "[{}] Handling vote request: [{:?}]",
+            self.address.name, request
         );
 
         let mut state = self.state.lock().await;
@@ -845,20 +846,21 @@ impl Raft for RaftImpl {
         let candidate = request.candidate;
 
         let granted;
+        let me = self.address.clone().name;
         if state.voted_for.is_none() || &candidate == &state.voted_for {
             if state.log.is_up_to_date(&request.last.expect("last")) {
                 state.voted_for = candidate.clone();
-                info!("[{:?}] Granted vote", self.address);
+                info!("[{}] Granted vote", &me);
                 granted = true;
             } else {
-                info!("[{:?}] Denied vote", self.address);
+                info!("[{}] Denied vote", &me);
                 granted = false;
             }
         } else {
             info!(
-                "[{:?}] Rejecting, already voted for candidate [{:?}]",
-                self.address,
-                state.voted_for.as_ref()
+                "[{}] Rejecting, already voted for candidate [{:?}]",
+                &me,
+                state.voted_for.clone().map(|x| x.name)
             );
             granted = false;
         }
@@ -875,8 +877,8 @@ impl Raft for RaftImpl {
     ) -> Result<Response<AppendResponse>, Status> {
         let request = request.into_inner();
         debug!(
-            "[{:?}] Handling append request: [{:?}]",
-            self.address, request
+            "[{}] Handling append request: [{:?}]",
+            self.address.name, request
         );
 
         let mut state = self.state.lock().await;
@@ -908,12 +910,12 @@ impl Raft for RaftImpl {
         // Reset the election timer
         let term = state.term;
         let arc_state = self.state.clone();
-        let me = state.address.clone();
+        let me = state.address.clone().name;
         let timeout_ms = state.config.follower_timeout_ms;
 
         let task = sleep(Duration::from_millis(add_jitter(timeout_ms))).then(async move |_| {
             tokio::spawn(async move {
-                info!("[{:?}] Timed out waiting for leader heartbeat", me.clone());
+                info!("[{}] Timed out waiting for leader heartbeat", me.clone());
                 RaftImpl::election_loop(arc_state.clone(), term + 1).await;
             });
         });
@@ -948,7 +950,7 @@ impl Raft for RaftImpl {
             state.apply_committed().await;
         }
 
-        debug!("[{:?}] Successfully processed heartbeat", &state.address);
+        debug!("[{}] Successfully processed heartbeat", &self.address.name);
         Ok(Response::new(AppendResponse {
             term,
             success: true,
@@ -960,7 +962,7 @@ impl Raft for RaftImpl {
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
         let request = request.into_inner();
-        debug!("[{:?}] Handling commit request", self.address);
+        debug!("[{}] Handling commit request", self.address.name);
 
         let term;
         let entry_id;
@@ -1017,7 +1019,7 @@ impl Raft for RaftImpl {
         &self,
         _: Request<StepDownRequest>,
     ) -> Result<Response<StepDownResponse>, Status> {
-        debug!("[{:?}] Handling step down request", self.address);
+        debug!("[{}] Handling step down request", self.address.name);
 
         let mut state = self.state.lock().await;
         if state.role != RaftRole::Leader {
@@ -1041,7 +1043,7 @@ impl Raft for RaftImpl {
         request: Request<InstallSnapshotRequest>,
     ) -> Result<Response<InstallSnapshotResponse>, Status> {
         let request = request.into_inner();
-        debug!("[{:?}] Handling install snapshot request", self.address);
+        debug!("[{}] Handling install snapshot request", self.address.name);
 
         let mut state = self.state.lock().await;
         if request.term >= state.term && !request.snapshot.is_empty() {
@@ -1050,8 +1052,8 @@ impl Raft for RaftImpl {
             match state.state_machine.lock().await.load_snapshot(&snapshot) {
                 Ok(_) => (),
                 Err(message) => error!(
-                    "[{:?}] Failed to load snapshot: [{:?}]",
-                    self.address, message
+                    "[{}] Failed to load snapshot: [{:?}]",
+                    self.address.name, message
                 ),
             }
 
@@ -1070,8 +1072,8 @@ impl Raft for RaftImpl {
                 ContainsResult::COMPACTED => {
                     // Something went very wrong...
                     warn!(
-                        "[{:?}] Got snapshot for already compacted index {}",
-                        state.address, last.index,
+                        "[{}] Got snapshot for already compacted index {}",
+                        state.address.name, last.index,
                     );
                 }
             }
@@ -1318,6 +1320,7 @@ mod tests {
         Server {
             host: "::1".to_string(),
             port,
+            name: port.to_string(),
         }
     }
 
