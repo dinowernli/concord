@@ -18,7 +18,7 @@ use tonic::Status;
 pub struct Store {
     pub log: LogSlice,
     state_machine: Arc<Mutex<dyn StateMachine + Send>>,
-    pub snapshot: Option<LogSnapshot>,
+    snapshot: Option<LogSnapshot>,
 
     listener_uid: i64,
     listeners: BTreeSet<CommitListener>,
