@@ -3,7 +3,7 @@ use crate::raft::raft_proto::EntryId;
 use crate::raft::StateMachine;
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
-use futures::channel::oneshot::Sender;
+use futures::channel::oneshot::{channel, Receiver, Sender};
 use log::{info, warn};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -99,6 +99,37 @@ impl Store {
                         msg,
                     );
                 }
+            }
+        }
+    }
+
+    // Registers a listener for the supplied index.
+    pub fn add_listener(&mut self, index: i64) -> Receiver<EntryId> {
+        let (sender, receiver) = channel::<EntryId>();
+        self.listeners.insert(CommitListener {
+            index,
+            sender,
+            uid: self.listener_uid,
+        });
+        self.listener_uid = self.listener_uid + 1;
+        receiver
+    }
+
+    // Tries to resolve the promises for listeners waiting for commits.
+    pub fn resolve_listeners(&mut self) {
+        while self.listeners.first().is_some()
+            && self.listeners.first().unwrap().index <= self.committed
+        {
+            let next = self.listeners.pop_first().expect("get first");
+            let index = next.index;
+            if !self.log.is_index_compacted(index) {
+                next.sender
+                    .send(self.log.id_at(index))
+                    .map_err(|_| warn!("Listener for commit {} no longer listening", index))
+                    .ok();
+            } else {
+                // Do nothing, we just let the sender go out of scope, which will notify the
+                // receiver of the cancellation
             }
         }
     }

@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
-use futures::channel::oneshot::{channel, Receiver};
 use futures::future::{err, join_all};
 use futures::FutureExt;
 use log::{debug, error, info, warn};
@@ -646,7 +645,7 @@ impl RaftState {
 
             if 2 * matches > self.cluster.len() {
                 self.store.committed = index;
-                self.resolve_listeners();
+                self.store.resolve_listeners();
             }
         }
         if self.store.committed != saved_committed {
@@ -657,37 +656,6 @@ impl RaftState {
         }
 
         self.store.apply_committed().await;
-    }
-
-    // Registers a listener for the supplied index.
-    fn add_listener(&mut self, index: i64) -> Receiver<EntryId> {
-        let (sender, receiver) = channel::<EntryId>();
-        self.store.listeners.insert(CommitListener {
-            index,
-            sender,
-            uid: self.store.listener_uid,
-        });
-        self.store.listener_uid = self.store.listener_uid + 1;
-        receiver
-    }
-
-    // Tries to resolve the promises for listeners waiting for commits.
-    fn resolve_listeners(&mut self) {
-        while self.store.listeners.first().is_some()
-            && self.store.listeners.first().unwrap().index <= self.store.committed
-        {
-            let next = self.store.listeners.pop_first().expect("get first");
-            let index = next.index;
-            if !self.store.log.is_index_compacted(index) {
-                next.sender
-                    .send(self.store.log.id_at(index))
-                    .map_err(|_| warn!("Listener for commit {} no longer listening", index))
-                    .ok();
-            } else {
-                // Do nothing, we just let the sender go out of scope, which will notify the
-                // receiver of the cancellation
-            }
-        }
     }
 
     // Returns a request which a candidate can send in order to request the vote
@@ -878,7 +846,7 @@ impl Raft for RaftImpl {
 
             term = state.term;
             entry_id = state.store.log.append(term, request.payload);
-            receiver = state.add_listener(entry_id.index);
+            receiver = state.store.add_listener(entry_id.index);
         }
 
         let committed = receiver.await;
