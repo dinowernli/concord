@@ -21,3 +21,4 @@ mod consensus;
 mod diagnostics;
 mod log;
 mod state_machine;
+mod store;
