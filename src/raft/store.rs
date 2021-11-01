@@ -4,6 +4,7 @@ use crate::raft::StateMachine;
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::channel::oneshot::Sender;
+use log::info;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
@@ -21,10 +22,17 @@ pub struct Store {
     pub listeners: BTreeSet<CommitListener>,
     pub committed: i64,
     pub applied: i64,
+
+    compaction_threshold_bytes: i64,
+    name: String,
 }
 
 impl Store {
-    pub fn new(state_machine: Arc<Mutex<dyn StateMachine + Send>>) -> Self {
+    pub fn new(
+        state_machine: Arc<Mutex<dyn StateMachine + Send>>,
+        compaction_threshold_bytes: i64,
+        name: &str,
+    ) -> Self {
         Self {
             log: LogSlice::initial(),
             state_machine,
@@ -33,6 +41,32 @@ impl Store {
             listeners: BTreeSet::new(),
             committed: -1,
             applied: -1,
+            compaction_threshold_bytes,
+            name: name.to_string(),
+        }
+    }
+
+    // Compacts logs entries into a new snapshot if necessary.
+    pub async fn try_compact(&mut self) {
+        if self.log.size_bytes() > self.compaction_threshold_bytes {
+            let applied_index = self.applied;
+            let latest_id = self.log.id_at(applied_index);
+            let snap = LogSnapshot {
+                snapshot: self.state_machine.lock().await.create_snapshot(),
+                last: latest_id.clone(),
+            };
+            self.snapshot = Some(snap);
+
+            // Note that we prefer not to clear the log slice entirely
+            // because although losing uncommitted entries is safe, the
+            // leader doing this could result in failed commit operations
+            // sent to the leader.
+            self.log.prune_until(&latest_id);
+
+            info!(
+                "[{}] Compacted log with snapshot up to (including) index {}",
+                self.name, applied_index
+            );
         }
     }
 }

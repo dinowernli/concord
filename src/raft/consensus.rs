@@ -83,6 +83,7 @@ impl RaftImpl {
         diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
         config: Config,
     ) -> RaftImpl {
+        let compaction_threshold_bytes = config.compaction_threshold_bytes;
         RaftImpl {
             address: server.clone(),
             state: Arc::new(Mutex::new(RaftState {
@@ -90,7 +91,11 @@ impl RaftImpl {
 
                 term: 0,
                 voted_for: None,
-                store: Store::new(state_machine),
+                store: Store::new(
+                    state_machine,
+                    compaction_threshold_bytes,
+                    server.name.as_str(),
+                ),
 
                 role: RaftRole::Follower,
                 followers: HashMap::new(),
@@ -148,7 +153,7 @@ impl RaftImpl {
                 if state.role == RaftRole::Stopping {
                     return;
                 }
-                state.try_compact().await;
+                state.store.try_compact().await;
             }
             let period_ms = arc_state.lock().await.config.compaction_check_periods_ms;
             sleep(Duration::from_millis(add_jitter(period_ms))).await;
@@ -726,30 +731,6 @@ impl RaftState {
         }
     }
 
-    // Compacts logs entries into a new snapshot if necessary.
-    async fn try_compact(&mut self) {
-        if self.store.log.size_bytes() > self.config.compaction_threshold_bytes {
-            let applied_index = self.store.applied;
-            let latest_id = self.store.log.id_at(applied_index);
-            let snap = LogSnapshot {
-                snapshot: self.store.state_machine.lock().await.create_snapshot(),
-                last: latest_id.clone(),
-            };
-            self.store.snapshot = Some(snap);
-
-            // Note that we prefer not to clear the log slice entirely
-            // because although losing uncommitted entries is safe, the
-            // leader doing this could result in failed commit operations
-            // sent to the leader.
-            self.store.log.prune_until(&latest_id);
-
-            info!(
-                "[{}] Compacted log with snapshot up to (including) index {}",
-                self.address.name, applied_index
-            );
-        }
-    }
-
     // Requests a vote from a follower. Used to run leader elections.
     async fn request_vote(
         mut client: RaftClient<Channel>,
@@ -1187,7 +1168,7 @@ mod tests {
         // Run a compaction, should have no effect
         {
             let mut state = raft_state.lock().await;
-            state.try_compact().await;
+            state.store.try_compact().await;
             assert!(!state.store.log.is_index_compacted(0)); // Not compacted
             assert_eq!(state.store.log.next_index(), 3);
         }
@@ -1226,7 +1207,7 @@ mod tests {
         // Run a compaction, this one should actually compact things now.
         {
             let mut state = raft_state.lock().await;
-            state.try_compact().await;
+            state.store.try_compact().await;
             assert!(state.store.log.is_index_compacted(0)); // Compacted
             assert_eq!(
                 state.store.snapshot.as_ref().expect("snapshot").last.index,
