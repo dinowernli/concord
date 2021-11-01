@@ -976,7 +976,7 @@ fn address_key(address: &Server) -> String {
 #[cfg(test)]
 mod tests {
     use crate::raft::raft_proto::raft_server::RaftServer;
-    use crate::raft::StateMachineResult;
+    use crate::raft::testing::FakeStateMachine;
     use crate::raft_proto::Entry;
     use crate::testing::TestServer;
 
@@ -988,8 +988,6 @@ mod tests {
         let state = raft.state.lock().await;
         assert_eq!(state.role, RaftRole::Follower);
         assert_eq!(state.term, 0);
-        assert_eq!(state.store.committed, -1);
-        assert_eq!(state.store.applied, -1);
     }
 
     // This test verifies that initially, a follower fails to accept entries
@@ -1199,33 +1197,5 @@ mod tests {
         RaftClient::connect(format!("http://[::1]:{}", port))
             .await
             .expect("client")
-    }
-
-    struct FakeStateMachine {
-        committed: i64,
-        snapshots_loaded: i64,
-    }
-
-    impl FakeStateMachine {
-        fn new() -> Self {
-            FakeStateMachine {
-                committed: 0,
-                snapshots_loaded: 0,
-            }
-        }
-    }
-
-    impl StateMachine for FakeStateMachine {
-        fn apply(&mut self, _operation: &Bytes) -> StateMachineResult {
-            self.committed += 1;
-            Ok(())
-        }
-        fn create_snapshot(&self) -> Bytes {
-            Bytes::from(Vec::new())
-        }
-        fn load_snapshot(&mut self, _snapshot: &Bytes) -> StateMachineResult {
-            self.snapshots_loaded += 1;
-            Ok(())
-        }
     }
 }

@@ -184,3 +184,23 @@ impl Ord for CommitListener {
 fn entry_id_key(entry_id: &EntryId) -> String {
     format!("(term={},id={})", entry_id.term, entry_id.index)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raft::testing::FakeStateMachine;
+
+    const COMPACTION_THRESHOLD_BYTES: i64 = 5000;
+
+    #[test]
+    fn test_initial() {
+        let store = Store::new(
+            Arc::new(Mutex::new(FakeStateMachine::new())),
+            COMPACTION_THRESHOLD_BYTES,
+            "testing-store",
+        );
+
+        assert_eq!(store.committed, -1);
+        assert_eq!(store.applied, -1);
+    }
+}
