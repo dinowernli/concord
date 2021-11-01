@@ -11,7 +11,7 @@ use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::future::{err, join_all};
 use futures::FutureExt;
-use log::{debug, error, info, warn};
+use log::{debug, info};
 use rand::Rng;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -19,7 +19,7 @@ use tonic::transport::{Channel, Endpoint, Error};
 use tonic::{Request, Response, Status};
 
 use diagnostics::ServerDiagnostics;
-use raft::log::{ContainsResult, LogSlice};
+use raft::log::ContainsResult;
 use raft::raft_proto;
 use raft::StateMachine;
 use raft_proto::{AppendRequest, AppendResponse, EntryId, Server, VoteRequest, VoteResponse};
@@ -28,7 +28,7 @@ use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 
 use crate::raft;
 use crate::raft::diagnostics;
-use crate::raft::store::{LogSnapshot, Store};
+use crate::raft::store::Store;
 use crate::raft_proto::raft_client::RaftClient;
 use crate::raft_proto::raft_server::Raft;
 
@@ -559,7 +559,7 @@ impl RaftState {
     fn create_snapshot_request(&self) -> InstallSnapshotRequest {
         let mut snapshot: Vec<u8> = vec![];
         let mut last: Option<EntryId> = None;
-        match &self.store.snapshot {
+        match self.store.get_latest_snapshot() {
             None => (),
             Some(snap) => {
                 snapshot = snap.snapshot.to_vec();
@@ -913,50 +913,12 @@ impl Raft for RaftImpl {
 
         let mut state = self.state.lock().await;
         if request.term >= state.term && !request.snapshot.is_empty() {
-            // Update the state machine.
-            let snapshot = Bytes::from(request.snapshot.to_vec());
-            match state
-                .store
-                .state_machine
-                .lock()
-                .await
-                .load_snapshot(&snapshot)
-            {
-                Ok(_) => (),
-                Err(message) => error!(
-                    "[{}] Failed to load snapshot: [{:?}]",
-                    self.address.name, message
-                ),
-            }
-
-            // Update the log.
             let last = request.last.expect("last");
-            let contains = state.store.log.contains(&last);
-            match contains {
-                ContainsResult::ABSENT => {
-                    // Common case, snapshot from the future. Just clear the log.
-                    state.store.log = LogSlice::new(last.clone());
-                }
-                ContainsResult::PRESENT => {
-                    // Entries that came after the latest snapshot entry might still be valid.
-                    state.store.log.prune_until(&last);
-                }
-                ContainsResult::COMPACTED => {
-                    // Something went very wrong...
-                    warn!(
-                        "[{}] Got snapshot for already compacted index {}",
-                        state.address.name, last.index,
-                    );
-                }
+            let snapshot = Bytes::from(request.snapshot.to_vec());
+            let status = state.store.install_snapshot(snapshot, last).await;
+            if status.code() != tonic::Code::Ok {
+                return Err(status);
             }
-
-            // Update volatile state.
-            state.store.applied = last.index;
-            state.store.committed = last.index;
-            state.store.snapshot = Some(LogSnapshot {
-                last: last.clone(),
-                snapshot: Bytes::from(request.snapshot.to_vec()),
-            });
         }
         Ok(Response::new(InstallSnapshotResponse { term: state.term }))
     }
@@ -1141,7 +1103,12 @@ mod tests {
             state.store.try_compact().await;
             assert!(state.store.log.is_index_compacted(0)); // Compacted
             assert_eq!(
-                state.store.snapshot.as_ref().expect("snapshot").last.index,
+                state
+                    .store
+                    .get_latest_snapshot()
+                    .expect("snapshot")
+                    .last
+                    .index,
                 3
             )
         }

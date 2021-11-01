@@ -1,4 +1,4 @@
-use crate::raft::log::LogSlice;
+use crate::raft::log::{ContainsResult, LogSlice};
 use crate::raft::raft_proto::EntryId;
 use crate::raft::StateMachine;
 use async_std::sync::{Arc, Mutex};
@@ -7,6 +7,7 @@ use futures::channel::oneshot::{channel, Receiver, Sender};
 use log::{info, warn};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
+use tonic::Status;
 
 // Handles persistent storage for a Raft member, including a snapshot starting
 // from the beginning of time up to some index, and running log of entries since
@@ -16,14 +17,14 @@ use std::collections::BTreeSet;
 // portion reaches as certain index, etc.
 pub struct Store {
     pub log: LogSlice,
-    pub state_machine: Arc<Mutex<dyn StateMachine + Send>>,
+    state_machine: Arc<Mutex<dyn StateMachine + Send>>,
     pub snapshot: Option<LogSnapshot>,
 
     listener_uid: i64,
     listeners: BTreeSet<CommitListener>,
 
     pub committed: i64,
-    pub applied: i64,
+    applied: i64,
 
     compaction_threshold_bytes: i64,
     name: String,
@@ -135,10 +136,55 @@ impl Store {
             }
         }
     }
+
+    // Resets the state of this store to the supplied snapshot.
+    pub async fn install_snapshot(&mut self, snapshot: Bytes, last: EntryId) -> Status {
+        // Update the state machine.
+        let mut state_machine = self.state_machine.lock().await;
+        match state_machine.load_snapshot(&snapshot) {
+            Ok(_) => (),
+            Err(message) => {
+                return Status::internal(format!(
+                    "[{}] Failed to load snapshot: [{:?}]",
+                    &self.name, message
+                ));
+            }
+        }
+
+        // Update the log.
+        let contains = self.log.contains(&last);
+        match contains {
+            ContainsResult::ABSENT => {
+                // Common case, snapshot from the future. Just clear the log.
+                self.log = LogSlice::new(last.clone());
+            }
+            ContainsResult::PRESENT => {
+                // Entries that came after the latest snapshot entry might still be valid.
+                self.log.prune_until(&last);
+            }
+            ContainsResult::COMPACTED => {
+                warn!(
+                    "[{}] Got snapshot for already compacted index {}",
+                    &self.name, last.index,
+                );
+            }
+        }
+
+        self.applied = last.index;
+        self.committed = last.index;
+        self.snapshot = Some(LogSnapshot { last, snapshot });
+
+        Status::ok("")
+    }
+
+    pub fn get_latest_snapshot(&self) -> Option<LogSnapshot> {
+        self.snapshot.clone()
+    }
 }
 
 // Represents a snapshot of the state machine after applying a complete prefix
 // of entries since the beginning of time.
+#[derive(Clone)]
 pub struct LogSnapshot {
     // The id of the latest entry included in the snapshot.
     pub last: EntryId,
@@ -192,14 +238,17 @@ mod tests {
 
     const COMPACTION_THRESHOLD_BYTES: i64 = 5000;
 
-    #[test]
-    fn test_initial() {
-        let store = Store::new(
+    fn make_store() -> Store {
+        Store::new(
             Arc::new(Mutex::new(FakeStateMachine::new())),
             COMPACTION_THRESHOLD_BYTES,
             "testing-store",
-        );
+        )
+    }
 
+    #[test]
+    fn test_initial() {
+        let store = make_store();
         assert_eq!(store.committed, -1);
         assert_eq!(store.applied, -1);
     }
