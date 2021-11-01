@@ -21,6 +21,18 @@ pub struct Store {
     pub listeners: BTreeSet<CommitListener>,
 }
 
+impl Store {
+    pub fn new(state_machine: Arc<Mutex<dyn StateMachine + Send>>) -> Self {
+        Self {
+            log: LogSlice::initial(),
+            state_machine,
+            snapshot: None,
+            listener_uid: 0,
+            listeners: BTreeSet::new(),
+        }
+    }
+}
+
 // Represents a snapshot of the state machine after applying a complete prefix
 // of entries since the beginning of time.
 pub struct LogSnapshot {

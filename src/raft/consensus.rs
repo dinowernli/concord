@@ -91,13 +91,7 @@ impl RaftImpl {
 
                 term: 0,
                 voted_for: None,
-                store: Store {
-                    log: LogSlice::initial(),
-                    state_machine,
-                    snapshot: None,
-                    listener_uid: 0,
-                    listeners: BTreeSet::new(),
-                },
+                store: Store::new(state_machine),
 
                 committed: -1,
                 applied: -1,
