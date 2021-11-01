@@ -19,7 +19,7 @@ pub struct Store {
     pub state_machine: Arc<Mutex<dyn StateMachine + Send>>,
     pub snapshot: Option<LogSnapshot>,
     pub listener_uid: i64,
-    pub listeners: BTreeSet<CommitListener>,
+    listeners: BTreeSet<CommitListener>,
     pub committed: i64,
     pub applied: i64,
 
@@ -148,15 +148,15 @@ pub struct LogSnapshot {
 // Each instance represents an ongoing commit operation waiting for the committed
 // index to reach the index of their tentative new entry.
 #[derive(Debug)]
-pub struct CommitListener {
+struct CommitListener {
     // The index the listener would like to be notified about.
-    pub index: i64,
+    index: i64,
 
     // Used to send the resulting entry id to the listener.
-    pub sender: Sender<EntryId>,
+    sender: Sender<EntryId>,
 
     // Used to disambiguate between structs for the same index.
-    pub uid: i64,
+    uid: i64,
 }
 
 impl Eq for CommitListener {}

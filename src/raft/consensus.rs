@@ -28,7 +28,7 @@ use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 
 use crate::raft;
 use crate::raft::diagnostics;
-use crate::raft::store::{CommitListener, LogSnapshot, Store};
+use crate::raft::store::{LogSnapshot, Store};
 use crate::raft_proto::raft_client::RaftClient;
 use crate::raft_proto::raft_server::Raft;
 
