@@ -2,15 +2,14 @@ extern crate chrono;
 extern crate math;
 extern crate rand;
 
-use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
-use futures::channel::oneshot::{channel, Receiver, Sender};
+use futures::channel::oneshot::{channel, Receiver};
 use futures::future::{err, join_all};
 use futures::FutureExt;
 use log::{debug, error, info, warn};
@@ -93,8 +92,6 @@ impl RaftImpl {
                 voted_for: None,
                 store: Store::new(state_machine),
 
-                committed: -1,
-                applied: -1,
                 role: RaftRole::Follower,
                 followers: HashMap::new(),
 
@@ -476,8 +473,6 @@ struct RaftState {
     store: Store, // RaftState gets sent between threads.
 
     // Volatile raft state.
-    committed: i64,
-    applied: i64,
     role: RaftRole,
     followers: HashMap<String, FollowerPosition>,
 
@@ -551,7 +546,7 @@ impl RaftState {
             leader: Some(self.address.clone()),
             previous: Some(previous.clone()),
             entries: self.store.log.get_entries_after(&previous),
-            committed: self.committed,
+            committed: self.store.committed,
         }
     }
 
@@ -635,8 +630,8 @@ impl RaftState {
     // has been replicated to a majority. If such an index is found, this updates
     // the index this leader considers committed.
     async fn update_committed(&mut self) {
-        let saved_committed = self.committed;
-        for index in self.committed + 1..self.store.log.next_index() {
+        let saved_committed = self.store.committed;
+        for index in self.store.committed + 1..self.store.log.next_index() {
             let mut matches = 1; // We match.
             for (_, follower) in &self.followers {
                 if follower.match_index >= index {
@@ -645,14 +640,14 @@ impl RaftState {
             }
 
             if 2 * matches > self.cluster.len() {
-                self.committed = index;
+                self.store.committed = index;
                 self.resolve_listeners();
             }
         }
-        if self.committed != saved_committed {
+        if self.store.committed != saved_committed {
             debug!(
                 "[{}] Updated committed index from {} to {}",
-                &self.address.name, saved_committed, self.committed
+                &self.address.name, saved_committed, self.store.committed
             );
         }
 
@@ -674,7 +669,7 @@ impl RaftState {
     // Tries to resolve the promises for listeners waiting for commits.
     fn resolve_listeners(&mut self) {
         while self.store.listeners.first().is_some()
-            && self.store.listeners.first().unwrap().index <= self.committed
+            && self.store.listeners.first().unwrap().index <= self.store.committed
         {
             let next = self.store.listeners.pop_first().expect("get first");
             let index = next.index;
@@ -693,9 +688,9 @@ impl RaftState {
     // Called to apply any committed values that haven't been applied to the
     // state machine. This method is always safe to call, on leaders and followers.
     async fn apply_committed(&mut self) {
-        while self.applied < self.committed {
-            self.applied = self.applied + 1;
-            let entry = self.store.log.entry_at(self.applied);
+        while self.store.applied < self.store.committed {
+            self.store.applied = self.store.applied + 1;
+            let entry = self.store.log.entry_at(self.store.applied);
             let entry_id = entry.id.expect("id").clone();
 
             let result = self
@@ -734,7 +729,7 @@ impl RaftState {
     // Compacts logs entries into a new snapshot if necessary.
     async fn try_compact(&mut self) {
         if self.store.log.size_bytes() > self.config.compaction_threshold_bytes {
-            let applied_index = self.applied;
+            let applied_index = self.store.applied;
             let latest_id = self.store.log.id_at(applied_index);
             let snap = LogSnapshot {
                 snapshot: self.store.state_machine.lock().await.create_snapshot(),
@@ -898,8 +893,8 @@ impl Raft for RaftImpl {
         // all members of the cluster agree on the log up to that index, so it
         // is safe to apply the entries to the state machine.
         let leader_commit = request.committed;
-        if leader_commit > state.committed {
-            state.committed = leader_commit;
+        if leader_commit > state.store.committed {
+            state.store.committed = leader_commit;
             state.apply_committed().await;
         }
 
@@ -1038,8 +1033,8 @@ impl Raft for RaftImpl {
             }
 
             // Update volatile state.
-            state.applied = last.index;
-            state.committed = last.index;
+            state.store.applied = last.index;
+            state.store.committed = last.index;
             state.store.snapshot = Some(LogSnapshot {
                 last: last.clone(),
                 snapshot: Bytes::from(request.snapshot.to_vec()),
@@ -1079,8 +1074,8 @@ mod tests {
         let state = raft.state.lock().await;
         assert_eq!(state.role, RaftRole::Follower);
         assert_eq!(state.term, 0);
-        assert_eq!(state.committed, -1);
-        assert_eq!(state.applied, -1);
+        assert_eq!(state.store.committed, -1);
+        assert_eq!(state.store.applied, -1);
     }
 
     // This test verifies that initially, a follower fails to accept entries

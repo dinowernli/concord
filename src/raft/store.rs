@@ -3,7 +3,7 @@ use crate::raft::raft_proto::EntryId;
 use crate::raft::StateMachine;
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
-use futures::channel::oneshot::{channel, Receiver, Sender};
+use futures::channel::oneshot::Sender;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
@@ -19,6 +19,8 @@ pub struct Store {
     pub snapshot: Option<LogSnapshot>,
     pub listener_uid: i64,
     pub listeners: BTreeSet<CommitListener>,
+    pub committed: i64,
+    pub applied: i64,
 }
 
 impl Store {
@@ -29,6 +31,8 @@ impl Store {
             snapshot: None,
             listener_uid: 0,
             listeners: BTreeSet::new(),
+            committed: -1,
+            applied: -1,
         }
     }
 }
