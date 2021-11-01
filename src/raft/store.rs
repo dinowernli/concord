@@ -18,8 +18,10 @@ pub struct Store {
     pub log: LogSlice,
     pub state_machine: Arc<Mutex<dyn StateMachine + Send>>,
     pub snapshot: Option<LogSnapshot>,
-    pub listener_uid: i64,
+
+    listener_uid: i64,
     listeners: BTreeSet<CommitListener>,
+
     pub committed: i64,
     pub applied: i64,
 
