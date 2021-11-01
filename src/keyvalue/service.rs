@@ -232,12 +232,4 @@ mod tests {
             .await
             .expect("client")
     }
-
-    fn make_server(host: &str, port: i32) -> Server {
-        Server {
-            host: host.to_string(),
-            port,
-            name: port.to_string(),
-        }
-    }
 }
