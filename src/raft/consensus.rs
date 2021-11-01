@@ -656,7 +656,7 @@ impl RaftState {
             );
         }
 
-        self.apply_committed().await;
+        self.store.apply_committed().await;
     }
 
     // Registers a listener for the supplied index.
@@ -686,37 +686,6 @@ impl RaftState {
             } else {
                 // Do nothing, we just let the sender go out of scope, which will notify the
                 // receiver of the cancellation
-            }
-        }
-    }
-
-    // Called to apply any committed values that haven't been applied to the
-    // state machine. This method is always safe to call, on leaders and followers.
-    async fn apply_committed(&mut self) {
-        while self.store.applied < self.store.committed {
-            self.store.applied = self.store.applied + 1;
-            let entry = self.store.log.entry_at(self.store.applied);
-            let entry_id = entry.id.expect("id").clone();
-
-            let result = self
-                .store
-                .state_machine
-                .lock()
-                .await
-                .apply(&Bytes::from(entry.payload));
-            let me = self.address.clone().name;
-            match result {
-                Ok(()) => {
-                    info!("[{}] Applied entry: {}", &me, entry_id_key(&entry_id));
-                }
-                Err(msg) => {
-                    warn!(
-                        "[{}] Failed to apply {}: {}",
-                        &me,
-                        entry_id_key(&entry_id),
-                        msg,
-                    );
-                }
             }
         }
     }
@@ -876,7 +845,7 @@ impl Raft for RaftImpl {
         let leader_commit = request.committed;
         if leader_commit > state.store.committed {
             state.store.committed = leader_commit;
-            state.apply_committed().await;
+            state.store.apply_committed().await;
         }
 
         debug!("[{}] Successfully processed heartbeat", &self.address.name);
@@ -1034,10 +1003,6 @@ fn add_jitter(lower: i64) -> u64 {
 
 fn address_key(address: &Server) -> String {
     format!("{}:{}", address.host, address.port)
-}
-
-fn entry_id_key(entry_id: &EntryId) -> String {
-    format!("(term={},id={})", entry_id.term, entry_id.index)
 }
 
 #[cfg(test)]

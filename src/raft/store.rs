@@ -4,7 +4,7 @@ use crate::raft::StateMachine;
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::channel::oneshot::Sender;
-use log::info;
+use log::{info, warn};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
@@ -69,6 +69,39 @@ impl Store {
             );
         }
     }
+
+    // Called to apply any committed values that haven't been applied to the
+    // state machine. This method is always safe to call, on leaders and followers.
+    pub async fn apply_committed(&mut self) {
+        while self.applied < self.committed {
+            self.applied = self.applied + 1;
+            let entry = self.log.entry_at(self.applied);
+            let entry_id = entry.id.expect("id").clone();
+
+            let result = self
+                .state_machine
+                .lock()
+                .await
+                .apply(&Bytes::from(entry.payload));
+            match result {
+                Ok(()) => {
+                    info!(
+                        "[{}] Applied entry: {}",
+                        &self.name,
+                        entry_id_key(&entry_id)
+                    );
+                }
+                Err(msg) => {
+                    warn!(
+                        "[{}] Failed to apply {}: {}",
+                        &self.name,
+                        entry_id_key(&entry_id),
+                        msg,
+                    );
+                }
+            }
+        }
+    }
 }
 
 // Represents a snapshot of the state machine after applying a complete prefix
@@ -113,4 +146,8 @@ impl Ord for CommitListener {
     fn cmp(&self, other: &Self) -> Ordering {
         (self.index, self.uid).cmp(&(other.index, other.uid))
     }
+}
+
+fn entry_id_key(entry_id: &EntryId) -> String {
+    format!("(term={},id={})", entry_id.term, entry_id.index)
 }
