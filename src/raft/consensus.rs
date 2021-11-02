@@ -82,23 +82,21 @@ impl RaftImpl {
         diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
         config: Config,
     ) -> RaftImpl {
-        let compaction_threshold_bytes = config.compaction_threshold_bytes;
+        let store = Store::new(
+            state_machine,
+            config.compaction_threshold_bytes,
+            server.name.as_str(),
+        );
         RaftImpl {
             address: server.clone(),
             state: Arc::new(Mutex::new(RaftState {
                 config,
+                store,
 
                 term: 0,
                 voted_for: None,
-                store: Store::new(
-                    state_machine,
-                    compaction_threshold_bytes,
-                    server.name.as_str(),
-                ),
-
                 role: RaftRole::Follower,
                 followers: HashMap::new(),
-
                 timer_guard: None,
 
                 address: server.clone(),
@@ -198,7 +196,7 @@ impl RaftImpl {
             let request = state.create_vote_request();
             let others = state.get_others();
             for server in others {
-                match state.get_client(&server).await {
+                match state.new_client(&server).await {
                     Ok(client) => {
                         futures.push(Box::pin(RaftState::request_vote(client, request.clone())));
                     }
@@ -307,7 +305,7 @@ impl RaftImpl {
                     .unwrap()
                     .next_index;
 
-                let client = state.get_client(&follower).await;
+                let client = state.new_client(&follower).await;
                 if let Err(msg) = &client {
                     results.push(Box::pin(err(Status::unavailable(format!(
                         "Unable to connect to {} : {}",
@@ -468,18 +466,14 @@ enum RaftRole {
 }
 
 struct RaftState {
-    // Constant state.
     config: Config,
+    store: Store,
 
-    // Persistent raft state.
+    // Term state.
     term: i64,
     voted_for: Option<Server>,
-    store: Store, // RaftState gets sent between threads.
-
-    // Volatile raft state.
     role: RaftRole,
     followers: HashMap<String, FollowerPosition>,
-
     timer_guard: Option<TimerGuard>,
 
     // Cluster membership.
@@ -495,7 +489,7 @@ struct RaftState {
 
 impl RaftState {
     // Returns an rpc client which can be used to contact the supplied peer.
-    async fn get_client(&mut self, address: &Server) -> Result<RaftClient<Channel>, Error> {
+    async fn new_client(&mut self, address: &Server) -> Result<RaftClient<Channel>, Error> {
         let key = address_key(address);
         let cached = self.channels.get_mut(&key);
         if let Some(channel) = cached {
