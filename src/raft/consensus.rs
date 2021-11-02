@@ -2,18 +2,16 @@ extern crate chrono;
 extern crate math;
 extern crate rand;
 
-use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
-use futures::channel::oneshot::{channel, Receiver, Sender};
 use futures::future::{err, join_all};
 use futures::FutureExt;
-use log::{debug, error, info, warn};
+use log::{debug, info};
 use rand::Rng;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -21,7 +19,7 @@ use tonic::transport::{Channel, Endpoint, Error};
 use tonic::{Request, Response, Status};
 
 use diagnostics::ServerDiagnostics;
-use raft::log::{ContainsResult, LogSlice};
+use raft::log::ContainsResult;
 use raft::raft_proto;
 use raft::StateMachine;
 use raft_proto::{AppendRequest, AppendResponse, EntryId, Server, VoteRequest, VoteResponse};
@@ -30,6 +28,7 @@ use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 
 use crate::raft;
 use crate::raft::diagnostics;
+use crate::raft::store::Store;
 use crate::raft_proto::raft_client::RaftClient;
 use crate::raft_proto::raft_server::Raft;
 
@@ -68,16 +67,6 @@ impl Config {
     }
 }
 
-// Represents a snapshot of the state machine after applying a complete prefix
-// of entries since the beginning of time.
-struct LogSnapshot {
-    // The id of the latest entry included in the snapshot.
-    last: EntryId,
-
-    // The snapshot bytes as produced by the state machine.
-    snapshot: Bytes,
-}
-
 // Canonical implementation of the raft service. Acts as one server among peers
 // which form a cluster.
 pub struct RaftImpl {
@@ -93,25 +82,21 @@ impl RaftImpl {
         diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
         config: Config,
     ) -> RaftImpl {
+        let store = Store::new(
+            state_machine,
+            config.compaction_threshold_bytes,
+            server.name.as_str(),
+        );
         RaftImpl {
             address: server.clone(),
             state: Arc::new(Mutex::new(RaftState {
                 config,
+                store,
 
                 term: 0,
                 voted_for: None,
-                log: LogSlice::initial(),
-                state_machine,
-                snapshot: None,
-
-                committed: -1,
-                applied: -1,
                 role: RaftRole::Follower,
                 followers: HashMap::new(),
-
-                listener_uid: 0,
-                listeners: BTreeSet::new(),
-
                 timer_guard: None,
 
                 address: server.clone(),
@@ -165,7 +150,7 @@ impl RaftImpl {
                 if state.role == RaftRole::Stopping {
                     return;
                 }
-                state.try_compact().await;
+                state.store.try_compact().await;
             }
             let period_ms = arc_state.lock().await.config.compaction_check_periods_ms;
             sleep(Duration::from_millis(add_jitter(period_ms))).await;
@@ -211,7 +196,7 @@ impl RaftImpl {
             let request = state.create_vote_request();
             let others = state.get_others();
             for server in others {
-                match state.get_client(&server).await {
+                match state.new_client(&server).await {
                     Ok(client) => {
                         futures.push(Box::pin(RaftState::request_vote(client, request.clone())));
                     }
@@ -320,7 +305,7 @@ impl RaftImpl {
                     .unwrap()
                     .next_index;
 
-                let client = state.get_client(&follower).await;
+                let client = state.new_client(&follower).await;
                 if let Err(msg) = &client {
                     results.push(Box::pin(err(Status::unavailable(format!(
                         "Unable to connect to {} : {}",
@@ -330,7 +315,7 @@ impl RaftImpl {
                 }
 
                 let client = client.unwrap();
-                if state.log.is_index_compacted(next_index) {
+                if state.store.log.is_index_compacted(next_index) {
                     let request = state.create_snapshot_request();
                     let fut = RaftImpl::replicate_snapshot(
                         client,
@@ -459,40 +444,6 @@ struct FollowerPosition {
     match_index: i64,
 }
 
-// Each instance represents an ongoing commit operation waiting for the committed
-// index to reach the index of their tentative new entry.
-#[derive(Debug)]
-struct CommitListener {
-    // The index the listener would like to be notified about.
-    index: i64,
-
-    // Used to send the resulting entry id to the listener.
-    sender: Sender<EntryId>,
-
-    // Used to disambiguate between structs for the same index.
-    uid: i64,
-}
-
-impl Eq for CommitListener {}
-
-impl PartialEq<Self> for CommitListener {
-    fn eq(&self, other: &Self) -> bool {
-        (self.index, self.uid).eq(&(other.index, other.uid))
-    }
-}
-
-impl PartialOrd<Self> for CommitListener {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        (self.index, self.uid).partial_cmp(&(other.index, other.uid))
-    }
-}
-
-impl Ord for CommitListener {
-    fn cmp(&self, other: &Self) -> Ordering {
-        (self.index, self.uid).cmp(&(other.index, other.uid))
-    }
-}
-
 // Holds on to the handle of a timed operation and cancels it upon destruction.
 // This allows callers to just replace the guard in order to refresh a timer,
 // ensuring that there is only one timer active at any given time.
@@ -515,25 +466,14 @@ enum RaftRole {
 }
 
 struct RaftState {
-    // Constant state.
     config: Config,
+    store: Store,
 
-    // Persistent raft state.
+    // Term state.
     term: i64,
     voted_for: Option<Server>,
-    log: LogSlice,
-    state_machine: Arc<Mutex<dyn StateMachine + Send>>, // RaftState gets sent between threads.
-
-    // Volatile raft state.
-    committed: i64,
-    applied: i64,
     role: RaftRole,
     followers: HashMap<String, FollowerPosition>,
-    snapshot: Option<LogSnapshot>,
-
-    listener_uid: i64,
-    listeners: BTreeSet<CommitListener>,
-
     timer_guard: Option<TimerGuard>,
 
     // Cluster membership.
@@ -549,7 +489,7 @@ struct RaftState {
 
 impl RaftState {
     // Returns an rpc client which can be used to contact the supplied peer.
-    async fn get_client(&mut self, address: &Server) -> Result<RaftClient<Channel>, Error> {
+    async fn new_client(&mut self, address: &Server) -> Result<RaftClient<Channel>, Error> {
         let key = address_key(address);
         let cached = self.channels.get_mut(&key);
         if let Some(channel) = cached {
@@ -583,7 +523,7 @@ impl RaftState {
                 address_key(&server),
                 FollowerPosition {
                     // Optimistically start assuming next is the same as our own next.
-                    next_index: self.log.next_index(),
+                    next_index: self.store.log.next_index(),
                     match_index: -1,
                 },
             );
@@ -596,15 +536,15 @@ impl RaftState {
     // exist in our current log.
     fn create_append_request(&self, next_index: i64) -> AppendRequest {
         // This method should only get called if we know the index is present.
-        assert!(!self.log.is_index_compacted(next_index));
-        let previous = self.log.id_at(next_index - 1);
+        assert!(!self.store.log.is_index_compacted(next_index));
+        let previous = self.store.log.id_at(next_index - 1);
 
         AppendRequest {
             term: self.term,
             leader: Some(self.address.clone()),
             previous: Some(previous.clone()),
-            entries: self.log.get_entries_after(&previous),
-            committed: self.committed,
+            entries: self.store.log.get_entries_after(&previous),
+            committed: self.store.committed_index(),
         }
     }
 
@@ -613,7 +553,7 @@ impl RaftState {
     fn create_snapshot_request(&self) -> InstallSnapshotRequest {
         let mut snapshot: Vec<u8> = vec![];
         let mut last: Option<EntryId> = None;
-        match &self.snapshot {
+        match self.store.get_latest_snapshot() {
             None => (),
             Some(snap) => {
                 snapshot = snap.snapshot.to_vec();
@@ -684,93 +624,32 @@ impl RaftState {
         }
     }
 
+    // Returns the highest index I such that each index at most I is replicated
+    // to a majority of followers. In practice, this means that it is safe to
+    // commit up to (and including) the result.
+    fn compute_highest_majority_match(&self) -> i64 {
+        let mut matches: Vec<i64> = self
+            .followers
+            .values()
+            .clone()
+            .into_iter()
+            .map(|f| f.match_index)
+            .collect();
+        matches.sort();
+        let mid = matches.len() / 2;
+
+        // The second half of the array has match_index above the return value. For even,
+        // we round down so that [1, 2, 4, 7] ends up as "2" (with the latter 3 followers
+        // making up the majority).
+        matches[mid]
+    }
+
     // Scans the state of our followers in the hope of finding a new index which
     // has been replicated to a majority. If such an index is found, this updates
     // the index this leader considers committed.
     async fn update_committed(&mut self) {
-        let saved_committed = self.committed;
-        for index in self.committed + 1..self.log.next_index() {
-            let mut matches = 1; // We match.
-            for (_, follower) in &self.followers {
-                if follower.match_index >= index {
-                    matches = matches + 1;
-                }
-            }
-
-            if 2 * matches > self.cluster.len() {
-                self.committed = index;
-                self.resolve_listeners();
-            }
-        }
-        if self.committed != saved_committed {
-            debug!(
-                "[{}] Updated committed index from {} to {}",
-                &self.address.name, saved_committed, self.committed
-            );
-        }
-
-        self.apply_committed().await;
-    }
-
-    // Registers a listener for the supplied index.
-    fn add_listener(&mut self, index: i64) -> Receiver<EntryId> {
-        let (sender, receiver) = channel::<EntryId>();
-        self.listeners.insert(CommitListener {
-            index,
-            sender,
-            uid: self.listener_uid,
-        });
-        self.listener_uid = self.listener_uid + 1;
-        receiver
-    }
-
-    // Tries to resolve the promises for listeners waiting for commits.
-    fn resolve_listeners(&mut self) {
-        while self.listeners.first().is_some()
-            && self.listeners.first().unwrap().index <= self.committed
-        {
-            let next = self.listeners.pop_first().expect("get first");
-            let index = next.index;
-            if !self.log.is_index_compacted(index) {
-                next.sender
-                    .send(self.log.id_at(index))
-                    .map_err(|_| warn!("Listener for commit {} no longer listening", index))
-                    .ok();
-            } else {
-                // Do nothing, we just let the sender go out of scope, which will notify the
-                // receiver of the cancellation
-            }
-        }
-    }
-
-    // Called to apply any committed values that haven't been applied to the
-    // state machine. This method is always safe to call, on leaders and followers.
-    async fn apply_committed(&mut self) {
-        while self.applied < self.committed {
-            self.applied = self.applied + 1;
-            let entry = self.log.entry_at(self.applied);
-            let entry_id = entry.id.expect("id").clone();
-
-            let result = self
-                .state_machine
-                .lock()
-                .await
-                .apply(&Bytes::from(entry.payload));
-            let me = self.address.clone().name;
-            match result {
-                Ok(()) => {
-                    info!("[{}] Applied entry: {}", &me, entry_id_key(&entry_id));
-                }
-                Err(msg) => {
-                    warn!(
-                        "[{}] Failed to apply {}: {}",
-                        &me,
-                        entry_id_key(&entry_id),
-                        msg,
-                    );
-                }
-            }
-        }
+        let new_commit_index = self.compute_highest_majority_match();
+        self.store.commit_to(new_commit_index).await;
     }
 
     // Returns a request which a candidate can send in order to request the vote
@@ -779,31 +658,7 @@ impl RaftState {
         VoteRequest {
             term: self.term,
             candidate: Some(self.address.clone()),
-            last: Some(self.log.last_known_id().clone()),
-        }
-    }
-
-    // Compacts logs entries into a new snapshot if necessary.
-    async fn try_compact(&mut self) {
-        if self.log.size_bytes() > self.config.compaction_threshold_bytes {
-            let applied_index = self.applied;
-            let latest_id = self.log.id_at(applied_index);
-            let snap = LogSnapshot {
-                snapshot: self.state_machine.lock().await.create_snapshot(),
-                last: latest_id.clone(),
-            };
-            self.snapshot = Some(snap);
-
-            // Note that we prefer not to clear the log slice entirely
-            // because although losing uncommitted entries is safe, the
-            // leader doing this could result in failed commit operations
-            // sent to the leader.
-            self.log.prune_until(&latest_id);
-
-            info!(
-                "[{}] Compacted log with snapshot up to (including) index {}",
-                self.address.name, applied_index
-            );
+            last: Some(self.store.log.last_known_id().clone()),
         }
     }
 
@@ -848,12 +703,20 @@ impl Raft for RaftImpl {
         let granted;
         let me = self.address.clone().name;
         if state.voted_for.is_none() || &candidate == &state.voted_for {
-            if state.log.is_up_to_date(&request.last.expect("last")) {
+            if state.store.log.is_up_to_date(&request.last.expect("last")) {
                 state.voted_for = candidate.clone();
-                info!("[{}] Granted vote", &me);
+                info!(
+                    "[{}] Granted vote to {:?}",
+                    &me,
+                    state.voted_for.clone().map(|x| x.name)
+                );
                 granted = true;
             } else {
-                info!("[{}] Denied vote", &me);
+                info!(
+                    "[{}] Denied vote to {:?}",
+                    &me,
+                    state.voted_for.clone().map(|x| x.name)
+                );
                 granted = false;
             }
         } else {
@@ -928,7 +791,12 @@ impl Raft for RaftImpl {
         // Make sure we have the previous log index sent. Note that COMPACTED
         // can happen whenever we have no entries (e.g.,initially or just after
         // a snapshot install).
-        if state.log.contains(&request.previous.expect("previous")) == ContainsResult::ABSENT {
+        if state
+            .store
+            .log
+            .contains(&request.previous.expect("previous"))
+            == ContainsResult::ABSENT
+        {
             // Let the leader know that this entry is too far in the future, so
             // it can try again from with earlier index.
             return Ok(Response::new(AppendResponse {
@@ -938,17 +806,14 @@ impl Raft for RaftImpl {
         }
 
         if !request.entries.is_empty() {
-            state.log.append_all(request.entries.as_slice());
+            state.store.log.append_all(request.entries.as_slice());
         }
 
         // If the leader considers an entry committed, it is guaranteed that
         // all members of the cluster agree on the log up to that index, so it
         // is safe to apply the entries to the state machine.
-        let leader_commit = request.committed;
-        if leader_commit > state.committed {
-            state.committed = leader_commit;
-            state.apply_committed().await;
-        }
+        let leader_commit_index = request.committed;
+        state.store.commit_to(leader_commit_index).await;
 
         debug!("[{}] Successfully processed heartbeat", &self.address.name);
         Ok(Response::new(AppendResponse {
@@ -979,8 +844,8 @@ impl Raft for RaftImpl {
             }
 
             term = state.term;
-            entry_id = state.log.append(term, request.payload);
-            receiver = state.add_listener(entry_id.index);
+            entry_id = state.store.log.append(term, request.payload);
+            receiver = state.store.add_listener(entry_id.index);
         }
 
         let committed = receiver.await;
@@ -1047,44 +912,12 @@ impl Raft for RaftImpl {
 
         let mut state = self.state.lock().await;
         if request.term >= state.term && !request.snapshot.is_empty() {
-            // Update the state machine.
-            let snapshot = Bytes::from(request.snapshot.to_vec());
-            match state.state_machine.lock().await.load_snapshot(&snapshot) {
-                Ok(_) => (),
-                Err(message) => error!(
-                    "[{}] Failed to load snapshot: [{:?}]",
-                    self.address.name, message
-                ),
-            }
-
-            // Update the log.
             let last = request.last.expect("last");
-            let contains = state.log.contains(&last);
-            match contains {
-                ContainsResult::ABSENT => {
-                    // Common case, snapshot from the future. Just clear the log.
-                    state.log = LogSlice::new(last.clone());
-                }
-                ContainsResult::PRESENT => {
-                    // Entries that came after the latest snapshot entry might still be valid.
-                    state.log.prune_until(&last);
-                }
-                ContainsResult::COMPACTED => {
-                    // Something went very wrong...
-                    warn!(
-                        "[{}] Got snapshot for already compacted index {}",
-                        state.address.name, last.index,
-                    );
-                }
+            let snapshot = Bytes::from(request.snapshot.to_vec());
+            let status = state.store.install_snapshot(snapshot, last).await;
+            if status.code() != tonic::Code::Ok {
+                return Err(status);
             }
-
-            // Update volatile state.
-            state.applied = last.index;
-            state.committed = last.index;
-            state.snapshot = Some(LogSnapshot {
-                last: last.clone(),
-                snapshot: Bytes::from(request.snapshot.to_vec()),
-            });
         }
         Ok(Response::new(InstallSnapshotResponse { term: state.term }))
     }
@@ -1101,14 +934,10 @@ fn address_key(address: &Server) -> String {
     format!("{}:{}", address.host, address.port)
 }
 
-fn entry_id_key(entry_id: &EntryId) -> String {
-    format!("(term={},id={})", entry_id.term, entry_id.index)
-}
-
 #[cfg(test)]
 mod tests {
     use crate::raft::raft_proto::raft_server::RaftServer;
-    use crate::raft::StateMachineResult;
+    use crate::raft::testing::FakeStateMachine;
     use crate::raft_proto::Entry;
     use crate::testing::TestServer;
 
@@ -1120,8 +949,6 @@ mod tests {
         let state = raft.state.lock().await;
         assert_eq!(state.role, RaftRole::Follower);
         assert_eq!(state.term, 0);
-        assert_eq!(state.committed, -1);
-        assert_eq!(state.applied, -1);
     }
 
     // This test verifies that initially, a follower fails to accept entries
@@ -1226,16 +1053,16 @@ mod tests {
             let state = raft_state.lock().await;
             assert_eq!(state.last_known_leader, Some(leader.clone()));
             assert_eq!(state.term, 12);
-            assert!(!state.log.is_index_compacted(0)); // Not compacted
-            assert_eq!(state.log.next_index(), 3);
+            assert!(!state.store.log.is_index_compacted(0)); // Not compacted
+            assert_eq!(state.store.log.next_index(), 3);
         }
 
         // Run a compaction, should have no effect
         {
             let mut state = raft_state.lock().await;
-            state.try_compact().await;
-            assert!(!state.log.is_index_compacted(0)); // Not compacted
-            assert_eq!(state.log.next_index(), 3);
+            state.store.try_compact().await;
+            assert!(!state.store.log.is_index_compacted(0)); // Not compacted
+            assert_eq!(state.store.log.next_index(), 3);
         }
 
         // Now send an append request with a payload large enough to trigger compaction.
@@ -1265,16 +1092,24 @@ mod tests {
         assert!(append_response_2.success);
         {
             let state = raft_state.lock().await;
-            assert!(!state.log.is_index_compacted(0)); // Not compacted
-            assert_eq!(state.log.next_index(), 4); // New entry incorporated
+            assert!(!state.store.log.is_index_compacted(0)); // Not compacted
+            assert_eq!(state.store.log.next_index(), 4); // New entry incorporated
         }
 
         // Run a compaction, this one should actually compact things now.
         {
             let mut state = raft_state.lock().await;
-            state.try_compact().await;
-            assert!(state.log.is_index_compacted(0)); // Compacted
-            assert_eq!(state.snapshot.as_ref().expect("snapshot").last.index, 3)
+            state.store.try_compact().await;
+            assert!(state.store.log.is_index_compacted(0)); // Compacted
+            assert_eq!(
+                state
+                    .store
+                    .get_latest_snapshot()
+                    .expect("snapshot")
+                    .last
+                    .index,
+                3
+            )
         }
     }
 
@@ -1328,33 +1163,5 @@ mod tests {
         RaftClient::connect(format!("http://[::1]:{}", port))
             .await
             .expect("client")
-    }
-
-    struct FakeStateMachine {
-        committed: i64,
-        snapshots_loaded: i64,
-    }
-
-    impl FakeStateMachine {
-        fn new() -> Self {
-            FakeStateMachine {
-                committed: 0,
-                snapshots_loaded: 0,
-            }
-        }
-    }
-
-    impl StateMachine for FakeStateMachine {
-        fn apply(&mut self, _operation: &Bytes) -> StateMachineResult {
-            self.committed += 1;
-            Ok(())
-        }
-        fn create_snapshot(&self) -> Bytes {
-            Bytes::from(Vec::new())
-        }
-        fn load_snapshot(&mut self, _snapshot: &Bytes) -> StateMachineResult {
-            self.snapshots_loaded += 1;
-            Ok(())
-        }
     }
 }
