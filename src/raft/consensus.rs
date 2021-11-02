@@ -630,32 +630,32 @@ impl RaftState {
         }
     }
 
+    // Returns the highest index I such that each index at most I is replicated
+    // to a majority of followers. In practice, this means that it is safe to
+    // commit up to (and including) the result.
+    fn compute_highest_majority_match(&self) -> i64 {
+        let mut matches: Vec<i64> = self
+            .followers
+            .values()
+            .clone()
+            .into_iter()
+            .map(|f| f.match_index)
+            .collect();
+        matches.sort();
+        let mid = matches.len() / 2;
+
+        // The second half of the array has match_index above the return value. For even,
+        // we round down so that [1, 2, 4, 7] ends up as "2" (with the latter 3 followers
+        // making up the majority).
+        matches[mid]
+    }
+
     // Scans the state of our followers in the hope of finding a new index which
     // has been replicated to a majority. If such an index is found, this updates
     // the index this leader considers committed.
     async fn update_committed(&mut self) {
-        let saved_committed = self.store.committed;
-        for index in self.store.committed + 1..self.store.log.next_index() {
-            let mut matches = 1; // We match.
-            for (_, follower) in &self.followers {
-                if follower.match_index >= index {
-                    matches = matches + 1;
-                }
-            }
-
-            if 2 * matches > self.cluster.len() {
-                self.store.committed = index;
-                self.store.resolve_listeners();
-            }
-        }
-        if self.store.committed != saved_committed {
-            debug!(
-                "[{}] Updated committed index from {} to {}",
-                &self.address.name, saved_committed, self.store.committed
-            );
-        }
-
-        self.store.apply_committed().await;
+        let new_commit_index = self.compute_highest_majority_match();
+        self.store.commit_to(new_commit_index).await;
     }
 
     // Returns a request which a candidate can send in order to request the vote
@@ -711,10 +711,18 @@ impl Raft for RaftImpl {
         if state.voted_for.is_none() || &candidate == &state.voted_for {
             if state.store.log.is_up_to_date(&request.last.expect("last")) {
                 state.voted_for = candidate.clone();
-                info!("[{}] Granted vote", &me);
+                info!(
+                    "[{}] Granted vote to {:?}",
+                    &me,
+                    state.voted_for.clone().map(|x| x.name)
+                );
                 granted = true;
             } else {
-                info!("[{}] Denied vote", &me);
+                info!(
+                    "[{}] Denied vote to {:?}",
+                    &me,
+                    state.voted_for.clone().map(|x| x.name)
+                );
                 granted = false;
             }
         } else {
@@ -810,11 +818,8 @@ impl Raft for RaftImpl {
         // If the leader considers an entry committed, it is guaranteed that
         // all members of the cluster agree on the log up to that index, so it
         // is safe to apply the entries to the state machine.
-        let leader_commit = request.committed;
-        if leader_commit > state.store.committed {
-            state.store.committed = leader_commit;
-            state.store.apply_committed().await;
-        }
+        let leader_commit_index = request.committed;
+        state.store.commit_to(leader_commit_index).await;
 
         debug!("[{}] Successfully processed heartbeat", &self.address.name);
         Ok(Response::new(AppendResponse {

@@ -4,7 +4,7 @@ use crate::raft::StateMachine;
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::channel::oneshot::{channel, Receiver, Sender};
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use tonic::Status;
@@ -73,37 +73,23 @@ impl Store {
         }
     }
 
-    // Called to apply any committed values that haven't been applied to the
-    // state machine. This method is always safe to call, on leaders and followers.
-    pub async fn apply_committed(&mut self) {
-        while self.applied < self.committed {
-            self.applied = self.applied + 1;
-            let entry = self.log.entry_at(self.applied);
-            let entry_id = entry.id.expect("id").clone();
+    // Marks the stored entries up to (and including) the supplied index as committed,
+    // informing any listeners if necessary, applying changes to the state machine, etc.
+    pub async fn commit_to(&mut self, new_commit_index: i64) {
+        // This has a built-in assertion that the entry is present in the log.
+        self.log.id_at(new_commit_index);
 
-            let result = self
-                .state_machine
-                .lock()
-                .await
-                .apply(&Bytes::from(entry.payload));
-            match result {
-                Ok(()) => {
-                    info!(
-                        "[{}] Applied entry: {}",
-                        &self.name,
-                        entry_id_key(&entry_id)
-                    );
-                }
-                Err(msg) => {
-                    warn!(
-                        "[{}] Failed to apply {}: {}",
-                        &self.name,
-                        entry_id_key(&entry_id),
-                        msg,
-                    );
-                }
-            }
+        let old_commit_index = self.committed;
+        self.committed = new_commit_index;
+        if new_commit_index > old_commit_index {
+            debug!(
+                "[{}] Updated committed index from {} to {}",
+                &self.name, old_commit_index, self.committed
+            );
         }
+
+        self.apply_committed().await;
+        self.resolve_listeners();
     }
 
     // Registers a listener for the supplied index.
@@ -116,25 +102,6 @@ impl Store {
         });
         self.listener_uid = self.listener_uid + 1;
         receiver
-    }
-
-    // Tries to resolve the promises for listeners waiting for commits.
-    pub fn resolve_listeners(&mut self) {
-        while self.listeners.first().is_some()
-            && self.listeners.first().unwrap().index <= self.committed
-        {
-            let next = self.listeners.pop_first().expect("get first");
-            let index = next.index;
-            if !self.log.is_index_compacted(index) {
-                next.sender
-                    .send(self.log.id_at(index))
-                    .map_err(|_| warn!("Listener for commit {} no longer listening", index))
-                    .ok();
-            } else {
-                // Do nothing, we just let the sender go out of scope, which will notify the
-                // receiver of the cancellation
-            }
-        }
     }
 
     // Resets the state of this store to the supplied snapshot.
@@ -179,6 +146,58 @@ impl Store {
 
     pub fn get_latest_snapshot(&self) -> Option<LogSnapshot> {
         self.snapshot.clone()
+    }
+
+    // Called to apply any committed values that haven't been applied to the
+    // state machine. This method is always safe to call, on leaders and followers.
+    async fn apply_committed(&mut self) {
+        while self.applied < self.committed {
+            self.applied = self.applied + 1;
+            let entry = self.log.entry_at(self.applied);
+            let entry_id = entry.id.expect("id").clone();
+
+            let result = self
+                .state_machine
+                .lock()
+                .await
+                .apply(&Bytes::from(entry.payload));
+            match result {
+                Ok(()) => {
+                    info!(
+                        "[{}] Applied entry: {}",
+                        &self.name,
+                        entry_id_key(&entry_id)
+                    );
+                }
+                Err(msg) => {
+                    warn!(
+                        "[{}] Failed to apply {}: {}",
+                        &self.name,
+                        entry_id_key(&entry_id),
+                        msg,
+                    );
+                }
+            }
+        }
+    }
+
+    // Tries to resolve the promises for listeners waiting for commits.
+    fn resolve_listeners(&mut self) {
+        while self.listeners.first().is_some()
+            && self.listeners.first().unwrap().index <= self.committed
+        {
+            let next = self.listeners.pop_first().expect("get first");
+            let index = next.index;
+            if !self.log.is_index_compacted(index) {
+                next.sender
+                    .send(self.log.id_at(index))
+                    .map_err(|_| warn!("Listener for commit {} no longer listening", index))
+                    .ok();
+            } else {
+                // Do nothing, we just let the sender go out of scope, which will notify the
+                // receiver of the cancellation
+            }
+        }
     }
 }
 
