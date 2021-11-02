@@ -55,6 +55,11 @@ impl Store {
         self.committed
     }
 
+    // Returns a copy of the latest snapshot backing this store, if any.
+    pub fn get_latest_snapshot(&self) -> Option<LogSnapshot> {
+        self.snapshot.clone()
+    }
+
     // Compacts logs entries into a new snapshot if necessary.
     pub async fn try_compact(&mut self) {
         if self.log.size_bytes() > self.compaction_threshold_bytes {
@@ -112,6 +117,11 @@ impl Store {
             uid: self.listener_uid,
         });
         self.listener_uid = self.listener_uid + 1;
+
+        // This makes sure that if a listener is added for an index that's
+        // already been committed, we resolve it immediately.
+        self.resolve_listeners();
+
         receiver
     }
 
@@ -153,10 +163,6 @@ impl Store {
         self.snapshot = Some(LogSnapshot { last, snapshot });
 
         Status::ok("")
-    }
-
-    pub fn get_latest_snapshot(&self) -> Option<LogSnapshot> {
-        self.snapshot.clone()
     }
 
     // Called to apply any committed values that haven't been applied to the
@@ -265,6 +271,7 @@ fn entry_id_key(entry_id: &EntryId) -> String {
 mod tests {
     use super::*;
     use crate::raft::testing::FakeStateMachine;
+    use futures::FutureExt;
 
     const COMPACTION_THRESHOLD_BYTES: i64 = 5000;
 
@@ -279,7 +286,112 @@ mod tests {
     #[test]
     fn test_initial() {
         let store = make_store();
-        assert_eq!(store.committed, -1);
+        assert_eq!(store.committed_index(), -1);
         assert_eq!(store.applied, -1);
+        assert!(store.get_latest_snapshot().is_none());
+    }
+
+    #[tokio::test]
+    #[should_panic]
+    async fn test_commit_to_bad_index() {
+        let mut store = make_store();
+        store.log.append(2, Vec::new());
+
+        // Attempt to "commit to" a value which hasn't yet been appended.
+        store.commit_to(17).await;
+    }
+
+    #[tokio::test]
+    async fn test_commit_to() {
+        let mut store = make_store();
+        let eid = store.log.append(2, Vec::new());
+
+        // Should succeed.
+        store.commit_to(eid.index).await;
+
+        // Should succeed (noop).
+        store.commit_to(eid.index - 1).await;
+    }
+
+    #[tokio::test]
+    async fn test_listener() {
+        let mut store = make_store();
+        let receiver = store.add_listener(2);
+
+        store.log.append(67, Vec::new());
+        store.log.append(67, Vec::new());
+        store.log.append(68, Vec::new());
+
+        store.commit_to(2).await;
+        let output = receiver.now_or_never();
+        assert!(output.is_some());
+
+        let result = output.unwrap().unwrap();
+        assert_eq!(2, result.index);
+        assert_eq!(68, result.term);
+    }
+
+    #[tokio::test]
+    async fn test_listener_multi() {
+        let mut store = make_store();
+        let receiver1 = store.add_listener(0);
+        let receiver2 = store.add_listener(1);
+        let receiver3 = store.add_listener(0);
+
+        store.log.append(67, Vec::new());
+        store.commit_to(0).await;
+
+        assert!(receiver1.now_or_never().is_some());
+        assert!(receiver2.now_or_never().is_none());
+        assert!(receiver3.now_or_never().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_listener_past() {
+        let mut store = make_store();
+
+        store.log.append(67, Vec::new());
+        store.log.append(67, Vec::new());
+        store.commit_to(1).await;
+
+        let receiver = store.add_listener(0);
+        assert!(receiver.now_or_never().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_compaction() {
+        let mut store = make_store();
+        let eid = store
+            .log
+            .append(67, vec![0; 2 * COMPACTION_THRESHOLD_BYTES as usize]);
+        assert!(store.log.size_bytes() > COMPACTION_THRESHOLD_BYTES);
+
+        store.commit_to(eid.index).await;
+        store.try_compact().await;
+
+        assert!(store.log.size_bytes() < COMPACTION_THRESHOLD_BYTES);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot() {
+        let mut store = make_store();
+        assert!(store.get_latest_snapshot().is_none());
+
+        store
+            .install_snapshot(
+                Bytes::from(""),
+                EntryId {
+                    term: 17,
+                    index: 22,
+                },
+            )
+            .await;
+        assert_eq!(22, store.committed_index());
+
+        let snap = store.get_latest_snapshot();
+        assert!(snap.is_some());
+        let last = snap.unwrap().last;
+        assert_eq!(17, last.term);
+        assert_eq!(22, last.index);
     }
 }
