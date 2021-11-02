@@ -82,6 +82,11 @@ impl Store {
     // Marks the stored entries up to (and including) the supplied index as committed,
     // informing any listeners if necessary, applying changes to the state machine, etc.
     pub async fn commit_to(&mut self, new_commit_index: i64) {
+        if new_commit_index <= self.committed {
+            // Nothing to do here, already committed past the supplied index.
+            return;
+        }
+
         // This has a built-in assertion that the entry is present in the log.
         self.log.id_at(new_commit_index);
 
