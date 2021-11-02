@@ -23,7 +23,7 @@ pub struct Store {
     listener_uid: i64,
     listeners: BTreeSet<CommitListener>,
 
-    pub committed: i64,
+    committed: i64,
     applied: i64,
 
     compaction_threshold_bytes: i64,
@@ -47,6 +47,12 @@ impl Store {
             compaction_threshold_bytes,
             name: name.to_string(),
         }
+    }
+
+    // Returns the index up to (and including) which the corresponding entries are
+    // considered committed.
+    pub fn committed_index(&self) -> i64 {
+        self.committed
     }
 
     // Compacts logs entries into a new snapshot if necessary.

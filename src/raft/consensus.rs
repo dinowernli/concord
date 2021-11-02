@@ -550,7 +550,7 @@ impl RaftState {
             leader: Some(self.address.clone()),
             previous: Some(previous.clone()),
             entries: self.store.log.get_entries_after(&previous),
-            committed: self.store.committed,
+            committed: self.store.committed_index(),
         }
     }
 
