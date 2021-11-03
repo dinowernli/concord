@@ -11,7 +11,7 @@ use futures::future::join4;
 use futures::future::join_all;
 use log::{error, info};
 use rand::seq::SliceRandom;
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 
 use raft::raft_proto;
 use raft::{Config, Diagnostics, RaftImpl};
@@ -81,8 +81,13 @@ async fn run_preempt_loop(cluster: &Vec<Server>) {
     let name = "main-preempt";
     let client = raft::new_client(name, &member);
     loop {
+        let start = Instant::now();
         match client.preempt_leader().await {
-            Ok(leader) => info!("Preempted cluster leader: {}", leader.name),
+            Ok(leader) => info!(
+                "Preempted cluster leader: {} (took {}ms)",
+                leader.name,
+                start.elapsed().as_millis()
+            ),
             Err(message) => error!("Failed to preempt leader: {}", message),
         }
         sleep(Duration::from_secs(10)).await;
@@ -114,9 +119,19 @@ async fn run_put_loop(cluster: &Vec<Server>) {
         let target = cluster.choose(&mut rand::thread_rng()).expect("nonempty");
         let address = format!("http://[{}]:{}", target.host, target.port);
         let mut client = KeyValueClient::connect(address).await.expect("connect");
+        let start = Instant::now();
         match client.put(request.clone()).await {
-            Ok(_) => info!("Put {} successful", i),
-            Err(msg) => error!("Put {} failed: {}", i, msg),
+            Ok(_) => info!(
+                "Put {} successful (took {}ms)",
+                i,
+                start.elapsed().as_millis()
+            ),
+            Err(msg) => error!(
+                "Put {} failed: {} (took {}ms)",
+                i,
+                msg,
+                start.elapsed().as_millis()
+            ),
         }
         i += 1;
         sleep(Duration::from_millis(1000)).await;
