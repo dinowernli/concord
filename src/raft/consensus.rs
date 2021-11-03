@@ -783,6 +783,9 @@ impl Raft for RaftImpl {
             state.store.log.append_all(request.entries.as_slice());
         }
 
+        // TODO(dino): scan the appended entries for the latest one with a cluster
+        // config change and update the membership info.
+
         // If the leader considers an entry committed, it is guaranteed that
         // all members of the cluster agree on the log up to that index, so it
         // is safe to apply the entries to the state machine.
@@ -880,6 +883,7 @@ fn address_key(address: &Server) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::raft::raft_proto::entry::Data;
     use crate::raft::raft_proto::raft_server::RaftServer;
     use crate::raft::testing::FakeStateMachine;
     use crate::raft_proto::Entry;
@@ -1060,7 +1064,7 @@ mod tests {
     fn entry(id: EntryId, payload: Vec<u8>) -> Entry {
         Entry {
             id: Some(id),
-            payload,
+            data: Some(Data::Payload(payload)),
         }
     }
 

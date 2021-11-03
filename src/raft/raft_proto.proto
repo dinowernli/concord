@@ -15,6 +15,12 @@ message Server {
   string name = 3;
 }
 
+// Configuration for the cluster.
+message ClusterConfig {
+  // Determines which members are considered part of the cluster.
+  repeated Server members = 1;
+}
+
 // Identifies an entry in a given log.
 message EntryId {
   int64 term = 1;
@@ -24,7 +30,15 @@ message EntryId {
 // Represents an entry in a server's log.
 message Entry {
   EntryId id = 1;
-  bytes payload = 2;
+
+  oneof data {
+    // An opaque payload which can be applied to the state machine.
+    bytes payload = 2;
+
+    // An updated configuration for the cluster. Used to effect membership
+    // changes and similar reconfigurations.
+    ClusterConfig config = 3;
+  }
 }
 
 // Sent by candidate to request votes from its peers. If a quorum of votes is

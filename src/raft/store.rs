@@ -1,4 +1,5 @@
 use crate::raft::log::{ContainsResult, LogSlice};
+use crate::raft::raft_proto::entry::Data;
 use crate::raft::raft_proto::EntryId;
 use crate::raft::StateMachine;
 use async_std::sync::{Arc, Mutex};
@@ -172,18 +173,16 @@ impl Store {
             self.applied = self.applied + 1;
             let entry = self.log.entry_at(self.applied);
             let entry_id = entry.id.expect("id").clone();
-
-            let result = self
-                .state_machine
-                .lock()
-                .await
-                .apply(&Bytes::from(entry.payload));
-            match result {
-                Ok(()) => {
-                    debug!(entry=%entry_id_key(&entry_id), "applied");
-                }
-                Err(msg) => {
-                    warn!(entry=%entry_id_key(&entry_id), "failed to apply: {}", msg);
+            
+            if let Some(Data::Payload(bytes)) = entry.data {
+                let result = self.state_machine.lock().await.apply(&Bytes::from(bytes));
+                match result {
+                    Ok(()) => {
+                        debug!(entry=%entry_id_key(&entry_id), "applied");
+                    }
+                    Err(msg) => {
+                        warn!(entry=%entry_id_key(&entry_id), "failed to apply: {}", msg);
+                    }
                 }
             }
         }

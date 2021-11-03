@@ -1,6 +1,8 @@
 use raft_proto::{Entry, EntryId};
 
 use crate::raft::raft_proto;
+use crate::raft::raft_proto::entry::Data;
+use crate::raft::raft_proto::entry::Data::{Config, Payload};
 
 // Represents a contiguous slice of a raft log.
 pub struct LogSlice {
@@ -124,16 +126,16 @@ impl LogSlice {
         assert!(!entries.is_empty(), "append_all called with empty entries");
 
         for entry in entries {
-            let size_bytes = entry.payload.len() as i64;
+            let len_bytes = size_bytes(&entry);
             let index = entry.id.as_ref().expect("id").index;
             if index == self.next_index() {
                 self.entries.push(entry.clone());
-                self.size_bytes += size_bytes;
+                self.size_bytes += len_bytes;
             } else {
                 let local_index = self.local_index(index);
-                self.size_bytes -= self.entries[local_index].payload.len() as i64;
+                self.size_bytes -= size_bytes(&self.entries[local_index]);
                 self.entries[local_index] = entry.clone();
-                self.size_bytes += size_bytes;
+                self.size_bytes += len_bytes;
             }
         }
 
@@ -141,7 +143,7 @@ impl LogSlice {
         let last = entries.last().unwrap().id.as_ref().expect("id");
         let local_index = self.local_index(last.index);
         for entry in self.entries.drain((local_index + 1)..) {
-            self.size_bytes -= entry.payload.len() as i64;
+            self.size_bytes -= size_bytes(&entry);
         }
     }
 
@@ -210,7 +212,7 @@ impl LogSlice {
         let local_idx = self.local_index(entry_id.index) + 1;
 
         for entry in self.entries.drain(0..local_idx) {
-            self.size_bytes -= entry.payload.len() as i64;
+            self.size_bytes -= size_bytes(&entry);
         }
         self.previous_id = entry_id.clone();
     }
@@ -235,7 +237,15 @@ impl LogSlice {
 fn create_entry(term: i64, index: i64, payload: Vec<u8>) -> Entry {
     Entry {
         id: Some(EntryId { term, index }),
-        payload,
+        data: Some(Data::Payload(payload)),
+    }
+}
+
+fn size_bytes(entry: &Entry) -> i64 {
+    match &entry.data {
+        Some(Payload(bytes)) => bytes.len() as i64,
+        Some(Config(_)) => 0,
+        None => 0,
     }
 }
 
@@ -517,7 +527,7 @@ mod tests {
     fn entry(term: i64, index: i64, payload_size_bytes: i64) -> Entry {
         Entry {
             id: Some(entry_id(term, index)),
-            payload: payload_of_size(payload_size_bytes),
+            data: Some(Payload(payload_of_size(payload_size_bytes))),
         }
     }
 }
