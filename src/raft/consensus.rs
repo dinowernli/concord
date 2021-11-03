@@ -468,6 +468,7 @@ enum RaftRole {
 struct RaftState {
     config: Config,
     store: Store,
+    cluster: Cluster,
 
     // Term state.
     term: i64,
@@ -475,12 +476,6 @@ struct RaftState {
     role: RaftRole,
     followers: HashMap<String, FollowerPosition>,
     timer_guard: Option<TimerGuard>,
-
-    // Cluster membership.
-    address: Server,
-    cluster: Vec<Server>,
-    channels: HashMap<String, Channel>,
-    last_known_leader: Option<Server>,
 
     // If present, this instance will inform the diagnostics object of relevant
     // updates as they happen during execution.
@@ -764,7 +759,7 @@ impl Raft for RaftImpl {
 
         // Record the latest leader.
         let leader = request.leader.expect("leader").clone();
-        state.last_known_leader = Some(leader.clone());
+        state.cluster.record_leader(&leader);
         match &state.diagnostics {
             Some(d) => d.lock().await.report_leader(state.term, &leader),
             _ => (),
@@ -838,7 +833,7 @@ impl Raft for RaftImpl {
             if state.role != RaftRole::Leader {
                 return Ok(Response::new(CommitResponse {
                     status: raft_proto::Status::NotLeader as i32,
-                    leader: state.last_known_leader.clone(),
+                    leader: state.cluster.leader(),
                     entry_id: None,
                 }));
             }
@@ -852,7 +847,7 @@ impl Raft for RaftImpl {
 
         let state = self.state.lock().await;
         let mut result = CommitResponse {
-            leader: state.last_known_leader.clone(),
+            leader: state.cluster.leader(),
 
             // Replaced below
             status: 0,
@@ -890,7 +885,7 @@ impl Raft for RaftImpl {
         if state.role != RaftRole::Leader {
             return Ok(Response::new(StepDownResponse {
                 status: raft_proto::Status::NotLeader as i32,
-                leader: state.last_known_leader.clone(),
+                leader: state.cluster.leader(),
             }));
         }
 
@@ -990,7 +985,7 @@ mod tests {
 
         // The raft server should acknowledge the new leader.
         let state = raft_state.lock().await;
-        assert_eq!(state.last_known_leader, Some(leader.clone()));
+        assert_eq!(state.cluster.leader(), Some(leader.clone()));
         drop(state);
 
         // Now install a snapshot which should make the original append request
@@ -1051,7 +1046,7 @@ mod tests {
         assert!(append_response_1.success);
         {
             let state = raft_state.lock().await;
-            assert_eq!(state.last_known_leader, Some(leader.clone()));
+            assert_eq!(state.cluster.leader(), Some(leader.clone()));
             assert_eq!(state.term, 12);
             assert!(!state.store.log.is_index_compacted(0)); // Not compacted
             assert_eq!(state.store.log.next_index(), 3);
