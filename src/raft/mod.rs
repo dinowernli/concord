@@ -9,7 +9,7 @@
 // https://raft.github.io/raft.pdf
 
 pub use client::{new_client, Client};
-pub use consensus::{Config, RaftImpl};
+pub use consensus::{Options, RaftImpl};
 pub use diagnostics::Diagnostics;
 pub use state_machine::{StateMachine, StateMachineResult};
 

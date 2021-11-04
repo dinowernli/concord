@@ -34,7 +34,7 @@ use crate::raft_proto::raft_client::RaftClient;
 use crate::raft_proto::raft_server::Raft;
 
 // Parameters used to configure the behavior of a cluster participant.
-pub struct Config {
+pub struct Options {
     // Timeout after which a server in follower state starts a new election.
     follower_timeout_ms: i64,
 
@@ -56,9 +56,9 @@ pub struct Config {
     compaction_check_periods_ms: i64,
 }
 
-impl Config {
+impl Options {
     pub fn default() -> Self {
-        Config {
+        Options {
             follower_timeout_ms: 100,
             candidate_timeouts_ms: 300,
             leader_replicate_ms: 50,
@@ -81,18 +81,18 @@ impl RaftImpl {
         all: &Vec<Server>,
         state_machine: Arc<Mutex<dyn StateMachine + Send>>,
         diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
-        config: Config,
+        options: Options,
     ) -> RaftImpl {
         let store = Store::new(
             state_machine,
-            config.compaction_threshold_bytes,
+            options.compaction_threshold_bytes,
             server.name.as_str(),
         );
         let cluster = Cluster::new(server.clone(), all.as_slice());
         RaftImpl {
             address: server.clone(),
             state: Arc::new(Mutex::new(RaftState {
-                config,
+                options: options,
                 store,
                 cluster,
                 diagnostics,
@@ -127,7 +127,7 @@ impl RaftImpl {
         state.term = term;
         state.role = RaftRole::Follower;
         state.voted_for = None;
-        let timeout_ms = state.config.follower_timeout_ms;
+        let timeout_ms = state.options.follower_timeout_ms;
 
         let task = sleep(Duration::from_millis(add_jitter(timeout_ms))).then(async move |_| {
             tokio::spawn(async move {
@@ -149,7 +149,7 @@ impl RaftImpl {
                 }
                 state.store.try_compact().await;
             }
-            let period_ms = arc_state.lock().await.config.compaction_check_periods_ms;
+            let period_ms = arc_state.lock().await.options.compaction_check_periods_ms;
             sleep(Duration::from_millis(add_jitter(period_ms))).await;
         }
     }
@@ -157,7 +157,7 @@ impl RaftImpl {
     // Keeps running elections until either the term changes, a leader has emerged,
     // or an own election has been won.
     async fn election_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        let timeout_ms = arc_state.lock().await.config.candidate_timeouts_ms.clone();
+        let timeout_ms = arc_state.lock().await.options.candidate_timeouts_ms.clone();
         let mut term = term;
         while !RaftImpl::run_election(arc_state.clone(), term).await {
             term = term + 1;
@@ -258,7 +258,7 @@ impl RaftImpl {
     // moved on (or we otherwise detect we are no longer leader).
     async fn replicate_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
         let me = arc_state.lock().await.name();
-        let timeouts_ms = arc_state.lock().await.config.leader_replicate_ms.clone();
+        let timeouts_ms = arc_state.lock().await.options.leader_replicate_ms.clone();
         loop {
             {
                 let locked_state = arc_state.lock().await;
@@ -463,7 +463,7 @@ enum RaftRole {
 }
 
 struct RaftState {
-    config: Config,
+    options: Options,
     store: Store,
     cluster: Cluster,
 
@@ -745,7 +745,7 @@ impl Raft for RaftImpl {
         let term = state.term;
         let arc_state = self.state.clone();
         let me = state.name();
-        let timeout_ms = state.config.follower_timeout_ms;
+        let timeout_ms = state.options.follower_timeout_ms;
 
         let task = sleep(Duration::from_millis(add_jitter(timeout_ms))).then(async move |_| {
             tokio::spawn(async move {
@@ -1037,7 +1037,7 @@ mod tests {
         }
 
         // Now send an append request with a payload large enough to trigger compaction.
-        let compaction_bytes = raft_state.lock().await.config.compaction_threshold_bytes;
+        let compaction_bytes = raft_state.lock().await.options.compaction_threshold_bytes;
 
         let append_request_2 = AppendRequest {
             term: 12,
@@ -1106,10 +1106,10 @@ mod tests {
         )
     }
 
-    fn create_config_for_testing() -> Config {
+    fn create_config_for_testing() -> Options {
         // Configs with very high timeouts to make sure none of them ever
         // trigger during a unit test.
-        Config {
+        Options {
             follower_timeout_ms: 100000000,
             candidate_timeouts_ms: 100000000,
             leader_replicate_ms: 100000000,

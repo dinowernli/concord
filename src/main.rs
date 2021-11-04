@@ -14,7 +14,7 @@ use rand::seq::SliceRandom;
 use tokio::time::{sleep, Instant};
 
 use raft::raft_proto;
-use raft::{Config, Diagnostics, RaftImpl};
+use raft::{Diagnostics, Options, RaftImpl};
 use raft_proto::Server;
 
 use crate::keyvalue::grpc::KeyValueClient;
@@ -53,7 +53,7 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
         all,
         state_machine,
         Some(server_diagnostics),
-        Config::default(),
+        Options::default(),
     );
     raft.start().await;
     info!("Created raft service for {:?}", &address);
