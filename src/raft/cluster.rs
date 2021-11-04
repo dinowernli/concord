@@ -77,3 +77,47 @@ impl Cluster {
 fn key(server: &Server) -> String {
     format!("{}:{}", server.host, server.port).to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_cluster() -> Cluster {
+        let s1 = Server {
+            host: "foo".to_string(),
+            port: 1234,
+            name: "a".to_string(),
+        };
+        let s2 = Server {
+            host: "bar".to_string(),
+            port: 1234,
+            name: "a".to_string(),
+        };
+        let s3 = Server {
+            host: "baz".to_string(),
+            port: 1234,
+            name: "a".to_string(),
+        };
+        Cluster::new(s2.clone(), vec![s1, s3].as_slice())
+    }
+
+    #[test]
+    fn test_initial() {
+        let cluster = create_cluster();
+        assert_eq!(cluster.size(), 3);
+        assert_eq!(cluster.others.len(), 2);
+        assert!(cluster.leader().is_none());
+    }
+
+    #[test]
+    fn test_singleton_cluster() {
+        let me = Server {
+            host: "foo".to_string(),
+            port: 1234,
+            name: "a".to_string(),
+        };
+        let cluster = Cluster::new(me.clone(), vec![me.clone()].as_slice());
+        assert_eq!(cluster.size(), 1);
+        assert!(cluster.others.is_empty());
+    }
+}
