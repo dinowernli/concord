@@ -15,7 +15,7 @@ use log::{debug, info};
 use rand::Rng;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tonic::transport::{Channel, Endpoint, Error};
+use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
 use diagnostics::ServerDiagnostics;
@@ -27,6 +27,7 @@ use raft_proto::{CommitRequest, CommitResponse, StepDownRequest, StepDownRespons
 use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 
 use crate::raft;
+use crate::raft::cluster::Cluster;
 use crate::raft::diagnostics;
 use crate::raft::store::Store;
 use crate::raft_proto::raft_client::RaftClient;
@@ -87,24 +88,20 @@ impl RaftImpl {
             config.compaction_threshold_bytes,
             server.name.as_str(),
         );
+        let cluster = Cluster::new(server.clone(), all.as_slice());
         RaftImpl {
             address: server.clone(),
             state: Arc::new(Mutex::new(RaftState {
                 config,
                 store,
+                cluster,
+                diagnostics,
 
                 term: 0,
                 voted_for: None,
                 role: RaftRole::Follower,
                 followers: HashMap::new(),
                 timer_guard: None,
-
-                address: server.clone(),
-                cluster: all.clone(),
-                channels: HashMap::new(),
-                last_known_leader: None,
-
-                diagnostics,
             })),
         }
     }
@@ -114,7 +111,7 @@ impl RaftImpl {
 
         let mut state = self.state.lock().await;
         let term = state.term;
-        info!("[{}] Starting", state.address.name);
+        info!("[{}] Starting", state.name());
         RaftImpl::become_follower(&mut state, arc_state.clone(), term);
 
         tokio::spawn(async move {
@@ -123,8 +120,8 @@ impl RaftImpl {
     }
 
     fn become_follower(state: &mut RaftState, arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        let me = state.address.clone();
-        info!("[{}] Becoming follower for term {}", &me.name, term);
+        let me = state.name();
+        info!("[{}] Becoming follower for term {}", &me, term);
         assert!(term >= state.term, "Term should never decrease");
 
         state.term = term;
@@ -134,7 +131,7 @@ impl RaftImpl {
 
         let task = sleep(Duration::from_millis(add_jitter(timeout_ms))).then(async move |_| {
             tokio::spawn(async move {
-                info!("[{}] Follower timeout in term {}", me.clone().name, term);
+                info!("[{}] Follower timeout in term {}", &me, term);
                 RaftImpl::election_loop(arc_state.clone(), term + 1).await;
             });
         });
@@ -183,20 +180,17 @@ impl RaftImpl {
             }
 
             // Prepare the election.
-            info!(
-                "[{}] Starting election for term {}",
-                state.address.name, term
-            );
+            info!("[{}] Starting election for term {}", state.name(), term);
             state.role = RaftRole::Candidate;
             state.term = term;
             state.timer_guard = None;
-            state.voted_for = Some(state.address.clone());
+            state.voted_for = Some(state.cluster.me());
 
             // Request votes from all peer.
             let request = state.create_vote_request();
-            let others = state.get_others();
+            let others = state.cluster.others();
             for server in others {
-                match state.new_client(&server).await {
+                match state.cluster.new_client(&server).await {
                     Ok(client) => {
                         futures.push(Box::pin(RaftState::request_vote(client, request.clone())));
                     }
@@ -214,7 +208,7 @@ impl RaftImpl {
 
         {
             let mut state = arc_state.lock().await;
-            let me = state.address.name.to_string();
+            let me = state.name();
             debug!("[{}] Done waiting for vote requests", &me);
 
             // The world has moved on or someone else has won in this term.
@@ -241,7 +235,7 @@ impl RaftImpl {
             }
 
             let arc_state_copy = arc_state.clone();
-            return if 2 * votes > state.cluster.len() {
+            return if 2 * votes > state.cluster.size() {
                 info!(
                     "[{}] Won election with {} votes, becoming leader for term {}",
                     &me, votes, term
@@ -263,7 +257,7 @@ impl RaftImpl {
     // Starts the main leader replication loop. The loop stops once the term has
     // moved on (or we otherwise detect we are no longer leader).
     async fn replicate_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        let me = arc_state.lock().await.address.clone().name;
+        let me = arc_state.lock().await.name();
         let timeouts_ms = arc_state.lock().await.config.leader_replicate_ms.clone();
         loop {
             {
@@ -276,7 +270,10 @@ impl RaftImpl {
                     return;
                 }
                 match &locked_state.diagnostics {
-                    Some(d) => d.lock().await.report_leader(term, &locked_state.address),
+                    Some(d) => d
+                        .lock()
+                        .await
+                        .report_leader(term, &locked_state.cluster.me()),
                     _ => (),
                 }
             }
@@ -293,8 +290,8 @@ impl RaftImpl {
         let mut results = Vec::<Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>>::new();
         {
             let mut state = arc_state.lock().await;
-            debug!("[{}] Replicating entries", &state.address.name);
-            let others = state.get_others();
+            debug!("[{}] Replicating entries", state.name());
+            let others = state.cluster.others();
             for follower in others {
                 // Figure out which entry the follower is expecting next and decide whether to
                 // send an append request (if we have the entries) or to fast-forward the follower
@@ -305,7 +302,7 @@ impl RaftImpl {
                     .unwrap()
                     .next_index;
 
-                let client = state.new_client(&follower).await;
+                let client = state.cluster.new_client(&follower).await;
                 if let Err(msg) = &client {
                     results.push(Box::pin(err(Status::unavailable(format!(
                         "Unable to connect to {} : {}",
@@ -342,7 +339,7 @@ impl RaftImpl {
 
         {
             let mut state = arc_state.lock().await;
-            let me = state.address.clone().name;
+            let me = state.name();
             if state.term > term {
                 info!("[{}] Detected higher term {}", &me, state.term);
                 return;
@@ -369,7 +366,7 @@ impl RaftImpl {
         let result = client.install_snapshot(request).await;
 
         let mut state = arc_state.lock().await;
-        let me = state.address.clone().name;
+        let me = state.name();
         match result {
             Ok(result) => {
                 let response = result.into_inner();
@@ -404,7 +401,7 @@ impl RaftImpl {
         let result = client.append(request).await;
 
         let mut state = arc_state.lock().await;
-        let me = state.address.clone().name;
+        let me = state.name();
         if state.term > append_request.term {
             info!("[{}] Detected higher term {}", &me, state.term);
             return;
@@ -483,37 +480,15 @@ struct RaftState {
 }
 
 impl RaftState {
-    // Returns an rpc client which can be used to contact the supplied peer.
-    async fn new_client(&mut self, address: &Server) -> Result<RaftClient<Channel>, Error> {
-        let key = address_key(address);
-        let cached = self.channels.get_mut(&key);
-        if let Some(channel) = cached {
-            // The "clone()" operation on channels is advertized as cheap and is the
-            // recommended way to reuse channels.
-            return Ok(RaftClient::new(channel.clone()));
-        }
-
-        // Cache miss, create a new channel.
-        let dst = format!("http://[::1]:{}", address.port);
-        let channel = Endpoint::new(dst)?.connect().await?;
-        self.channels.insert(key, channel.clone());
-        Ok(RaftClient::new(channel))
-    }
-
-    // Returns the peers in the cluster (ourself excluded).
-    fn get_others(&self) -> Vec<Server> {
-        self.cluster
-            .clone()
-            .into_iter()
-            .filter(|server| server != &self.address)
-            .collect()
+    fn name(&self) -> String {
+        self.cluster.me().name.to_string()
     }
 
     // Returns a suitable initial map of follower positions. Meant to be called
     // by a new leader initializing itself.
     fn create_follower_positions(&self) -> HashMap<String, FollowerPosition> {
         let mut result = HashMap::new();
-        for server in self.get_others() {
+        for server in self.cluster.others() {
             result.insert(
                 address_key(&server),
                 FollowerPosition {
@@ -536,7 +511,7 @@ impl RaftState {
 
         AppendRequest {
             term: self.term,
-            leader: Some(self.address.clone()),
+            leader: Some(self.cluster.me()),
             previous: Some(previous.clone()),
             entries: self.store.log.get_entries_after(&previous),
             committed: self.store.committed_index(),
@@ -557,7 +532,7 @@ impl RaftState {
         }
         InstallSnapshotRequest {
             term: self.term,
-            leader: Some(self.address.clone()),
+            leader: Some(self.cluster.me()),
             snapshot,
             last,
         }
@@ -571,8 +546,8 @@ impl RaftState {
         response: &AppendResponse,
         request: &AppendRequest,
     ) {
+        let me = self.name();
         let follower = self.followers.get_mut(address_key(&peer).as_str());
-        let me = self.address.clone().name;
         if follower.is_none() {
             info!(
                 "[{}] Ignoring append response for unknown peer {}",
@@ -604,6 +579,7 @@ impl RaftState {
     // Called when, as a leader, we know that a follower's entries up to (and including)
     // match_index match our entries.
     fn record_follower_matches(&mut self, peer: &Server, match_index: i64) {
+        let me = self.name();
         let follower = self
             .followers
             .get_mut(address_key(&peer).as_str())
@@ -614,7 +590,7 @@ impl RaftState {
         if follower != &old_f {
             info!(
                 "[{}] Follower state for peer {} is now (next={},match={})",
-                &self.address.name, &peer.name, follower.next_index, follower.match_index
+                me, &peer.name, follower.next_index, follower.match_index
             );
         }
     }
@@ -652,7 +628,7 @@ impl RaftState {
     fn create_vote_request(&self) -> VoteRequest {
         VoteRequest {
             term: self.term,
-            candidate: Some(self.address.clone()),
+            candidate: Some(self.cluster.me()),
             last: Some(self.store.log.last_known_id().clone()),
         }
     }
@@ -768,7 +744,7 @@ impl Raft for RaftImpl {
         // Reset the election timer
         let term = state.term;
         let arc_state = self.state.clone();
-        let me = state.address.clone().name;
+        let me = state.name();
         let timeout_ms = state.config.follower_timeout_ms;
 
         let task = sleep(Duration::from_millis(add_jitter(timeout_ms))).then(async move |_| {
@@ -894,7 +870,7 @@ impl Raft for RaftImpl {
 
         Ok(Response::new(StepDownResponse {
             status: raft_proto::Status::Success as i32,
-            leader: Some(state.address.clone()),
+            leader: Some(state.cluster.me()),
         }))
     }
 
