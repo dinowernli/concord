@@ -17,6 +17,7 @@ pub use state_machine::{StateMachine, StateMachineResult};
 pub mod raft_proto;
 
 mod client;
+mod cluster;
 mod consensus;
 mod diagnostics;
 mod log;
