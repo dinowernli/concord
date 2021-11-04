@@ -83,22 +83,10 @@ mod tests {
     use super::*;
 
     fn create_cluster() -> Cluster {
-        let s1 = Server {
-            host: "foo".to_string(),
-            port: 1234,
-            name: "a".to_string(),
-        };
-        let s2 = Server {
-            host: "bar".to_string(),
-            port: 1234,
-            name: "a".to_string(),
-        };
-        let s3 = Server {
-            host: "baz".to_string(),
-            port: 1234,
-            name: "a".to_string(),
-        };
-        Cluster::new(s2.clone(), vec![s1, s3].as_slice())
+        let s1 = server("foo", 1234, "name1");
+        let s2 = server("bar", 1234, "name1");
+        let s3 = server("baz", 1234, "name1");
+        Cluster::new(s2.clone(), vec![s1, s2, s3].as_slice())
     }
 
     #[test]
@@ -126,13 +114,40 @@ mod tests {
 
     #[test]
     fn test_singleton_cluster() {
-        let me = Server {
-            host: "foo".to_string(),
-            port: 1234,
-            name: "a".to_string(),
-        };
+        let me = server("foo", 1234, "some-name");
         let cluster = Cluster::new(me.clone(), vec![me.clone()].as_slice());
         assert_eq!(cluster.size(), 1);
         assert!(cluster.others.is_empty());
+    }
+
+    #[test]
+    fn test_dedup() {
+        let s1 = server("foo", 1234, "name");
+        let s2 = server("bar", 1234, "name");
+        let s3 = server("baz", 1234, "name");
+
+        // Create a cluster with a bunch of duplicates.
+        let cluster = Cluster::new(
+            s1.clone(),
+            vec![
+                s1.clone(),
+                s1.clone(),
+                s2.clone(),
+                s2.clone(),
+                s2.clone(),
+                s3.clone(),
+            ]
+            .as_slice(),
+        );
+
+        assert_eq!(cluster.size(), 3);
+    }
+
+    fn server(host: &str, port: i32, name: &str) -> Server {
+        Server {
+            host: host.to_string(),
+            port,
+            name: name.to_string(),
+        }
     }
 }
