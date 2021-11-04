@@ -110,6 +110,21 @@ mod tests {
     }
 
     #[test]
+    fn test_leader() {
+        let mut cluster = create_cluster();
+        assert!(cluster.leader().is_none());
+
+        let other = cluster.others[0].clone();
+        cluster.record_leader(&other);
+
+        let leader = cluster.leader();
+        assert!(leader.is_some());
+        let leader = leader.unwrap();
+        assert_eq!(other.host, leader.host);
+        assert_eq!(other.port, leader.port);
+    }
+
+    #[test]
     fn test_singleton_cluster() {
         let me = Server {
             host: "foo".to_string(),
