@@ -173,17 +173,15 @@ impl Client for ClientImpl {
     // Adds the supplied payload as the next entry in the cluster's shared log.
     // Returns once the payload has been added (or the operation has failed).
     async fn commit(&self, payload: &[u8]) -> Result<EntryId, tonic::Status> {
-        self.retry_helper(async move |leader: Server| {
-            ClientImpl::commit_impl(leader, payload).await
-        })
-        .await
+        let op = async move |leader: Server| ClientImpl::commit_impl(leader, payload).await;
+        self.retry_helper(op).await
     }
 
     // Sends an rpc to the cluster leader to step down. Returns the address of
     // the leader which stepped down.
     async fn preempt_leader(&self) -> Result<Server, tonic::Status> {
-        self.retry_helper(async move |leader: Server| ClientImpl::preempt_leader_impl(leader).await)
-            .await
+        let op = async move |leader: Server| ClientImpl::preempt_leader_impl(leader).await;
+        self.retry_helper(op).await
     }
 }
 
