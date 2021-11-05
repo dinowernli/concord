@@ -292,7 +292,7 @@ mod tests {
     #[should_panic]
     async fn test_commit_to_bad_index() {
         let mut store = make_store();
-        store.log.append(2, Payload(Vec::new()));
+        store.append(2, Payload(Vec::new()));
 
         // Attempt to "commit to" a value which hasn't yet been appended.
         store.commit_to(17).await;
@@ -301,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn test_commit_to() {
         let mut store = make_store();
-        let eid = store.log.append(2, Payload(Vec::new()));
+        let eid = store.append(2, Payload(Vec::new()));
 
         // Should succeed.
         store.commit_to(eid.index).await;
@@ -315,9 +315,9 @@ mod tests {
         let mut store = make_store();
         let receiver = store.add_listener(2);
 
-        store.log.append(67, Payload(Vec::new()));
-        store.log.append(67, Payload(Vec::new()));
-        store.log.append(68, Payload(Vec::new()));
+        store.append(67, Payload(Vec::new()));
+        store.append(67, Payload(Vec::new()));
+        store.append(68, Payload(Vec::new()));
 
         store.commit_to(2).await;
         let output = receiver.now_or_never();
@@ -335,7 +335,7 @@ mod tests {
         let receiver2 = store.add_listener(1);
         let receiver3 = store.add_listener(0);
 
-        store.log.append(67, Payload(Vec::new()));
+        store.append(67, Payload(Vec::new()));
         store.commit_to(0).await;
 
         assert!(receiver1.now_or_never().is_some());
@@ -347,8 +347,8 @@ mod tests {
     async fn test_listener_past() {
         let mut store = make_store();
 
-        store.log.append(67, Payload(Vec::new()));
-        store.log.append(67, Payload(Vec::new()));
+        store.append(67, Payload(Vec::new()));
+        store.append(67, Payload(Vec::new()));
         store.commit_to(1).await;
 
         let receiver = store.add_listener(0);
@@ -358,7 +358,7 @@ mod tests {
     #[tokio::test]
     async fn test_compaction() {
         let mut store = make_store();
-        let eid = store.log.append(
+        let eid = store.append(
             67,
             Payload(vec![0; 2 * COMPACTION_THRESHOLD_BYTES as usize]),
         );
