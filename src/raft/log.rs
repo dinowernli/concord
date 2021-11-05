@@ -54,15 +54,15 @@ impl LogSlice {
 
     // Adds a new entry to the end of the slice. Returns the id of the
     // newly appended entry.
-    pub fn append(&mut self, term: i64, payload: Vec<u8>) -> EntryId {
+    pub fn append(&mut self, term: i64, data: Data) -> EntryId {
         assert!(term >= self.last_known_id().term);
 
-        let size_bytes = payload.len() as i64;
-        let entry = create_entry(term, self.next_index(), payload);
+        let entry = create_entry(term, self.next_index(), data);
+        let bytes = size_bytes(&entry);
         let entry_id = entry.id.clone().expect("entry");
 
         self.entries.push(entry);
-        self.size_bytes += size_bytes;
+        self.size_bytes += bytes;
         entry_id
     }
 
@@ -234,10 +234,10 @@ impl LogSlice {
     }
 }
 
-fn create_entry(term: i64, index: i64, payload: Vec<u8>) -> Entry {
+fn create_entry(term: i64, index: i64, data: Data) -> Entry {
     Entry {
         id: Some(EntryId { term, index }),
-        data: Some(Data::Payload(payload)),
+        data: Some(data),
     }
 }
 
@@ -287,7 +287,10 @@ mod tests {
     #[test]
     fn test_single_entry() {
         let mut l = LogSlice::initial();
-        l.append(72 /* term */, "some payload".as_bytes().to_vec());
+        l.append(
+            72, /* term */
+            Payload("some payload".as_bytes().to_vec()),
+        );
 
         let expected_id = entry_id(72 /* term */, 0 /* index */);
 
@@ -415,13 +418,13 @@ mod tests {
     #[should_panic]
     fn test_append_bad_term() {
         let mut l = create_default_slice();
-        l.append(73, "bad term".as_bytes().to_vec());
+        l.append(73, Payload("bad term".as_bytes().to_vec()));
     }
 
     #[test]
     fn test_append() {
         let mut l = create_default_slice();
-        let id = l.append(74, "bad term".as_bytes().to_vec());
+        let id = l.append(74, Payload("bad term".as_bytes().to_vec()));
         assert_eq!(74, id.term);
         assert_eq!(6, id.index);
     }
@@ -516,8 +519,8 @@ mod tests {
         result
     }
 
-    fn payload_of_size(size_bytes: i64) -> Vec<u8> {
-        [3].repeat(size_bytes as usize)
+    fn payload_of_size(size_bytes: i64) -> Data {
+        Payload([3].repeat(size_bytes as usize))
     }
 
     fn entry_id(term: i64, index: i64) -> EntryId {
@@ -527,7 +530,7 @@ mod tests {
     fn entry(term: i64, index: i64, payload_size_bytes: i64) -> Entry {
         Entry {
             id: Some(entry_id(term, index)),
-            data: Some(Payload(payload_of_size(payload_size_bytes))),
+            data: Some(payload_of_size(payload_size_bytes)),
         }
     }
 }

@@ -61,6 +61,12 @@ impl Store {
         self.snapshot.clone()
     }
 
+    // Applies the supplied data to the log (without necessarily committing it). Returns
+    // the id for the created entry.
+    pub fn append(&mut self, term: i64, data: Data) -> EntryId {
+        self.log.append(term, data)
+    }
+
     // Compacts logs entries into a new snapshot if necessary.
     pub async fn try_compact(&mut self) {
         if self.log.size_bytes() > self.compaction_threshold_bytes {
@@ -260,6 +266,7 @@ fn entry_id_key(entry_id: &EntryId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::raft_proto::entry::Data::Payload;
     use crate::raft::testing::FakeStateMachine;
     use futures::FutureExt;
 
@@ -285,7 +292,7 @@ mod tests {
     #[should_panic]
     async fn test_commit_to_bad_index() {
         let mut store = make_store();
-        store.log.append(2, Vec::new());
+        store.log.append(2, Payload(Vec::new()));
 
         // Attempt to "commit to" a value which hasn't yet been appended.
         store.commit_to(17).await;
@@ -294,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn test_commit_to() {
         let mut store = make_store();
-        let eid = store.log.append(2, Vec::new());
+        let eid = store.log.append(2, Payload(Vec::new()));
 
         // Should succeed.
         store.commit_to(eid.index).await;
@@ -308,9 +315,9 @@ mod tests {
         let mut store = make_store();
         let receiver = store.add_listener(2);
 
-        store.log.append(67, Vec::new());
-        store.log.append(67, Vec::new());
-        store.log.append(68, Vec::new());
+        store.log.append(67, Payload(Vec::new()));
+        store.log.append(67, Payload(Vec::new()));
+        store.log.append(68, Payload(Vec::new()));
 
         store.commit_to(2).await;
         let output = receiver.now_or_never();
@@ -328,7 +335,7 @@ mod tests {
         let receiver2 = store.add_listener(1);
         let receiver3 = store.add_listener(0);
 
-        store.log.append(67, Vec::new());
+        store.log.append(67, Payload(Vec::new()));
         store.commit_to(0).await;
 
         assert!(receiver1.now_or_never().is_some());
@@ -340,8 +347,8 @@ mod tests {
     async fn test_listener_past() {
         let mut store = make_store();
 
-        store.log.append(67, Vec::new());
-        store.log.append(67, Vec::new());
+        store.log.append(67, Payload(Vec::new()));
+        store.log.append(67, Payload(Vec::new()));
         store.commit_to(1).await;
 
         let receiver = store.add_listener(0);
@@ -351,9 +358,10 @@ mod tests {
     #[tokio::test]
     async fn test_compaction() {
         let mut store = make_store();
-        let eid = store
-            .log
-            .append(67, vec![0; 2 * COMPACTION_THRESHOLD_BYTES as usize]);
+        let eid = store.log.append(
+            67,
+            Payload(vec![0; 2 * COMPACTION_THRESHOLD_BYTES as usize]),
+        );
         assert!(store.log.size_bytes() > COMPACTION_THRESHOLD_BYTES);
 
         store.commit_to(eid.index).await;
