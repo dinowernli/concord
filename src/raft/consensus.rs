@@ -794,6 +794,7 @@ impl Raft for RaftImpl {
                         "Udpated cluster config based on entry: [term={}, index={}]",
                         id.term, id.index
                     );
+                    break;
                 }
             }
         }
