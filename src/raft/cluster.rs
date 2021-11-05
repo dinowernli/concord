@@ -247,6 +247,7 @@ mod tests {
                 server("wiggle", 1234, "name"),
                 server("ziggle", 1234, "name"),
             ],
+            members_next: vec![],
         };
         cluster.update(new_config);
         assert_eq!(cluster.size(), 5);

@@ -173,7 +173,7 @@ impl Store {
             self.applied = self.applied + 1;
             let entry = self.log.entry_at(self.applied);
             let entry_id = entry.id.expect("id").clone();
-            
+
             if let Some(Data::Payload(bytes)) = entry.data {
                 let result = self.state_machine.lock().await.apply(&Bytes::from(bytes));
                 match result {

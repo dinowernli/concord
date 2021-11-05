@@ -1,7 +1,7 @@
 extern crate rand;
 
-use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -29,6 +29,7 @@ use crate::raft;
 use crate::raft::cluster::Cluster;
 use crate::raft::diagnostics;
 use crate::raft::raft_proto::entry::Data;
+use crate::raft::raft_proto::{ChangeConfigRequest, ChangeConfigResponse, ClusterConfig};
 use crate::raft::store::Store;
 use crate::raft_proto::raft_client::RaftClient;
 use crate::raft_proto::raft_server::Raft;
@@ -880,6 +881,52 @@ impl Raft for RaftImpl {
             }
         }
         Ok(Response::new(InstallSnapshotResponse { term: state.term }))
+    }
+
+    async fn change_config(
+        &self,
+        request: Request<ChangeConfigRequest>,
+    ) -> Result<Response<ChangeConfigResponse>, Status> {
+        let request = request.into_inner();
+        debug!("[{}] Handling change config request", self.address.name);
+
+        {
+            let state = self.state.lock().await;
+            if state.role != RaftRole::Leader {
+                return Ok(Response::new(ChangeConfigResponse {
+                    status: raft_proto::Status::NotLeader as i32,
+                    leader: state.cluster.leader(),
+                }));
+            }
+
+            // TODO
+            // 1) Create joint configuration
+
+            let union: HashSet<Server> = state
+                .cluster
+                .others()
+                .iter()
+                .cloned()
+                .chain(state.cluster.me().into())
+                .chain(request.members.iter().cloned())
+                .collect();
+            let joint = ClusterConfig {
+                members: union.into_iter().collect(),
+                members_next: request.members,
+            };
+
+            // 2) Commit joint configuration
+            // 3) Return success
+
+            // TODO - create a commit_internal which takes either a "Data"
+
+            // ***
+        }
+
+        Ok(Response::new(ChangeConfigResponse {
+            status: raft_proto::Status::Success as i32,
+            leader: Some(self.address.clone()),
+        }))
     }
 }
 
