@@ -901,19 +901,7 @@ impl Raft for RaftImpl {
 
             // TODO
             // 1) Create joint configuration
-
-            let union: HashSet<Server> = state
-                .cluster
-                .others()
-                .iter()
-                .cloned()
-                .chain(state.cluster.me().into())
-                .chain(request.members.iter().cloned())
-                .collect();
-            let joint = ClusterConfig {
-                members: union.into_iter().collect(),
-                members_next: request.members,
-            };
+            let joint_config = state.cluster.create_joint(request.members.to_vec());
 
             // 2) Commit joint configuration
             // 3) Return success

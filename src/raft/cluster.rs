@@ -1,7 +1,7 @@
 use crate::raft::raft_proto::raft_client::RaftClient;
 use crate::raft::raft_proto::{ClusterConfig, Server};
-use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+use std::collections::{HashMap, HashSet};
 use tonic::transport::{Channel, Endpoint, Error};
 
 // Holds information about a Raft cluster.
@@ -122,6 +122,33 @@ impl Cluster {
 
         self.channels.insert(k, channel.clone());
         Ok(RaftClient::new(channel))
+    }
+
+    pub fn create_joint(&self, new_members: Vec<Server>) -> ClusterConfig {
+        let mut keys = HashSet::<String>::new();
+        let mut union = Vec::<Server>::new();
+
+        union.push(self.me.clone());
+        keys.insert(key(&self.me));
+
+        for server in self
+            .others
+            .iter()
+            .cloned()
+            .chain(new_members.iter().cloned())
+        {
+            let k = key(&server);
+            if keys.contains(&k) {
+                continue;
+            }
+            keys.insert(k);
+            union.push(server);
+        }
+
+        ClusterConfig {
+            members: union,
+            members_next: new_members,
+        }
     }
 }
 
