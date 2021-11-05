@@ -402,6 +402,48 @@ impl RaftImpl {
             }
         }
     }
+
+    // Adds the supplied data to the store and waits for the commit to go through.
+    // Returns the resulting entry id if the commit was successful, or a failure
+    // status if the commit was unsuccessful (e.g., because we are no longer the
+    // leader).
+    async fn commit_internal(
+        arc_state: Arc<Mutex<RaftState>>,
+        payload: Vec<u8>,
+    ) -> Result<EntryId, raft_proto::Status> {
+        let term;
+        let entry_id;
+        let receiver;
+        {
+            let mut state = arc_state.lock().await;
+            if state.role != RaftRole::Leader {
+                return Err(raft_proto::Status::NotLeader);
+            }
+
+            term = state.term;
+            entry_id = state.store.log.append(term, payload);
+            receiver = state.store.add_listener(entry_id.index);
+        }
+
+        let committed = receiver.await;
+        match committed {
+            Ok(committed_id) => {
+                if entry_id == committed_id {
+                    Ok(entry_id)
+                } else {
+                    // A different entry got committed to this index. This means
+                    // the leader must have changed, let the caller know.
+                    Err(raft_proto::Status::NotLeader)
+                }
+            }
+            Err(_) => {
+                // The sender went out of scope without ever being resolved. This can
+                // happen in rare cases where the index we're interested in got compacted.
+                // In this case we don't know whether the entry was committed.
+                Err(raft_proto::Status::NotLeader)
+            }
+        }
+    }
 }
 
 // Holds the state a cluster leader tracks about its followers. Used to decide
@@ -762,55 +804,21 @@ impl Raft for RaftImpl {
         let request = request.into_inner();
         debug!(?request, "handling request");
 
-        let term;
-        let entry_id;
-        let receiver;
-
-        {
-            let mut state = self.state.lock().await;
-            if state.role != RaftRole::Leader {
-                return Ok(Response::new(CommitResponse {
-                    status: raft_proto::Status::NotLeader as i32,
-                    leader: state.cluster.leader(),
-                    entry_id: None,
-                }));
-            }
-
-            term = state.term;
-            entry_id = state.store.log.append(term, request.payload);
-            receiver = state.store.add_listener(entry_id.index);
-        }
-
-        let committed = receiver.await;
-
-        let state = self.state.lock().await;
-        let mut result = CommitResponse {
-            leader: state.cluster.leader(),
-
-            // Replaced below
-            status: 0,
-            entry_id: None,
+        let result = RaftImpl::commit_internal(self.state.clone(), request.payload).await;
+        let leader = self.state.lock().await.cluster.leader().clone();
+        let proto = match result {
+            Ok(entry_id) => CommitResponse {
+                entry_id: Some(entry_id),
+                status: raft_proto::Status::Success as i32,
+                leader,
+            },
+            Err(status) => CommitResponse {
+                entry_id: None,
+                status: status as i32,
+                leader,
+            },
         };
-
-        match committed {
-            Ok(committed_id) => {
-                if entry_id == committed_id {
-                    result.entry_id = Some(entry_id.clone());
-                    result.status = raft_proto::Status::Success as i32;
-                } else {
-                    // A different entry got committed to this index. This means
-                    // the leader must have changed, let the caller know.
-                    result.status = raft_proto::Status::NotLeader as i32;
-                }
-            }
-            Err(_) => {
-                // The sender went out of scope without ever being resolved. This can
-                // happen in rare cases where the index we're interested in got compacted.
-                // In this case we don't know whether the entry was committed.
-                result.status = raft_proto::Status::NotLeader as i32;
-            }
-        };
-        Ok(Response::new(result))
+        Ok(Response::new(proto))
     }
 
     #[instrument(fields(server=%self.address.name),skip(self,request))]
