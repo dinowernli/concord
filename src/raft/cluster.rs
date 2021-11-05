@@ -1,5 +1,5 @@
 use crate::raft::raft_proto::raft_client::RaftClient;
-use crate::raft::raft_proto::Server;
+use crate::raft::raft_proto::{ClusterConfig, Server};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint, Error};
@@ -89,6 +89,16 @@ impl Cluster {
         let mid = indexes.len() / 2;
 
         indexes[mid]
+    }
+
+    // Updates the cluster according to the supplied configuration.
+    pub fn update(&mut self, config: ClusterConfig) {
+        self.others = config
+            .members
+            .into_iter()
+            .filter(|s| key(&s) != key(&self.me))
+            .collect();
+        self.channels.drain();
     }
 
     // Returns an rpc client which can be used to contact the supplied peer.
@@ -222,6 +232,24 @@ mod tests {
             ("server3".to_string(), 3),
         ]);
         assert_eq!(2, cluster.highest_replicated_index(data));
+    }
+
+    #[test]
+    fn test_update() {
+        let mut cluster = create_cluster();
+        assert_eq!(cluster.size(), 3);
+
+        let new_config = ClusterConfig {
+            members: vec![
+                server("foo", 1234, "name"),
+                server("bar", 1234, "name"),
+                server("baz", 1234, "name"),
+                server("wiggle", 1234, "name"),
+                server("ziggle", 1234, "name"),
+            ],
+        };
+        cluster.update(new_config);
+        assert_eq!(cluster.size(), 5);
     }
 
     fn server(host: &str, port: i32, name: &str) -> Server {

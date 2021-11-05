@@ -28,6 +28,7 @@ use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 use crate::raft;
 use crate::raft::cluster::Cluster;
 use crate::raft::diagnostics;
+use crate::raft::raft_proto::entry::Data;
 use crate::raft::store::Store;
 use crate::raft_proto::raft_client::RaftClient;
 use crate::raft_proto::raft_server::Raft;
@@ -780,11 +781,22 @@ impl Raft for RaftImpl {
         }
 
         if !request.entries.is_empty() {
+            // Store all the entries received.
             state.store.log.append_all(request.entries.as_slice());
-        }
 
-        // TODO(dino): scan the appended entries for the latest one with a cluster
-        // config change and update the membership info.
+            // The Raft spec says that a node should operate under the latest seen
+            // configuration (regardless of whether it has been committed).
+            for i in request.entries.len() - 1..0 {
+                if let Some(Data::Config(config)) = &request.entries[i].data {
+                    state.cluster.update(config.clone());
+                    let id = &request.entries[i].id.as_ref().expect("id").clone();
+                    info!(
+                        "Udpated cluster config based on entry: [term={}, index={}]",
+                        id.term, id.index
+                    );
+                }
+            }
+        }
 
         // If the leader considers an entry committed, it is guaranteed that
         // all members of the cluster agree on the log up to that index, so it
