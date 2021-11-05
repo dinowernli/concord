@@ -12,7 +12,9 @@ use raft_proto::{CommitRequest, EntryId, Server, Status, StepDownRequest};
 
 use crate::raft::client::Outcome::{Failure, NewLeader, Success};
 use crate::raft::raft_proto;
-use crate::raft::raft_proto::{CommitResponse, StepDownResponse};
+use crate::raft::raft_proto::{
+    ChangeConfigRequest, ChangeConfigResponse, CommitResponse, StepDownResponse,
+};
 use crate::raft_proto::raft_client::RaftClient;
 
 // Returns a new client instance talking to a Raft cluster.
@@ -37,9 +39,12 @@ pub trait Client {
     // Returns once the payload has been added (or the operation has failed).
     async fn commit(&self, payload: &[u8]) -> Result<EntryId, tonic::Status>;
 
-    // Sends an rpc to the cluster leader to step down. Returns the address of
-    // the leader which stepped down.
+    // Asks the cluster leader to step down. Returns the address of
+    // the leader which stepped down if successful.
     async fn preempt_leader(&self) -> Result<Server, tonic::Status>;
+
+    // Modifies the cluster configuration with a new set of (voting) members.
+    async fn change_config(&self, members: Vec<Server>) -> Result<(), tonic::Status>;
 }
 
 // The outcome of an individual operation sent to one server in the Raft cluster.
@@ -166,21 +171,48 @@ impl ClientImpl {
             }
         }
     }
+
+    async fn change_config_impl(leader: Server, members: &Vec<Server>) -> Outcome<()> {
+        let mut request = Request::new(ChangeConfigRequest {
+            members: members.to_vec(),
+        });
+        request.set_timeout(Duration::from_millis(2000));
+
+        let client = ClientImpl::connect(&leader).await;
+        if let Err(status) = client {
+            return Failure(tonic::Status::internal(status.to_string()));
+        }
+
+        let result = client.unwrap().change_config(request).await;
+        match result {
+            Err(status) => return Failure(tonic::Status::internal(status.to_string())),
+            Ok(response) => {
+                let proto: ChangeConfigResponse = response.into_inner();
+                match Status::from_i32(proto.status) {
+                    Some(Status::Success) => Success(()),
+                    Some(Status::NotLeader) => NewLeader(proto.leader),
+                    _ => Failure(bad_status(proto.status)),
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl Client for ClientImpl {
-    // Adds the supplied payload as the next entry in the cluster's shared log.
-    // Returns once the payload has been added (or the operation has failed).
     async fn commit(&self, payload: &[u8]) -> Result<EntryId, tonic::Status> {
-        let op = async move |leader: Server| ClientImpl::commit_impl(leader, payload).await;
+        let op = async move |leader| ClientImpl::commit_impl(leader, payload).await;
         self.retry_helper(op).await
     }
 
-    // Sends an rpc to the cluster leader to step down. Returns the address of
-    // the leader which stepped down.
     async fn preempt_leader(&self) -> Result<Server, tonic::Status> {
-        let op = async move |leader: Server| ClientImpl::preempt_leader_impl(leader).await;
+        let op = async move |leader| ClientImpl::preempt_leader_impl(leader).await;
+        self.retry_helper(op).await
+    }
+
+    async fn change_config(&self, members: Vec<Server>) -> Result<(), tonic::Status> {
+        let members = &members;
+        let op = async move |leader| ClientImpl::change_config_impl(leader, members).await;
         self.retry_helper(op).await
     }
 }
