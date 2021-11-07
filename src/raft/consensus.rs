@@ -259,6 +259,7 @@ impl RaftImpl {
     async fn replicate_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
         let me = arc_state.lock().await.name();
         let timeouts_ms = arc_state.lock().await.options.leader_replicate_ms.clone();
+        let mut first_heartbeat_done = false;
         loop {
             {
                 let locked_state = arc_state.lock().await;
@@ -279,6 +280,14 @@ impl RaftImpl {
             }
 
             RaftImpl::replicate_entries(arc_state.clone(), term).await;
+            if !first_heartbeat_done {
+                info!(
+                    "[{}] Completed first round of appends as leader for term {}",
+                    me, term
+                );
+                first_heartbeat_done = true;
+            }
+
             sleep(Duration::from_millis(add_jitter(timeouts_ms))).await;
         }
     }
@@ -736,6 +745,7 @@ impl Raft for RaftImpl {
         // Record the latest leader.
         let leader = request.leader.expect("leader").clone();
         state.cluster.record_leader(&leader);
+        state.role = RaftRole::Follower;
         match &state.diagnostics {
             Some(d) => d.lock().await.report_leader(state.term, &leader),
             _ => (),
