@@ -745,7 +745,6 @@ impl Raft for RaftImpl {
         // Record the latest leader.
         let leader = request.leader.expect("leader").clone();
         state.cluster.record_leader(&leader);
-        state.role = RaftRole::Follower;
         match &state.diagnostics {
             Some(d) => d.lock().await.report_leader(state.term, &leader),
             _ => (),
