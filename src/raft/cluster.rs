@@ -125,6 +125,14 @@ impl Cluster {
     }
 
     pub fn create_joint(&self, new_members: Vec<Server>) -> ClusterConfig {
+
+        // TODO - DONOTLAND
+        // This doesn't actually work because we need quorum among both the old
+        // members and the new members, which is different from quorum among the
+        // union. We probably want a special "joint" mode and to have the
+        // consensus module ask the cluster whether there is sufficient quorum
+        // based on a set of votes from different servers.
+
         let mut keys = HashSet::<String>::new();
         let mut union = Vec::<Server>::new();
 
