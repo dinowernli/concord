@@ -2,6 +2,8 @@
 #![feature(map_first_last)]
 #![feature(trait_upcasting)]
 
+extern crate structopt;
+
 use std::error::Error;
 use std::time::Duration;
 
@@ -11,6 +13,7 @@ use futures::future::join4;
 use futures::future::join_all;
 use log::{error, info};
 use rand::seq::SliceRandom;
+use structopt::StructOpt;
 use tokio::time::{sleep, Instant};
 
 use raft::raft_proto;
@@ -26,6 +29,18 @@ use crate::raft_proto::raft_server::RaftServer;
 mod keyvalue;
 mod raft;
 mod testing;
+
+#[derive(Debug, StructOpt, Copy, Clone)]
+struct Arguments {
+    #[structopt(short = "p", long = "disable_preempt")]
+    disable_preempt: bool,
+
+    #[structopt(short = "v", long = "disable_validate")]
+    disable_validate: bool,
+
+    #[structopt(short = "c", long = "disable_commit")]
+    disable_commit: bool,
+}
 
 fn server(host: &str, port: i32, name: &str) -> Server {
     Server {
@@ -76,7 +91,11 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
 
 // Starts a loop which periodically preempts the cluster leader, forcing the
 // cluster to recover by electing a new one.
-async fn run_preempt_loop(cluster: &Vec<Server>) {
+async fn run_preempt_loop(args: Arc<Arguments>, cluster: &Vec<Server>) {
+    if args.disable_preempt {
+        return;
+    }
+
     let member = cluster.first().unwrap().clone();
     let name = "main-preempt";
     let client = raft::new_client(name, &member);
@@ -97,7 +116,11 @@ async fn run_preempt_loop(cluster: &Vec<Server>) {
 // Starts a loop which periodically asks the diagnostics object to validate the
 // execution history of the cluster. If this fails, this indicates a bug in the
 // raft implementation.
-async fn run_validate_loop(diag: Arc<Mutex<Diagnostics>>) {
+async fn run_validate_loop(args: Arc<Arguments>, diag: Arc<Mutex<Diagnostics>>) {
+    if args.disable_validate {
+        return;
+    }
+
     loop {
         diag.lock()
             .await
@@ -109,7 +132,11 @@ async fn run_validate_loop(diag: Arc<Mutex<Diagnostics>>) {
 }
 
 // Repeatedly picks a random server in the cluster and sends a put request.
-async fn run_put_loop(cluster: &Vec<Server>) {
+async fn run_put_loop(args: Arc<Arguments>, cluster: &Vec<Server>) {
+    if args.disable_commit {
+        return;
+    }
+
     let request = PutRequest {
         key: "foo".as_bytes().to_vec(),
         value: "bar".as_bytes().to_vec(),
@@ -140,7 +167,11 @@ async fn run_put_loop(cluster: &Vec<Server>) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::from_env(Env::default().default_filter_or("concord=info")).init();
+    env_logger::from_env(Env::default().default_filter_or("concord=info"))
+        .format_timestamp_millis()
+        .init();
+
+    let arguments = Arc::new(Arguments::from_args());
 
     // Note that we use the port as the name because we're running all these servers
     // locally and so the port is sufficient to identify the server.
@@ -161,9 +192,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let serving = join_all(servers);
     let all = join4(
         serving,
-        run_put_loop(&addresses),
-        run_preempt_loop(&addresses),
-        run_validate_loop(diag.clone()),
+        run_put_loop(arguments.clone(), &addresses),
+        run_preempt_loop(arguments.clone(), &addresses),
+        run_validate_loop(arguments.clone(), diag.clone()),
     );
 
     all.await;
