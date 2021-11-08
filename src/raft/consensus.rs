@@ -112,31 +112,10 @@ impl RaftImpl {
         let mut state = self.state.lock().await;
         let term = state.term;
         info!("[{}] Starting", state.name());
-        RaftImpl::become_follower(&mut state, arc_state.clone(), term);
+        state.become_follower(arc_state.clone(), term);
 
         tokio::spawn(async move {
             RaftImpl::compaction_loop(arc_state.clone()).await;
-        });
-    }
-
-    fn become_follower(state: &mut RaftState, arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        let me = state.name();
-        info!("[{}] Becoming follower for term {}", &me, term);
-        assert!(term >= state.term, "Term should never decrease");
-
-        state.term = term;
-        state.role = RaftRole::Follower;
-        state.voted_for = None;
-        let timeout_ms = state.options.follower_timeout_ms;
-
-        let task = sleep(Duration::from_millis(add_jitter(timeout_ms))).then(async move |_| {
-            tokio::spawn(async move {
-                info!("[{}] Follower timeout in term {}", &me, term);
-                RaftImpl::election_loop(arc_state.clone(), term + 1).await;
-            });
-        });
-        state.timer_guard = Some(TimerGuard {
-            handle: tokio::spawn(task),
         });
     }
 
@@ -171,6 +150,7 @@ impl RaftImpl {
         type Res = Result<Response<VoteResponse>, Status>;
         type Fut = Pin<Box<dyn Future<Output = Res> + Send>>;
         let mut futures = Vec::<Fut>::new();
+
         {
             let mut state = arc_state.lock().await;
 
@@ -179,14 +159,14 @@ impl RaftImpl {
                 return true;
             }
 
-            // Prepare the election.
+            // Prepare the election. Note that we don't reset the timer because this
+            // would lead to cancelling our own ongoing execution.
             info!("[{}] Starting election for term {}", state.name(), term);
             state.role = RaftRole::Candidate;
             state.term = term;
-            state.timer_guard = None;
             state.voted_for = Some(state.cluster.me());
 
-            // Request votes from all peer.
+            // Request votes from all peers.
             let request = state.create_vote_request();
             let others = state.cluster.others();
             for server in others {
@@ -223,7 +203,7 @@ impl RaftImpl {
                         let message = result.into_inner();
                         if message.term > term {
                             info!("[{}] Detected higher term {}", &me, message.term);
-                            RaftImpl::become_follower(&mut state, arc_state.clone(), message.term);
+                            state.become_follower(arc_state.clone(), message.term);
                             return true;
                         }
                         if message.granted {
@@ -385,7 +365,7 @@ impl RaftImpl {
                         "[{}] Detected higher term {} from peer {}",
                         &me, other_term, &follower.name,
                     );
-                    RaftImpl::become_follower(&mut state, arc_state.clone(), other_term);
+                    state.become_follower(arc_state.clone(), other_term);
                     return;
                 }
                 state.record_follower_matches(&follower, install_request.last.expect("last").index);
@@ -430,7 +410,7 @@ impl RaftImpl {
                         "[{}] Detected higher term {} from peer {}",
                         &me, other_term, &follower.name,
                     );
-                    RaftImpl::become_follower(&mut state, arc_state.clone(), other_term);
+                    state.become_follower(arc_state.clone(), other_term);
                     return;
                 }
                 state.handle_append_response(&follower, &message, &append_request);
@@ -454,12 +434,14 @@ struct FollowerPosition {
 // This allows callers to just replace the guard in order to refresh a timer,
 // ensuring that there is only one timer active at any given time.
 struct TimerGuard {
+    name: String,
     handle: JoinHandle<()>,
 }
 
 impl Drop for TimerGuard {
     fn drop(&mut self) {
         self.handle.abort();
+        debug!("[{}] Aborted handle", &self.name);
     }
 }
 
@@ -545,6 +527,30 @@ impl RaftState {
             snapshot,
             last,
         }
+    }
+
+    fn become_follower(&mut self, arc_state: Arc<Mutex<RaftState>>, term: i64) {
+        info!("[{}] Becoming follower for term {}", self.name(), term);
+        assert!(term >= self.term, "Term should never decrease");
+
+        self.term = term;
+        self.role = RaftRole::Follower;
+        self.voted_for = None;
+        self.reset_follower_timer(arc_state.clone(), term + 1);
+    }
+
+    fn reset_follower_timer(&mut self, arc_state: Arc<Mutex<RaftState>>, next_term: i64) {
+        let timeout_ms = self.options.follower_timeout_ms;
+        let me = self.name();
+        let term = self.term;
+        let task = sleep(Duration::from_millis(add_jitter(timeout_ms))).then(async move |_| {
+            info!("[{}] Follower timeout in term {}", me, term);
+            RaftImpl::election_loop(arc_state.clone(), next_term).await;
+        });
+        self.timer_guard = Some(TimerGuard {
+            name: self.name(),
+            handle: tokio::spawn(task),
+        });
     }
 
     // Incorporates the provided response corresponding to the supplied request.
@@ -675,7 +681,7 @@ impl Raft for RaftImpl {
         // If we're in an outdated term, we revert to follower in the new later
         // term and may still grant the requesting candidate our vote.
         if request.term > state.term {
-            RaftImpl::become_follower(&mut state, self.state.clone(), request.term);
+            state.become_follower(self.state.clone(), request.term);
         }
 
         let candidate = request.candidate;
@@ -688,14 +694,14 @@ impl Raft for RaftImpl {
                 info!(
                     "[{}] Granted vote to {:?}",
                     &me,
-                    state.voted_for.clone().map(|x| x.name)
+                    candidate.clone().map(|x| x.name)
                 );
                 granted = true;
             } else {
                 info!(
                     "[{}] Denied vote to {:?}",
                     &me,
-                    state.voted_for.clone().map(|x| x.name)
+                    candidate.clone().map(|x| x.name)
                 );
                 granted = false;
             }
@@ -739,7 +745,7 @@ impl Raft for RaftImpl {
         // by resetting to a "clean" follower state for the leader's (greater)
         // term. Note that we then handle the leader's append afterwards.
         if request.term > state.term {
-            RaftImpl::become_follower(&mut state, self.state.clone(), request.term);
+            state.become_follower(self.state.clone(), request.term);
         }
 
         // Record the latest leader.
@@ -752,31 +758,13 @@ impl Raft for RaftImpl {
 
         // Reset the election timer
         let term = state.term;
-        let arc_state = self.state.clone();
-        let me = state.name();
-        let timeout_ms = state.options.follower_timeout_ms;
-
-        let task = sleep(Duration::from_millis(add_jitter(timeout_ms))).then(async move |_| {
-            tokio::spawn(async move {
-                info!("[{}] Timed out waiting for leader heartbeat", me.clone());
-                RaftImpl::election_loop(arc_state.clone(), term + 1).await;
-            });
-        });
-        state.timer_guard = Some(TimerGuard {
-            handle: tokio::spawn(task),
-        });
-
-        let term = state.term;
+        state.reset_follower_timer(self.state.clone(), term + 1);
 
         // Make sure we have the previous log index sent. Note that COMPACTED
         // can happen whenever we have no entries (e.g.,initially or just after
         // a snapshot install).
-        if state
-            .store
-            .log
-            .contains(&request.previous.expect("previous"))
-            == ContainsResult::ABSENT
-        {
+        let previous = &request.previous.expect("previous");
+        if state.store.log.contains(previous) == ContainsResult::ABSENT {
             // Let the leader know that this entry is too far in the future, so
             // it can try again from with earlier index.
             return Ok(Response::new(AppendResponse {
@@ -875,7 +863,7 @@ impl Raft for RaftImpl {
         }
 
         let term = state.term;
-        RaftImpl::become_follower(&mut state, self.state.clone(), term);
+        state.become_follower(self.state.clone(), term);
 
         Ok(Response::new(StepDownResponse {
             status: raft_proto::Status::Success as i32,
