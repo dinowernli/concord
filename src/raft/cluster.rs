@@ -1,6 +1,7 @@
 use crate::raft::raft_proto::raft_client::RaftClient;
 use crate::raft::raft_proto::Server;
 use std::collections::HashMap;
+use std::time::Duration;
 use tonic::transport::{Channel, Endpoint, Error};
 
 // Holds information about a Raft cluster.
@@ -68,7 +69,13 @@ impl Cluster {
 
         // Cache miss, create a new channel.
         let dst = format!("http://[::1]:{}", address.port);
-        let channel = Endpoint::new(dst)?.connect().await?;
+        let timeout = Duration::from_secs(1);
+        let channel = Endpoint::new(dst)?
+            .connect_timeout(timeout.clone())
+            .timeout(timeout.clone())
+            .connect()
+            .await?;
+
         self.channels.insert(k, channel.clone());
         Ok(RaftClient::new(channel))
     }

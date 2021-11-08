@@ -150,6 +150,7 @@ impl RaftImpl {
         type Res = Result<Response<VoteResponse>, Status>;
         type Fut = Pin<Box<dyn Future<Output = Res> + Send>>;
         let mut futures = Vec::<Fut>::new();
+
         {
             let mut state = arc_state.lock().await;
 
@@ -158,14 +159,14 @@ impl RaftImpl {
                 return true;
             }
 
-            // Prepare the election.
+            // Prepare the election. Note that we don't reset the timer because this
+            // would lead to cancelling our own ongoing execution.
             info!("[{}] Starting election for term {}", state.name(), term);
             state.role = RaftRole::Candidate;
             state.term = term;
-            state.timer_guard = None;
             state.voted_for = Some(state.cluster.me());
 
-            // Request votes from all peer.
+            // Request votes from all peers.
             let request = state.create_vote_request();
             let others = state.cluster.others();
             for server in others {
@@ -433,12 +434,14 @@ struct FollowerPosition {
 // This allows callers to just replace the guard in order to refresh a timer,
 // ensuring that there is only one timer active at any given time.
 struct TimerGuard {
+    name: String,
     handle: JoinHandle<()>,
 }
 
 impl Drop for TimerGuard {
     fn drop(&mut self) {
         self.handle.abort();
+        debug!("[{}] Aborted handle", &self.name);
     }
 }
 
@@ -539,13 +542,13 @@ impl RaftState {
     fn reset_follower_timer(&mut self, arc_state: Arc<Mutex<RaftState>>, next_term: i64) {
         let timeout_ms = self.options.follower_timeout_ms;
         let me = self.name();
+        let term = self.term;
         let task = sleep(Duration::from_millis(add_jitter(timeout_ms))).then(async move |_| {
-            tokio::spawn(async move {
-                info!("[{}] Follower timeout in term {}", me, next_term);
-                RaftImpl::election_loop(arc_state.clone(), next_term).await;
-            });
+            info!("[{}] Follower timeout in term {}", me, term);
+            RaftImpl::election_loop(arc_state.clone(), next_term).await;
         });
         self.timer_guard = Some(TimerGuard {
+            name: self.name(),
             handle: tokio::spawn(task),
         });
     }
@@ -691,14 +694,14 @@ impl Raft for RaftImpl {
                 info!(
                     "[{}] Granted vote to {:?}",
                     &me,
-                    state.voted_for.clone().map(|x| x.name)
+                    candidate.clone().map(|x| x.name)
                 );
                 granted = true;
             } else {
                 info!(
                     "[{}] Denied vote to {:?}",
                     &me,
-                    state.voted_for.clone().map(|x| x.name)
+                    candidate.clone().map(|x| x.name)
                 );
                 granted = false;
             }
