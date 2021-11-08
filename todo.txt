@@ -1,4 +1,3 @@
 * Write more tests for consensus.rs
-* Split up consensus.rs
 * Introduce a network layer for fault injection
 * Implement cluster reconfiguration
