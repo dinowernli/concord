@@ -4,10 +4,10 @@ use crate::raft::StateMachine;
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::channel::oneshot::{channel, Receiver, Sender};
-use log::{debug, info, warn};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use tonic::Status;
+use tracing::{debug, info, warn};
 
 // Handles persistent storage for a Raft member, including a snapshot starting
 // from the beginning of time up to some index, and running log of entries since

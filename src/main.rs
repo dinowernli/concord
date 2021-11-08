@@ -3,6 +3,7 @@
 #![feature(trait_upcasting)]
 
 extern crate structopt;
+extern crate tracing;
 
 use std::error::Error;
 use std::time::Duration;
@@ -11,10 +12,11 @@ use async_std::sync::{Arc, Mutex};
 use env_logger::Env;
 use futures::future::join4;
 use futures::future::join_all;
-use log::{error, info};
 use rand::seq::SliceRandom;
 use structopt::StructOpt;
 use tokio::time::{sleep, Instant};
+use tracing::{error, info};
+use tracing_subscriber;
 
 use raft::raft_proto;
 use raft::{Diagnostics, Options, RaftImpl};
@@ -167,9 +169,11 @@ async fn run_put_loop(args: Arc<Arguments>, cluster: &Vec<Server>) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::Builder::from_env(Env::default().default_filter_or("concord=info"))
-        .format_timestamp_millis()
-        .init();
+    // env_logger::Builder::from_env(Env::default().default_filter_or("concord=info"))
+    //     .format_timestamp_millis()
+    //     .init();
+
+    tracing_subscriber::fmt::init();
 
     let arguments = Arc::new(Arguments::from_args());
 

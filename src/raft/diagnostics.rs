@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use async_std::sync::{Arc, Mutex};
-use log::info;
+use tracing::info;
 
 use raft_proto::Server;
 

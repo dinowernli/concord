@@ -1,8 +1,8 @@
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
-use log::{debug, warn};
 use prost::Message;
 use tonic::{Request, Response, Status};
+use tracing::{debug, warn};
 
 use crate::keyvalue::keyvalue_proto;
 use crate::keyvalue::keyvalue_proto::key_value_server::KeyValue;

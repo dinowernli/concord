@@ -11,12 +11,12 @@ use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::future::{err, join_all};
 use futures::FutureExt;
-use log::{debug, info};
 use rand::Rng;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
+use tracing::{debug, info};
 
 use diagnostics::ServerDiagnostics;
 use raft::log::ContainsResult;
