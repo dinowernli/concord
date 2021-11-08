@@ -167,7 +167,7 @@ async fn run_put_loop(args: Arc<Arguments>, cluster: &Vec<Server>) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::from_env(Env::default().default_filter_or("concord=info"))
+    env_logger::Builder::from_env(Env::default().default_filter_or("concord=info"))
         .format_timestamp_millis()
         .init();
 

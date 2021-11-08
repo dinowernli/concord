@@ -699,7 +699,7 @@ impl Raft for RaftImpl {
                 granted = true;
             } else {
                 info!(
-                    "[{}] Denied vote to {:?}",
+                    "[{}] Denied vote to {:?} because log is not up-to-date",
                     &me,
                     candidate.clone().map(|x| x.name)
                 );
