@@ -1,7 +1,7 @@
 use crate::raft::raft_proto::raft_client::RaftClient;
 use crate::raft::raft_proto::{ClusterConfig, Server};
-use std::time::Duration;
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 use tonic::transport::{Channel, Endpoint, Error};
 
 // Holds information about a Raft cluster.
@@ -125,7 +125,6 @@ impl Cluster {
     }
 
     pub fn create_joint(&self, new_members: Vec<Server>) -> ClusterConfig {
-
         // TODO - DONOTLAND
         // This doesn't actually work because we need quorum among both the old
         // members and the new members, which is different from quorum among the
