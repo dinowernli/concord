@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
-use tracing::{debug, info};
+use tracing::{debug, info, info_span, instrument, Instrument};
 
 use diagnostics::ServerDiagnostics;
 use raft::log::ContainsResult;
@@ -111,7 +111,7 @@ impl RaftImpl {
 
         let mut state = self.state.lock().await;
         let term = state.term;
-        info!("[{}] Starting", state.name());
+        info!(term, "starting");
         state.become_follower(arc_state.clone(), term);
 
         tokio::spawn(async move {
@@ -161,7 +161,7 @@ impl RaftImpl {
 
             // Prepare the election. Note that we don't reset the timer because this
             // would lead to cancelling our own ongoing execution.
-            info!("[{}] Starting election for term {}", state.name(), term);
+            info!(term, "starting election");
             state.role = RaftRole::Candidate;
             state.term = term;
             state.voted_for = Some(state.cluster.me());
@@ -189,7 +189,6 @@ impl RaftImpl {
         {
             let mut state = arc_state.lock().await;
             let me = state.name();
-            debug!("[{}] Done waiting for vote requests", &me);
 
             // The world has moved on or someone else has won in this term.
             if state.term > term || state.role != RaftRole::Candidate {
@@ -216,19 +215,21 @@ impl RaftImpl {
 
             let arc_state_copy = arc_state.clone();
             return if 2 * votes > state.cluster.size() {
-                info!(
-                    "[{}] Won election with {} votes, becoming leader for term {}",
-                    &me, votes, term
-                );
+                info!(term, votes, "won election");
                 state.role = RaftRole::Leader;
                 state.followers = state.create_follower_positions();
                 state.timer_guard = None;
+
+                let me = state.name();
                 tokio::spawn(async move {
-                    RaftImpl::replicate_loop(arc_state_copy.clone(), term).await;
+                    let span = info_span!("replicate", server=%me);
+                    RaftImpl::replicate_loop(arc_state_copy.clone(), term)
+                        .instrument(span)
+                        .await;
                 });
                 true
             } else {
-                info!("[{}] Lost election with {} votes", &me, votes);
+                info!(term, votes, "lost election");
                 false
             };
         }
@@ -261,10 +262,7 @@ impl RaftImpl {
 
             RaftImpl::replicate_entries(arc_state.clone(), term).await;
             if !first_heartbeat_done {
-                info!(
-                    "[{}] Completed first round of appends as leader for term {}",
-                    me, term
-                );
+                info!(term, "completed first round of appends as leader");
                 first_heartbeat_done = true;
             }
 
@@ -530,7 +528,7 @@ impl RaftState {
     }
 
     fn become_follower(&mut self, arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        info!("[{}] Becoming follower for term {}", self.name(), term);
+        info!(term, "becoming follower");
         assert!(term >= self.term, "Term should never decrease");
 
         self.term = term;
@@ -543,13 +541,14 @@ impl RaftState {
         let timeout_ms = self.options.follower_timeout_ms;
         let me = self.name();
         let term = self.term;
+        let span = info_span!(parent: None, "election", server = %me);
         let task = sleep(Duration::from_millis(add_jitter(timeout_ms))).then(async move |_| {
-            info!("[{}] Follower timeout in term {}", me, term);
+            info!(term, "follower timeout");
             RaftImpl::election_loop(arc_state.clone(), next_term).await;
         });
         self.timer_guard = Some(TimerGuard {
             name: self.name(),
-            handle: tokio::spawn(task),
+            handle: tokio::spawn(task.instrument(span)),
         });
     }
 
@@ -594,7 +593,6 @@ impl RaftState {
     // Called when, as a leader, we know that a follower's entries up to (and including)
     // match_index match our entries.
     fn record_follower_matches(&mut self, peer: &Server, match_index: i64) {
-        let me = self.name();
         let follower = self
             .followers
             .get_mut(address_key(&peer).as_str())
@@ -603,10 +601,7 @@ impl RaftState {
         follower.match_index = match_index;
         follower.next_index = match_index + 1;
         if follower != &old_f {
-            info!(
-                "[{}] Follower state for peer {} is now (next={},match={})",
-                me, &peer.name, follower.next_index, follower.match_index
-            );
+            info!(peer = %peer.name, follower_next = follower.next_index, follower_match = follower.match_index, "updated follower state");
         }
     }
 
@@ -661,6 +656,7 @@ impl RaftState {
 
 #[tonic::async_trait]
 impl Raft for RaftImpl {
+    #[instrument(fields(server=%self.address.name),skip(self,request))]
     async fn vote(&self, request: Request<VoteRequest>) -> Result<Response<VoteResponse>, Status> {
         let request = request.into_inner();
         debug!(
@@ -687,30 +683,18 @@ impl Raft for RaftImpl {
         let candidate = request.candidate;
 
         let granted;
-        let me = self.address.clone().name;
+        let term = state.term;
         if state.voted_for.is_none() || &candidate == &state.voted_for {
             if state.store.log.is_up_to_date(&request.last.expect("last")) {
                 state.voted_for = candidate.clone();
-                info!(
-                    "[{}] Granted vote to {:?}",
-                    &me,
-                    candidate.clone().map(|x| x.name)
-                );
                 granted = true;
+                info!(term, candidate=?candidate.clone().map(|x| x.name), "granted vote");
             } else {
-                info!(
-                    "[{}] Denied vote to {:?} because log is not up-to-date",
-                    &me,
-                    candidate.clone().map(|x| x.name)
-                );
+                info!(term, candidate=?candidate.clone().map(|x| x.name), "denied vote because candidate is not up-to-date");
                 granted = false;
             }
         } else {
-            info!(
-                "[{}] Rejecting, already voted for candidate [{:?}]",
-                &me,
-                state.voted_for.clone().map(|x| x.name)
-            );
+            info!(term, voted_for = ?state.voted_for.clone().map(|x| x.name), "denied vote, already voted for someone else");
             granted = false;
         }
 
@@ -720,6 +704,7 @@ impl Raft for RaftImpl {
         }))
     }
 
+    #[instrument(fields(server=%self.address.name),skip(self,request))]
     async fn append(
         &self,
         request: Request<AppendRequest>,
@@ -790,6 +775,7 @@ impl Raft for RaftImpl {
         }))
     }
 
+    #[instrument(fields(server=%self.address.name),skip(self,request))]
     async fn commit(
         &self,
         request: Request<CommitRequest>,
@@ -848,9 +834,10 @@ impl Raft for RaftImpl {
         Ok(Response::new(result))
     }
 
+    #[instrument(fields(server=%self.address.name),skip(self,_req))]
     async fn step_down(
         &self,
-        _: Request<StepDownRequest>,
+        _req: Request<StepDownRequest>,
     ) -> Result<Response<StepDownResponse>, Status> {
         debug!("[{}] Handling step down request", self.address.name);
 
@@ -871,6 +858,7 @@ impl Raft for RaftImpl {
         }))
     }
 
+    #[instrument(fields(server=?self.address),skip(self,request))]
     async fn install_snapshot(
         &self,
         request: Request<InstallSnapshotRequest>,

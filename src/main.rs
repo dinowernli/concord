@@ -9,13 +9,12 @@ use std::error::Error;
 use std::time::Duration;
 
 use async_std::sync::{Arc, Mutex};
-use env_logger::Env;
 use futures::future::join4;
 use futures::future::join_all;
 use rand::seq::SliceRandom;
 use structopt::StructOpt;
 use tokio::time::{sleep, Instant};
-use tracing::{error, info};
+use tracing::{error, info, info_span, Instrument};
 use tracing_subscriber;
 
 use raft::raft_proto;
@@ -52,15 +51,14 @@ fn server(host: &str, port: i32, name: &str) -> Server {
     }
 }
 
+//#[instrument(skip(all,diagnostics))]
 async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<Diagnostics>>) {
+    let server = address.name.to_string();
+    let keyvalue = KeyValueService::new(server.as_str(), &address);
+
     // A service used to serve the keyvalue store, backed by the
     // underlying Raft cluster.
-    let name = address.name.to_string();
-    let keyvalue = KeyValueService::new(name.as_str(), &address);
-    info!(
-        "Created keyvalue service with name {} at {:?}",
-        name, &address
-    );
+    info!("created keyvalue service");
 
     // A service used by the Raft cluster.
     let server_diagnostics = diagnostics.lock().await.get_server(&address);
@@ -72,8 +70,9 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
         Some(server_diagnostics),
         Options::default(),
     );
+
     raft.start().await;
-    info!("Created raft service for {:?}", &address);
+    info!("created raft service");
 
     let serve = tonic::transport::Server::builder()
         .add_service(RaftServer::new(raft))
@@ -104,12 +103,10 @@ async fn run_preempt_loop(args: Arc<Arguments>, cluster: &Vec<Server>) {
     loop {
         let start = Instant::now();
         match client.preempt_leader().await {
-            Ok(leader) => info!(
-                "Preempted cluster leader: {} (took {}ms)",
-                leader.name,
-                start.elapsed().as_millis()
-            ),
-            Err(message) => error!("Failed to preempt leader: {}", message),
+            Ok(leader) => {
+                info!(leader = %leader.name, latency_ms = %start.elapsed().as_millis(), "success")
+            }
+            Err(message) => error!("failed: {}", message),
         }
         sleep(Duration::from_secs(10)).await;
     }
@@ -150,17 +147,8 @@ async fn run_put_loop(args: Arc<Arguments>, cluster: &Vec<Server>) {
         let mut client = KeyValueClient::connect(address).await.expect("connect");
         let start = Instant::now();
         match client.put(request.clone()).await {
-            Ok(_) => info!(
-                "Put {} successful (took {}ms)",
-                i,
-                start.elapsed().as_millis()
-            ),
-            Err(msg) => error!(
-                "Put {} failed: {} (took {}ms)",
-                i,
-                msg,
-                start.elapsed().as_millis()
-            ),
+            Ok(_) => info!(i, latency_ms=%start.elapsed().as_millis(), "success"),
+            Err(msg) => info!(i, latency_ms=%start.elapsed().as_millis(), "failure: {}", msg),
         }
         i += 1;
         sleep(Duration::from_millis(1000)).await;
@@ -169,12 +157,9 @@ async fn run_put_loop(args: Arc<Arguments>, cluster: &Vec<Server>) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // env_logger::Builder::from_env(Env::default().default_filter_or("concord=info"))
-    //     .format_timestamp_millis()
-    //     .init();
-
-    tracing_subscriber::fmt::init();
-
+    tracing_subscriber::FmtSubscriber::builder()
+        .with_target(false)
+        .init();
     let arguments = Arc::new(Arguments::from_args());
 
     // Note that we use the port as the name because we're running all these servers
@@ -189,16 +174,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let diag = Arc::new(Mutex::new(Diagnostics::new()));
     let mut servers = Vec::new();
     for address in &addresses {
+        let span = info_span!("serve", server=%address.name);
         let running = run_server(&address, &addresses, diag.clone());
-        servers.push(running);
+        servers.push(running.instrument(span));
     }
 
     let serving = join_all(servers);
     let all = join4(
         serving,
-        run_put_loop(arguments.clone(), &addresses),
-        run_preempt_loop(arguments.clone(), &addresses),
-        run_validate_loop(arguments.clone(), diag.clone()),
+        run_put_loop(arguments.clone(), &addresses).instrument(info_span!("put")),
+        run_preempt_loop(arguments.clone(), &addresses).instrument(info_span!("preempt")),
+        run_validate_loop(arguments.clone(), diag.clone()).instrument(info_span!("validate")),
     );
 
     all.await;
