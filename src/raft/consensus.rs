@@ -146,7 +146,7 @@ impl RaftImpl {
     // Returns whether or not the election process is deemed complete. If complete,
     // there is no need to run any further elections.
     async fn run_election(arc_state: Arc<Mutex<RaftState>>, term: i64) -> bool {
-        type Res = Result<Response<VoteResponse>, Status>;
+        type Res = Result<(Server, VoteResponse), Status>;
         type Fut = Pin<Box<dyn Future<Output = Res> + Send>>;
         let mut futures = Vec::<Fut>::new();
 
@@ -168,10 +168,14 @@ impl RaftImpl {
             // Request votes from all peers.
             let request = state.create_vote_request();
             let others = state.cluster.others();
-            for server in others {
+            for server in &others {
                 match state.cluster.new_client(&server).await {
                     Ok(client) => {
-                        futures.push(Box::pin(RaftState::request_vote(client, request.clone())));
+                        futures.push(Box::pin(RaftState::request_vote(
+                            client,
+                            server.clone(),
+                            request.clone(),
+                        )));
                     }
                     Err(msg) => {
                         futures.push(Box::pin(err(Status::unavailable(format!(
@@ -193,18 +197,17 @@ impl RaftImpl {
                 return true;
             }
 
-            let mut votes = 1; // Here we count our own vote for ourselves.
+            let mut votes = Vec::new();
             for response in results {
                 match response {
-                    Ok(result) => {
-                        let message = result.into_inner();
+                    Ok((peer, message)) => {
                         if message.term > term {
                             info!(term=state.term, other_term=message.term, role=?state.role, "detected higher term");
                             state.become_follower(arc_state.clone(), message.term);
                             return true;
                         }
                         if message.granted {
-                            votes = votes + 1;
+                            votes.push(peer);
                         }
                     }
                     Err(message) => warn!("vote request error: {}", message),
@@ -212,8 +215,9 @@ impl RaftImpl {
             }
 
             let arc_state_copy = arc_state.clone();
-            return if 2 * votes > state.cluster.size() {
-                info!(term, votes, "won election");
+            let supporters: Vec<String> = votes.iter().map(|s| s.name.to_string()).collect();
+            return if state.cluster.is_quorum(&votes) {
+                info!(term, votes=?supporters, "won election");
                 state.role = RaftRole::Leader;
                 state.followers = state.create_follower_positions();
                 state.timer_guard = None;
@@ -221,13 +225,13 @@ impl RaftImpl {
                 let me = state.name();
                 tokio::spawn(async move {
                     let span = info_span!("replicate", server=%me);
-                    RaftImpl::replicate_loop(arc_state_copy.clone(), term)
+                    RaftImpl::replicate_loop(arc_state_copy, term)
                         .instrument(span)
                         .await;
                 });
                 true
             } else {
-                debug!(term, votes, "lost election");
+                debug!(term, votes=?supporters, "lost election");
                 false
             };
         }
@@ -257,7 +261,7 @@ impl RaftImpl {
 
             RaftImpl::replicate_entries(arc_state.clone(), term).await;
             if !first_heartbeat_done {
-                info!(term, role=?RaftRole::Leader, "established as leader");
+                info!(term, role=?RaftRole::Leader, "established");
                 first_heartbeat_done = true;
             }
 
@@ -409,6 +413,9 @@ struct FollowerPosition {
 
     // Highest index known to be replicated on the follower.
     match_index: i64,
+
+    // The actual server, for convenience.
+    server: Server,
 }
 
 impl Display for FollowerPosition {
@@ -473,6 +480,7 @@ impl RaftState {
                     // Optimistically start assuming next is the same as our own next.
                     next_index: self.store.log.next_index(),
                     match_index: -1,
+                    server: server.clone(),
                 },
             );
         }
@@ -591,20 +599,12 @@ impl RaftState {
     // to a majority of followers. In practice, this means that it is safe to
     // commit up to (and including) the result.
     fn compute_highest_majority_match(&self) -> i64 {
-        let mut matches: Vec<i64> = self
+        let matches = self
             .followers
-            .values()
-            .clone()
-            .into_iter()
-            .map(|f| f.match_index)
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.match_index))
             .collect();
-        matches.sort();
-        let mid = matches.len() / 2;
-
-        // The second half of the array has match_index above the return value. For even,
-        // we round down so that [1, 2, 4, 7] ends up as "2" (with the latter 3 followers
-        // making up the majority).
-        matches[mid]
+        self.cluster.highest_replicated_index(matches)
     }
 
     // Scans the state of our followers in the hope of finding a new index which
@@ -628,11 +628,13 @@ impl RaftState {
     // Requests a vote from a follower. Used to run leader elections.
     async fn request_vote(
         mut client: RaftClient<Channel>,
+        peer: Server,
         req: VoteRequest,
-    ) -> Result<Response<VoteResponse>, Status> {
-        let mut request = Request::new(req);
+    ) -> Result<(Server, VoteResponse), Status> {
+        let mut request = Request::new(req.clone());
         request.set_timeout(Duration::from_millis(100));
-        client.vote(request).await
+        let result = client.vote(request).await;
+        result.map(|response| (peer, response.into_inner()))
     }
 }
 

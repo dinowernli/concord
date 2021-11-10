@@ -1,6 +1,6 @@
 use crate::raft::raft_proto::raft_client::RaftClient;
 use crate::raft::raft_proto::Server;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint, Error};
 
@@ -55,6 +55,40 @@ impl Cluster {
     // Returns the number of participants in the cluster (including us).
     pub fn size(&self) -> usize {
         self.others.len() + 1
+    }
+
+    // Returns whether or not the supplied votes constitute a quorum, given the
+    // current cluster configuration.
+    pub fn is_quorum(&self, votes: &Vec<Server>) -> bool {
+        let mut uniques = HashSet::new();
+
+        // Always assume we vote for our outcome.
+        uniques.insert(key(&self.me));
+
+        for server in votes {
+            uniques.insert(key(&server));
+        }
+        2 * uniques.len() > self.size()
+    }
+
+    // Returns the highest index which has been replicated to a sufficient quorum of
+    // voting peer, and thus is safe to be committed.
+    //
+    // The supplied "matches" represents, for each known peer, the index up to which
+    // its log is identical to ours.
+    pub fn highest_replicated_index(&self, matches: HashMap<String, i64>) -> i64 {
+        let mut indexes: Vec<i64> = matches.values().cloned().collect();
+        indexes.sort();
+
+        // Note that we've implicitly appended ourselves to the end of the list because
+        // we assume no follower will be ahead of us (as leader) by construction.
+        //
+        // Examples:
+        // * [1, 3],    leader (3) ==> (len = 2) => (mid = 1)
+        // * [1, 1, 3], leader (3) ==> (len = 3) => (mid = 1)
+        let mid = indexes.len() / 2;
+
+        indexes[mid]
     }
 
     // Returns an rpc client which can be used to contact the supplied peer.
@@ -148,6 +182,46 @@ mod tests {
         );
 
         assert_eq!(cluster.size(), 3);
+    }
+
+    #[test]
+    fn test_quorum() {
+        let cluster = create_cluster();
+        assert_eq!(cluster.size(), 3);
+
+        // No votes other than ourself, no quorum.
+        assert!(!cluster.is_quorum(&Vec::new()));
+
+        // One other vote, this is quorum.
+        assert!(cluster.is_quorum(&vec![server("foo", 1234, "name1")]));
+
+        // One other vote, but that's just also us. No quorum.
+        let me = cluster.me.clone();
+        assert!(!cluster.is_quorum(&vec![me]));
+    }
+
+    #[test]
+    fn test_highest_replicated_index() {
+        let cluster = create_cluster();
+        assert_eq!(cluster.size(), 3);
+
+        let data = HashMap::from([("server1".to_string(), 4), ("server2".to_string(), 3)]);
+        assert_eq!(4, cluster.highest_replicated_index(data));
+
+        let data = HashMap::from([
+            ("server1".to_string(), 2),
+            ("server2".to_string(), 2),
+            ("server3".to_string(), 4),
+            ("server4".to_string(), 5),
+        ]);
+        assert_eq!(4, cluster.highest_replicated_index(data));
+
+        let data = HashMap::from([
+            ("server1".to_string(), 2),
+            ("server2".to_string(), 2),
+            ("server3".to_string(), 3),
+        ]);
+        assert_eq!(2, cluster.highest_replicated_index(data));
     }
 
     fn server(host: &str, port: i32, name: &str) -> Server {
