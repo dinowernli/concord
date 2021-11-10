@@ -1,8 +1,8 @@
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
-use log::{debug, warn};
 use prost::Message;
 use tonic::{Request, Response, Status};
+use tracing::{debug, instrument, warn};
 
 use crate::keyvalue::keyvalue_proto;
 use crate::keyvalue::keyvalue_proto::key_value_server::KeyValue;
@@ -58,9 +58,11 @@ impl KeyValueService {
 
 #[tonic::async_trait]
 impl KeyValue for KeyValueService {
+    #[instrument(fields(server=%self.name),skip(self,request))]
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
-        debug!("[{:?}] Handling GET request", &self.name);
         let request = request.into_inner();
+        debug!(?request, "handling request");
+
         if request.key.is_empty() {
             return Err(Status::invalid_argument("Empty key"));
         }
@@ -93,9 +95,11 @@ impl KeyValue for KeyValueService {
         }))
     }
 
+    #[instrument(fields(server=%self.name),skip(self,request))]
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
-        debug!("[{:?}] Handling PUT request", &self.name);
         let request = request.into_inner();
+        debug!(?request, "handling request");
+
         if request.key.is_empty() {
             return Err(Status::invalid_argument("Empty key"));
         }

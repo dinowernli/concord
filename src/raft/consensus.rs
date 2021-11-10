@@ -1,8 +1,7 @@
-extern crate chrono;
-extern crate math;
 extern crate rand;
 
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -11,12 +10,12 @@ use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::future::{err, join_all};
 use futures::FutureExt;
-use log::{debug, info};
 use rand::Rng;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
+use tracing::{debug, info, info_span, instrument, warn, Instrument};
 
 use diagnostics::ServerDiagnostics;
 use raft::log::ContainsResult;
@@ -111,7 +110,7 @@ impl RaftImpl {
 
         let mut state = self.state.lock().await;
         let term = state.term;
-        info!("[{}] Starting", state.name());
+        info!(term, "starting");
         state.become_follower(arc_state.clone(), term);
 
         tokio::spawn(async move {
@@ -161,7 +160,7 @@ impl RaftImpl {
 
             // Prepare the election. Note that we don't reset the timer because this
             // would lead to cancelling our own ongoing execution.
-            info!("[{}] Starting election for term {}", state.name(), term);
+            debug!(term, "starting election");
             state.role = RaftRole::Candidate;
             state.term = term;
             state.voted_for = Some(state.cluster.me());
@@ -188,8 +187,6 @@ impl RaftImpl {
 
         {
             let mut state = arc_state.lock().await;
-            let me = state.name();
-            debug!("[{}] Done waiting for vote requests", &me);
 
             // The world has moved on or someone else has won in this term.
             if state.term > term || state.role != RaftRole::Candidate {
@@ -202,7 +199,7 @@ impl RaftImpl {
                     Ok(result) => {
                         let message = result.into_inner();
                         if message.term > term {
-                            info!("[{}] Detected higher term {}", &me, message.term);
+                            info!(term=state.term, other_term=message.term, role=?state.role, "detected higher term");
                             state.become_follower(arc_state.clone(), message.term);
                             return true;
                         }
@@ -210,25 +207,27 @@ impl RaftImpl {
                             votes = votes + 1;
                         }
                     }
-                    Err(message) => info!("[{}] Vote request error: {}", &me, message),
+                    Err(message) => warn!("vote request error: {}", message),
                 }
             }
 
             let arc_state_copy = arc_state.clone();
             return if 2 * votes > state.cluster.size() {
-                info!(
-                    "[{}] Won election with {} votes, becoming leader for term {}",
-                    &me, votes, term
-                );
+                info!(term, votes, "won election");
                 state.role = RaftRole::Leader;
                 state.followers = state.create_follower_positions();
                 state.timer_guard = None;
+
+                let me = state.name();
                 tokio::spawn(async move {
-                    RaftImpl::replicate_loop(arc_state_copy.clone(), term).await;
+                    let span = info_span!("replicate", server=%me);
+                    RaftImpl::replicate_loop(arc_state_copy.clone(), term)
+                        .instrument(span)
+                        .await;
                 });
                 true
             } else {
-                info!("[{}] Lost election with {} votes", &me, votes);
+                debug!(term, votes, "lost election");
                 false
             };
         }
@@ -237,34 +236,28 @@ impl RaftImpl {
     // Starts the main leader replication loop. The loop stops once the term has
     // moved on (or we otherwise detect we are no longer leader).
     async fn replicate_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        let me = arc_state.lock().await.name();
         let timeouts_ms = arc_state.lock().await.options.leader_replicate_ms.clone();
         let mut first_heartbeat_done = false;
         loop {
             {
-                let locked_state = arc_state.lock().await;
-                if locked_state.term > term {
-                    info!("[{}] Detected higher term {}", me, locked_state.term);
+                let state = arc_state.lock().await;
+                if state.term > term {
+                    debug!(term=state.term, role=?state.role, "detected higher term");
                     return;
                 }
-                if locked_state.role != RaftRole::Leader {
+                if state.role != RaftRole::Leader {
+                    debug!(term=state.term, role=?state.role, "no longer leader");
                     return;
                 }
-                match &locked_state.diagnostics {
-                    Some(d) => d
-                        .lock()
-                        .await
-                        .report_leader(term, &locked_state.cluster.me()),
+                match &state.diagnostics {
+                    Some(d) => d.lock().await.report_leader(term, &state.cluster.me()),
                     _ => (),
                 }
             }
 
             RaftImpl::replicate_entries(arc_state.clone(), term).await;
             if !first_heartbeat_done {
-                info!(
-                    "[{}] Completed first round of appends as leader for term {}",
-                    me, term
-                );
+                info!(term, role=?RaftRole::Leader, "established as leader");
                 first_heartbeat_done = true;
             }
 
@@ -279,7 +272,7 @@ impl RaftImpl {
         let mut results = Vec::<Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>>::new();
         {
             let mut state = arc_state.lock().await;
-            debug!("[{}] Replicating entries", state.name());
+            debug!("replicating entries");
             let others = state.cluster.others();
             for follower in others {
                 // Figure out which entry the follower is expecting next and decide whether to
@@ -328,17 +321,16 @@ impl RaftImpl {
 
         {
             let mut state = arc_state.lock().await;
-            let me = state.name();
             if state.term > term {
-                info!("[{}] Detected higher term {}", &me, state.term);
+                debug!(term=state.term, role=?state.role, "detected higher term");
                 return;
             }
             if state.role != RaftRole::Leader {
-                info!("[{}] No longer leader", &me);
+                debug!(term=state.term, role=?state.role, "no longer leader");
                 return;
             }
             state.update_committed().await;
-            debug!("[{}] Done replicating entries", &me);
+            debug!("done replicating entries");
         }
     }
 
@@ -355,25 +347,18 @@ impl RaftImpl {
         let result = client.install_snapshot(request).await;
 
         let mut state = arc_state.lock().await;
-        let me = state.name();
         match result {
             Ok(result) => {
                 let response = result.into_inner();
                 let other_term = response.term;
                 if other_term > state.term {
-                    info!(
-                        "[{}] Detected higher term {} from peer {}",
-                        &me, other_term, &follower.name,
-                    );
+                    info!(other_term, peer=%follower.name, role=?state.role, "detected higher term");
                     state.become_follower(arc_state.clone(), other_term);
                     return;
                 }
                 state.record_follower_matches(&follower, install_request.last.expect("last").index);
             }
-            Err(message) => info!(
-                "[{}] InstallSnapshot request failed, error: {}",
-                &me, message
-            ),
+            Err(message) => info!("InstallSnapshot request failed: {}", message),
         }
     }
 
@@ -390,26 +375,22 @@ impl RaftImpl {
         let result = client.append(request).await;
 
         let mut state = arc_state.lock().await;
-        let me = state.name();
         if state.term > append_request.term {
-            info!("[{}] Detected higher term {}", &me, state.term);
+            debug!(term=state.term, role=?state.role, "detected higher term");
             return;
         }
         if state.role != RaftRole::Leader {
-            info!("[{}] No longer leader", &me);
+            debug!(term=state.term, role=?state.role, "no longer leader");
             return;
         }
 
         match result {
-            Err(message) => info!("[{}] Append request failed, error: {}", &me, message),
+            Err(message) => warn!("append rpc failed: {}", message),
             Ok(response) => {
                 let message = response.into_inner();
                 let other_term = message.term;
                 if other_term > state.term {
-                    info!(
-                        "[{}] Detected higher term {} from peer {}",
-                        &me, other_term, &follower.name,
-                    );
+                    debug!(other_term, term=state.term, role=?state.role, "detected higher term");
                     state.become_follower(arc_state.clone(), other_term);
                     return;
                 }
@@ -430,6 +411,12 @@ struct FollowerPosition {
     match_index: i64,
 }
 
+impl Display for FollowerPosition {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "(next={},match={})", self.next_index, self.match_index)
+    }
+}
+
 // Holds on to the handle of a timed operation and cancels it upon destruction.
 // This allows callers to just replace the guard in order to refresh a timer,
 // ensuring that there is only one timer active at any given time.
@@ -441,7 +428,7 @@ struct TimerGuard {
 impl Drop for TimerGuard {
     fn drop(&mut self) {
         self.handle.abort();
-        debug!("[{}] Aborted handle", &self.name);
+        debug!(name=%self.name, "aborted handle");
     }
 }
 
@@ -530,7 +517,7 @@ impl RaftState {
     }
 
     fn become_follower(&mut self, arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        info!("[{}] Becoming follower for term {}", self.name(), term);
+        debug!(term, "becoming follower");
         assert!(term >= self.term, "Term should never decrease");
 
         self.term = term;
@@ -543,13 +530,14 @@ impl RaftState {
         let timeout_ms = self.options.follower_timeout_ms;
         let me = self.name();
         let term = self.term;
+        let span = info_span!(parent: None, "election", server = %me);
         let task = sleep(Duration::from_millis(add_jitter(timeout_ms))).then(async move |_| {
-            info!("[{}] Follower timeout in term {}", me, term);
+            debug!(term, "follower timeout");
             RaftImpl::election_loop(arc_state.clone(), next_term).await;
         });
         self.timer_guard = Some(TimerGuard {
             name: self.name(),
-            handle: tokio::spawn(task),
+            handle: tokio::spawn(task.instrument(span)),
         });
     }
 
@@ -561,26 +549,19 @@ impl RaftState {
         response: &AppendResponse,
         request: &AppendRequest,
     ) {
-        let me = self.name();
         let follower = self.followers.get_mut(address_key(&peer).as_str());
         if follower.is_none() {
-            info!(
-                "[{}] Ignoring append response for unknown peer {}",
-                &me, &peer.name
-            );
+            info!(peer=%peer.name, "skipped response from unknown peer");
             return;
         }
 
-        let f = follower.unwrap();
+        let follower = follower.unwrap();
         if !response.success {
             // The follower has rejected our entries, presumably because they could
             // not find the entry we sent as "previous". We repeatedly reduce the
             // "next" index until we hit a "previous" entry present on the follower.
-            f.next_index = f.next_index - 1;
-            info!(
-                "[{}] Decremented follower next_index for peer {} to {}",
-                &me, &peer.name, f.next_index
-            );
+            follower.next_index = follower.next_index - 1;
+            info!(follower=%peer.name, state=%follower, "decremented");
             return;
         }
 
@@ -594,7 +575,6 @@ impl RaftState {
     // Called when, as a leader, we know that a follower's entries up to (and including)
     // match_index match our entries.
     fn record_follower_matches(&mut self, peer: &Server, match_index: i64) {
-        let me = self.name();
         let follower = self
             .followers
             .get_mut(address_key(&peer).as_str())
@@ -603,10 +583,7 @@ impl RaftState {
         follower.match_index = match_index;
         follower.next_index = match_index + 1;
         if follower != &old_f {
-            info!(
-                "[{}] Follower state for peer {} is now (next={},match={})",
-                me, &peer.name, follower.next_index, follower.match_index
-            );
+            debug!(follower = %peer.name, state = %follower, "updated");
         }
     }
 
@@ -661,12 +638,10 @@ impl RaftState {
 
 #[tonic::async_trait]
 impl Raft for RaftImpl {
+    #[instrument(fields(server=%self.address.name),skip(self,request))]
     async fn vote(&self, request: Request<VoteRequest>) -> Result<Response<VoteResponse>, Status> {
         let request = request.into_inner();
-        debug!(
-            "[{}] Handling vote request: [{:?}]",
-            self.address.name, request
-        );
+        debug!(?request, "handling request");
 
         let mut state = self.state.lock().await;
 
@@ -687,30 +662,19 @@ impl Raft for RaftImpl {
         let candidate = request.candidate;
 
         let granted;
-        let me = self.address.clone().name;
+        let term = state.term;
         if state.voted_for.is_none() || &candidate == &state.voted_for {
+            let candidate_name = candidate.clone().map(|x| x.name);
             if state.store.log.is_up_to_date(&request.last.expect("last")) {
                 state.voted_for = candidate.clone();
-                info!(
-                    "[{}] Granted vote to {:?}",
-                    &me,
-                    candidate.clone().map(|x| x.name)
-                );
                 granted = true;
+                debug!(term, candidate=?candidate_name, "granted vote");
             } else {
-                info!(
-                    "[{}] Denied vote to {:?} because log is not up-to-date",
-                    &me,
-                    candidate.clone().map(|x| x.name)
-                );
+                debug!(term, candidate=?candidate_name, "denied vote because candidate is not up-to-date");
                 granted = false;
             }
         } else {
-            info!(
-                "[{}] Rejecting, already voted for candidate [{:?}]",
-                &me,
-                state.voted_for.clone().map(|x| x.name)
-            );
+            debug!(term, voted_for = ?state.voted_for.clone().map(|x| x.name), "denied vote, already voted");
             granted = false;
         }
 
@@ -720,15 +684,13 @@ impl Raft for RaftImpl {
         }))
     }
 
+    #[instrument(fields(server=%self.address.name),skip(self,request))]
     async fn append(
         &self,
         request: Request<AppendRequest>,
     ) -> Result<Response<AppendResponse>, Status> {
         let request = request.into_inner();
-        debug!(
-            "[{}] Handling append request: [{:?}]",
-            self.address.name, request
-        );
+        debug!(?request, "handling request");
 
         let mut state = self.state.lock().await;
 
@@ -783,19 +745,20 @@ impl Raft for RaftImpl {
         let leader_commit_index = request.committed;
         state.store.commit_to(leader_commit_index).await;
 
-        debug!("[{}] Successfully processed heartbeat", &self.address.name);
+        debug!("handled request");
         Ok(Response::new(AppendResponse {
             term,
             success: true,
         }))
     }
 
+    #[instrument(fields(server=%self.address.name),skip(self,request))]
     async fn commit(
         &self,
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
         let request = request.into_inner();
-        debug!("[{}] Handling commit request", self.address.name);
+        debug!(?request, "handling request");
 
         let term;
         let entry_id;
@@ -848,11 +811,13 @@ impl Raft for RaftImpl {
         Ok(Response::new(result))
     }
 
+    #[instrument(fields(server=%self.address.name),skip(self,request))]
     async fn step_down(
         &self,
-        _: Request<StepDownRequest>,
+        request: Request<StepDownRequest>,
     ) -> Result<Response<StepDownResponse>, Status> {
-        debug!("[{}] Handling step down request", self.address.name);
+        let request = request.into_inner();
+        debug!(?request, "handling request");
 
         let mut state = self.state.lock().await;
         if state.role != RaftRole::Leader {
@@ -871,12 +836,13 @@ impl Raft for RaftImpl {
         }))
     }
 
+    #[instrument(fields(server=?self.address),skip(self,request))]
     async fn install_snapshot(
         &self,
         request: Request<InstallSnapshotRequest>,
     ) -> Result<Response<InstallSnapshotResponse>, Status> {
         let request = request.into_inner();
-        debug!("[{}] Handling install snapshot request", self.address.name);
+        debug!(?request, "handling request");
 
         let mut state = self.state.lock().await;
         if request.term >= state.term && !request.snapshot.is_empty() {

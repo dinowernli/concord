@@ -3,10 +3,10 @@ use std::time::Duration;
 use async_std::sync::Mutex;
 use async_trait::async_trait;
 use futures::Future;
-use log::debug;
 use tokio::time::sleep;
 use tonic::transport::{Channel, Error};
 use tonic::Request;
+use tracing::debug;
 
 use raft_proto::{CommitRequest, EntryId, Server, Status, StepDownRequest};
 
@@ -73,7 +73,7 @@ impl ClientImpl {
     async fn update_leader(&self, leader: &Server) {
         let mut locked = self.leader.lock().await;
         *locked = leader.clone();
-        debug!("[{}] updated to new leader: [{}]", &self.name, &leader.name);
+        debug!(name=%self.name, leader=%leader.name, "updated leader");
     }
 
     // Helper used to connect to a remote server.

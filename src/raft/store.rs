@@ -4,10 +4,10 @@ use crate::raft::StateMachine;
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::channel::oneshot::{channel, Receiver, Sender};
-use log::{debug, info, warn};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use tonic::Status;
+use tracing::{debug, info, warn};
 
 // Handles persistent storage for a Raft member, including a snapshot starting
 // from the beginning of time up to some index, and running log of entries since
@@ -180,19 +180,10 @@ impl Store {
                 .apply(&Bytes::from(entry.payload));
             match result {
                 Ok(()) => {
-                    info!(
-                        "[{}] Applied entry: {}",
-                        &self.name,
-                        entry_id_key(&entry_id)
-                    );
+                    debug!(entry=%entry_id_key(&entry_id), "applied");
                 }
                 Err(msg) => {
-                    warn!(
-                        "[{}] Failed to apply {}: {}",
-                        &self.name,
-                        entry_id_key(&entry_id),
-                        msg,
-                    );
+                    warn!(entry=%entry_id_key(&entry_id), "failed to apply: {}", msg);
                 }
             }
         }
