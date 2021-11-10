@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
-use tracing::{debug, info, info_span, instrument, Instrument};
+use tracing::{debug, info, info_span, instrument, warn, Instrument};
 
 use diagnostics::ServerDiagnostics;
 use raft::log::ContainsResult;
@@ -187,7 +187,6 @@ impl RaftImpl {
 
         {
             let mut state = arc_state.lock().await;
-            let me = state.name();
 
             // The world has moved on or someone else has won in this term.
             if state.term > term || state.role != RaftRole::Candidate {
@@ -200,7 +199,7 @@ impl RaftImpl {
                     Ok(result) => {
                         let message = result.into_inner();
                         if message.term > term {
-                            info!("[{}] Detected higher term {}", &me, message.term);
+                            info!(term=state.term, other_term=message.term, role=?state.role, "detected higher term");
                             state.become_follower(arc_state.clone(), message.term);
                             return true;
                         }
@@ -208,7 +207,7 @@ impl RaftImpl {
                             votes = votes + 1;
                         }
                     }
-                    Err(message) => info!("[{}] Vote request error: {}", &me, message),
+                    Err(message) => warn!("vote request error: {}", message),
                 }
             }
 
@@ -376,7 +375,6 @@ impl RaftImpl {
         let result = client.append(request).await;
 
         let mut state = arc_state.lock().await;
-        let me = state.name();
         if state.term > append_request.term {
             info!(term=state.term, role=?state.role, "detected higher term");
             return;
@@ -387,15 +385,12 @@ impl RaftImpl {
         }
 
         match result {
-            Err(message) => info!("[{}] Append request failed, error: {}", &me, message),
+            Err(message) => warn!("append rpc failed: {}", message),
             Ok(response) => {
                 let message = response.into_inner();
                 let other_term = message.term;
                 if other_term > state.term {
-                    info!(
-                        "[{}] Detected higher term {} from peer {}",
-                        &me, other_term, &follower.name,
-                    );
+                    info!(other_term, term=state.term, role=?state.role, "detected higher term");
                     state.become_follower(arc_state.clone(), other_term);
                     return;
                 }
@@ -646,10 +641,7 @@ impl Raft for RaftImpl {
     #[instrument(fields(server=%self.address.name),skip(self,request))]
     async fn vote(&self, request: Request<VoteRequest>) -> Result<Response<VoteResponse>, Status> {
         let request = request.into_inner();
-        debug!(
-            "[{}] Handling vote request: [{:?}]",
-            self.address.name, request
-        );
+        debug!(?request, "handling request");
 
         let mut state = self.state.lock().await;
 
@@ -672,12 +664,13 @@ impl Raft for RaftImpl {
         let granted;
         let term = state.term;
         if state.voted_for.is_none() || &candidate == &state.voted_for {
+            let candidate_name = candidate.clone().map(|x| x.name);
             if state.store.log.is_up_to_date(&request.last.expect("last")) {
                 state.voted_for = candidate.clone();
                 granted = true;
-                info!(term, candidate=?candidate.clone().map(|x| x.name), "granted vote");
+                info!(term, candidate=?candidate_name, "granted vote");
             } else {
-                info!(term, candidate=?candidate.clone().map(|x| x.name), "denied vote because candidate is not up-to-date");
+                info!(term, candidate=?candidate_name, "denied vote because candidate is not up-to-date");
                 granted = false;
             }
         } else {
@@ -697,10 +690,7 @@ impl Raft for RaftImpl {
         request: Request<AppendRequest>,
     ) -> Result<Response<AppendResponse>, Status> {
         let request = request.into_inner();
-        debug!(
-            "[{}] Handling append request: [{:?}]",
-            self.address.name, request
-        );
+        debug!(?request, "handling request");
 
         let mut state = self.state.lock().await;
 
@@ -755,7 +745,7 @@ impl Raft for RaftImpl {
         let leader_commit_index = request.committed;
         state.store.commit_to(leader_commit_index).await;
 
-        debug!("[{}] Successfully processed heartbeat", &self.address.name);
+        debug!("handled request");
         Ok(Response::new(AppendResponse {
             term,
             success: true,
@@ -768,7 +758,7 @@ impl Raft for RaftImpl {
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
         let request = request.into_inner();
-        debug!("[{}] Handling commit request", self.address.name);
+        debug!(?request, "handling request");
 
         let term;
         let entry_id;
@@ -821,12 +811,13 @@ impl Raft for RaftImpl {
         Ok(Response::new(result))
     }
 
-    #[instrument(fields(server=%self.address.name),skip(self,_req))]
+    #[instrument(fields(server=%self.address.name),skip(self,request))]
     async fn step_down(
         &self,
-        _req: Request<StepDownRequest>,
+        request: Request<StepDownRequest>,
     ) -> Result<Response<StepDownResponse>, Status> {
-        debug!("[{}] Handling step down request", self.address.name);
+        let request = request.into_inner();
+        debug!(?request, "handling request");
 
         let mut state = self.state.lock().await;
         if state.role != RaftRole::Leader {
@@ -851,7 +842,7 @@ impl Raft for RaftImpl {
         request: Request<InstallSnapshotRequest>,
     ) -> Result<Response<InstallSnapshotResponse>, Status> {
         let request = request.into_inner();
-        debug!("[{}] Handling install snapshot request", self.address.name);
+        debug!(?request, "handling request");
 
         let mut state = self.state.lock().await;
         if request.term >= state.term && !request.snapshot.is_empty() {
