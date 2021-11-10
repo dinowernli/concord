@@ -79,11 +79,15 @@ impl Cluster {
     pub fn highest_replicated_index(&self, matches: HashMap<String, i64>) -> i64 {
         let mut indexes: Vec<i64> = matches.values().cloned().collect();
         indexes.sort();
+
+        // Note that we've implicitly appended ourselves to the end of the list because
+        // we assume no follower will be ahead of us (as leader) by construction.
+        //
+        // Examples:
+        // * [1, 3],    leader (3) ==> (len = 2) => (mid = 1)
+        // * [1, 1, 3], leader (3) ==> (len = 3) => (mid = 1)
         let mid = indexes.len() / 2;
 
-        // The second half of the array has match_index above the return value. For even,
-        // we round down so that [1, 2, 4, 7] ends up as "2" (with the latter 3 followers
-        // making up the majority).
         indexes[mid]
     }
 
@@ -194,6 +198,30 @@ mod tests {
         // One other vote, but that's just also us. No quorum.
         let me = cluster.me.clone();
         assert!(!cluster.is_quorum(&vec![me]));
+    }
+
+    #[test]
+    fn test_highest_replicated_index() {
+        let cluster = create_cluster();
+        assert_eq!(cluster.size(), 3);
+
+        let data = HashMap::from([("server1".to_string(), 4), ("server2".to_string(), 3)]);
+        assert_eq!(4, cluster.highest_replicated_index(data));
+
+        let data = HashMap::from([
+            ("server1".to_string(), 2),
+            ("server2".to_string(), 2),
+            ("server3".to_string(), 4),
+            ("server4".to_string(), 5),
+        ]);
+        assert_eq!(4, cluster.highest_replicated_index(data));
+
+        let data = HashMap::from([
+            ("server1".to_string(), 2),
+            ("server2".to_string(), 2),
+            ("server3".to_string(), 3),
+        ]);
+        assert_eq!(2, cluster.highest_replicated_index(data));
     }
 
     fn server(host: &str, port: i32, name: &str) -> Server {
