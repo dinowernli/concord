@@ -157,7 +157,9 @@ async fn run_put_loop(args: Arc<Arguments>, cluster: &Vec<Server>) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // This allows configuring the filters using the RUST_LOG env variable.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or(EnvFilter::from("concord=info"));
+
     tracing_subscriber::FmtSubscriber::builder()
         .with_target(false)
         .with_env_filter(env_filter)
