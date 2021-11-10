@@ -1,7 +1,7 @@
 extern crate rand;
 
-use std::fmt::{Display, Formatter};
 use std::collections::{HashMap, HashSet};
+use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
