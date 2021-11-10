@@ -15,7 +15,7 @@ use rand::seq::SliceRandom;
 use structopt::StructOpt;
 use tokio::time::{sleep, Instant};
 use tracing::{error, info, info_span, Instrument};
-use tracing_subscriber;
+use tracing_subscriber::EnvFilter;
 
 use raft::raft_proto;
 use raft::{Diagnostics, Options, RaftImpl};
@@ -157,8 +157,10 @@ async fn run_put_loop(args: Arc<Arguments>, cluster: &Vec<Server>) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or(EnvFilter::from("concord=info"));
     tracing_subscriber::FmtSubscriber::builder()
         .with_target(false)
+        .with_env_filter(env_filter)
         .init();
     let arguments = Arc::new(Arguments::from_args());
 
