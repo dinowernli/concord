@@ -160,7 +160,7 @@ impl RaftImpl {
 
             // Prepare the election. Note that we don't reset the timer because this
             // would lead to cancelling our own ongoing execution.
-            info!(term, "starting election");
+            debug!(term, "starting election");
             state.role = RaftRole::Candidate;
             state.term = term;
             state.voted_for = Some(state.cluster.me());
@@ -227,7 +227,7 @@ impl RaftImpl {
                 });
                 true
             } else {
-                info!(term, votes, "lost election");
+                debug!(term, votes, "lost election");
                 false
             };
         }
@@ -242,11 +242,11 @@ impl RaftImpl {
             {
                 let state = arc_state.lock().await;
                 if state.term > term {
-                    info!(term=state.term, role=?state.role, "detected higher term");
+                    debug!(term=state.term, role=?state.role, "detected higher term");
                     return;
                 }
                 if state.role != RaftRole::Leader {
-                    info!(term=state.term, role=?state.role, "no longer leader");
+                    debug!(term=state.term, role=?state.role, "no longer leader");
                     return;
                 }
                 match &state.diagnostics {
@@ -257,7 +257,7 @@ impl RaftImpl {
 
             RaftImpl::replicate_entries(arc_state.clone(), term).await;
             if !first_heartbeat_done {
-                info!(term, role=?RaftRole::Leader, "completed initial appends");
+                info!(term, role=?RaftRole::Leader, "established as leader");
                 first_heartbeat_done = true;
             }
 
@@ -272,7 +272,7 @@ impl RaftImpl {
         let mut results = Vec::<Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>>::new();
         {
             let mut state = arc_state.lock().await;
-            debug!("[{}] Replicating entries", state.name());
+            debug!("replicating entries");
             let others = state.cluster.others();
             for follower in others {
                 // Figure out which entry the follower is expecting next and decide whether to
@@ -322,11 +322,11 @@ impl RaftImpl {
         {
             let mut state = arc_state.lock().await;
             if state.term > term {
-                info!(term=state.term, role=?state.role, "detected higher term");
+                debug!(term=state.term, role=?state.role, "detected higher term");
                 return;
             }
             if state.role != RaftRole::Leader {
-                info!(term=state.term, role=?state.role, "no longer leader");
+                debug!(term=state.term, role=?state.role, "no longer leader");
                 return;
             }
             state.update_committed().await;
@@ -376,11 +376,11 @@ impl RaftImpl {
 
         let mut state = arc_state.lock().await;
         if state.term > append_request.term {
-            info!(term=state.term, role=?state.role, "detected higher term");
+            debug!(term=state.term, role=?state.role, "detected higher term");
             return;
         }
         if state.role != RaftRole::Leader {
-            info!(term=state.term, role=?state.role, "no longer leader");
+            debug!(term=state.term, role=?state.role, "no longer leader");
             return;
         }
 
@@ -390,7 +390,7 @@ impl RaftImpl {
                 let message = response.into_inner();
                 let other_term = message.term;
                 if other_term > state.term {
-                    info!(other_term, term=state.term, role=?state.role, "detected higher term");
+                    debug!(other_term, term=state.term, role=?state.role, "detected higher term");
                     state.become_follower(arc_state.clone(), other_term);
                     return;
                 }
@@ -517,7 +517,7 @@ impl RaftState {
     }
 
     fn become_follower(&mut self, arc_state: Arc<Mutex<RaftState>>, term: i64) {
-        info!(term, "becoming follower");
+        debug!(term, "becoming follower");
         assert!(term >= self.term, "Term should never decrease");
 
         self.term = term;
@@ -532,7 +532,7 @@ impl RaftState {
         let term = self.term;
         let span = info_span!(parent: None, "election", server = %me);
         let task = sleep(Duration::from_millis(add_jitter(timeout_ms))).then(async move |_| {
-            info!(term, "follower timeout");
+            debug!(term, "follower timeout");
             RaftImpl::election_loop(arc_state.clone(), next_term).await;
         });
         self.timer_guard = Some(TimerGuard {
@@ -583,7 +583,7 @@ impl RaftState {
         follower.match_index = match_index;
         follower.next_index = match_index + 1;
         if follower != &old_f {
-            info!(follower = %peer.name, state = %follower, "updated");
+            debug!(follower = %peer.name, state = %follower, "updated");
         }
     }
 
@@ -668,13 +668,13 @@ impl Raft for RaftImpl {
             if state.store.log.is_up_to_date(&request.last.expect("last")) {
                 state.voted_for = candidate.clone();
                 granted = true;
-                info!(term, candidate=?candidate_name, "granted vote");
+                debug!(term, candidate=?candidate_name, "granted vote");
             } else {
-                info!(term, candidate=?candidate_name, "denied vote because candidate is not up-to-date");
+                debug!(term, candidate=?candidate_name, "denied vote because candidate is not up-to-date");
                 granted = false;
             }
         } else {
-            info!(term, voted_for = ?state.voted_for.clone().map(|x| x.name), "denied vote, already voted");
+            debug!(term, voted_for = ?state.voted_for.clone().map(|x| x.name), "denied vote, already voted");
             granted = false;
         }
 
