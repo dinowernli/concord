@@ -3,6 +3,7 @@ extern crate math;
 extern crate rand;
 
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -243,26 +244,24 @@ impl RaftImpl {
         let mut first_heartbeat_done = false;
         loop {
             {
-                let locked_state = arc_state.lock().await;
-                if locked_state.term > term {
-                    info!("[{}] Detected higher term {}", me, locked_state.term);
+                let state = arc_state.lock().await;
+                if state.term > term {
+                    info!(term=state.term, role=?state.role, "detected higher term");
                     return;
                 }
-                if locked_state.role != RaftRole::Leader {
+                if state.role != RaftRole::Leader {
+                    info!(term=state.term, role=?state.role, "no longer leader");
                     return;
                 }
-                match &locked_state.diagnostics {
-                    Some(d) => d
-                        .lock()
-                        .await
-                        .report_leader(term, &locked_state.cluster.me()),
+                match &state.diagnostics {
+                    Some(d) => d.lock().await.report_leader(term, &state.cluster.me()),
                     _ => (),
                 }
             }
 
             RaftImpl::replicate_entries(arc_state.clone(), term).await;
             if !first_heartbeat_done {
-                info!(term, "completed first round of appends as leader");
+                info!(term, role=?RaftRole::Leader, "completed initial appends");
                 first_heartbeat_done = true;
             }
 
@@ -326,17 +325,16 @@ impl RaftImpl {
 
         {
             let mut state = arc_state.lock().await;
-            let me = state.name();
             if state.term > term {
-                info!("[{}] Detected higher term {}", &me, state.term);
+                info!(term=state.term, role=?state.role, "detected higher term");
                 return;
             }
             if state.role != RaftRole::Leader {
-                info!("[{}] No longer leader", &me);
+                info!(term=state.term, role=?state.role, "no longer leader");
                 return;
             }
             state.update_committed().await;
-            debug!("[{}] Done replicating entries", &me);
+            debug!("done replicating entries");
         }
     }
 
@@ -353,25 +351,18 @@ impl RaftImpl {
         let result = client.install_snapshot(request).await;
 
         let mut state = arc_state.lock().await;
-        let me = state.name();
         match result {
             Ok(result) => {
                 let response = result.into_inner();
                 let other_term = response.term;
                 if other_term > state.term {
-                    info!(
-                        "[{}] Detected higher term {} from peer {}",
-                        &me, other_term, &follower.name,
-                    );
+                    info!(other_term, peer=%follower.name, role=?state.role, "detected higher term");
                     state.become_follower(arc_state.clone(), other_term);
                     return;
                 }
                 state.record_follower_matches(&follower, install_request.last.expect("last").index);
             }
-            Err(message) => info!(
-                "[{}] InstallSnapshot request failed, error: {}",
-                &me, message
-            ),
+            Err(message) => info!("InstallSnapshot request failed: {}", message),
         }
     }
 
@@ -390,11 +381,11 @@ impl RaftImpl {
         let mut state = arc_state.lock().await;
         let me = state.name();
         if state.term > append_request.term {
-            info!("[{}] Detected higher term {}", &me, state.term);
+            info!(term=state.term, role=?state.role, "detected higher term");
             return;
         }
         if state.role != RaftRole::Leader {
-            info!("[{}] No longer leader", &me);
+            info!(term=state.term, role=?state.role, "no longer leader");
             return;
         }
 
@@ -428,6 +419,12 @@ struct FollowerPosition {
     match_index: i64,
 }
 
+impl Display for FollowerPosition {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "(next={},match={})", self.next_index, self.match_index)
+    }
+}
+
 // Holds on to the handle of a timed operation and cancels it upon destruction.
 // This allows callers to just replace the guard in order to refresh a timer,
 // ensuring that there is only one timer active at any given time.
@@ -439,7 +436,7 @@ struct TimerGuard {
 impl Drop for TimerGuard {
     fn drop(&mut self) {
         self.handle.abort();
-        debug!("[{}] Aborted handle", &self.name);
+        debug!(name=%self.name, "aborted handle");
     }
 }
 
@@ -560,26 +557,19 @@ impl RaftState {
         response: &AppendResponse,
         request: &AppendRequest,
     ) {
-        let me = self.name();
         let follower = self.followers.get_mut(address_key(&peer).as_str());
         if follower.is_none() {
-            info!(
-                "[{}] Ignoring append response for unknown peer {}",
-                &me, &peer.name
-            );
+            info!(peer=%peer.name, "skipped response from unknown peer");
             return;
         }
 
-        let f = follower.unwrap();
+        let follower = follower.unwrap();
         if !response.success {
             // The follower has rejected our entries, presumably because they could
             // not find the entry we sent as "previous". We repeatedly reduce the
             // "next" index until we hit a "previous" entry present on the follower.
-            f.next_index = f.next_index - 1;
-            info!(
-                "[{}] Decremented follower next_index for peer {} to {}",
-                &me, &peer.name, f.next_index
-            );
+            follower.next_index = follower.next_index - 1;
+            info!(follower=%peer.name, state=%follower, "decremented");
             return;
         }
 
@@ -601,7 +591,7 @@ impl RaftState {
         follower.match_index = match_index;
         follower.next_index = match_index + 1;
         if follower != &old_f {
-            info!(peer = %peer.name, follower_next = follower.next_index, follower_match = follower.match_index, "updated follower state");
+            info!(follower = %peer.name, state = %follower, "updated");
         }
     }
 
@@ -694,7 +684,7 @@ impl Raft for RaftImpl {
                 granted = false;
             }
         } else {
-            info!(term, voted_for = ?state.voted_for.clone().map(|x| x.name), "denied vote, already voted for someone else");
+            info!(term, voted_for = ?state.voted_for.clone().map(|x| x.name), "denied vote, already voted");
             granted = false;
         }
 

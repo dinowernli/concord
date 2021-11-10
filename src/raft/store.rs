@@ -180,19 +180,10 @@ impl Store {
                 .apply(&Bytes::from(entry.payload));
             match result {
                 Ok(()) => {
-                    info!(
-                        "[{}] Applied entry: {}",
-                        &self.name,
-                        entry_id_key(&entry_id)
-                    );
+                    info!(entry=%entry_id_key(&entry_id), "applied");
                 }
                 Err(msg) => {
-                    warn!(
-                        "[{}] Failed to apply {}: {}",
-                        &self.name,
-                        entry_id_key(&entry_id),
-                        msg,
-                    );
+                    warn!(entry=%entry_id_key(&entry_id), "failed to apply: {}", msg);
                 }
             }
         }

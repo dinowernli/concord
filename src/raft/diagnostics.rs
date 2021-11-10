@@ -88,7 +88,7 @@ impl Diagnostics {
             // At this point, all servers have moved on to seeing leaders for a future
             // term. Note that we may or may not have an actual leader.
             let leader = candidate.clone().map(|x| x.name);
-            info!(term, ?leader, "leader correct");
+            info!(term, ?leader, "consensus on leader");
             candidate.map(|c| self.leaders.insert(term, c.clone()));
         }
     }
