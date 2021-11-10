@@ -180,6 +180,22 @@ mod tests {
         assert_eq!(cluster.size(), 3);
     }
 
+    #[test]
+    fn test_quorum() {
+        let cluster = create_cluster();
+        assert_eq!(cluster.size(), 3);
+
+        // No votes other than ourself, no quorum.
+        assert!(!cluster.is_quorum(&Vec::new()));
+
+        // One other vote, this is quorum.
+        assert!(cluster.is_quorum(&vec![server("foo", 1234, "name1")]));
+
+        // One other vote, but that's just also us. No quorum.
+        let me = cluster.me.clone();
+        assert!(!cluster.is_quorum(&vec![me]));
+    }
+
     fn server(host: &str, port: i32, name: &str) -> Server {
         Server {
             host: host.to_string(),
