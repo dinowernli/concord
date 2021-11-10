@@ -1,5 +1,3 @@
-extern crate chrono;
-extern crate math;
 extern crate rand;
 
 use std::collections::HashMap;
