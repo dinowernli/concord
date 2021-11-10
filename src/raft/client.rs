@@ -73,7 +73,7 @@ impl ClientImpl {
     async fn update_leader(&self, leader: &Server) {
         let mut locked = self.leader.lock().await;
         *locked = leader.clone();
-        debug!("[{}] updated to new leader: [{}]", &self.name, &leader.name);
+        debug!(name=%self.name, leader=%leader.name, "updated leader");
     }
 
     // Helper used to connect to a remote server.
