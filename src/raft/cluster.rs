@@ -1,6 +1,6 @@
 use crate::raft::raft_proto::raft_client::RaftClient;
 use crate::raft::raft_proto::Server;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint, Error};
 
@@ -55,6 +55,20 @@ impl Cluster {
     // Returns the number of participants in the cluster (including us).
     pub fn size(&self) -> usize {
         self.others.len() + 1
+    }
+
+    // Returns whether or not the supplied votes constitute a quorum, given the
+    // current cluster configuration.
+    pub fn is_quorum(&self, votes: &Vec<Server>) -> bool {
+        let mut uniques = HashSet::new();
+
+        // Always assume we vote for our outcome.
+        uniques.insert(key(&self.me));
+
+        for server in votes {
+            uniques.insert(key(&server));
+        }
+        2 * uniques.len() > self.size()
     }
 
     // Returns an rpc client which can be used to contact the supplied peer.
