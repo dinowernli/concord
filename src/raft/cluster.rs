@@ -71,6 +71,22 @@ impl Cluster {
         2 * uniques.len() > self.size()
     }
 
+    // Returns the highest index which has been replicated to a sufficient quorum of
+    // voting peer, and thus is safe to be committed.
+    //
+    // The supplied "matches" represents, for each known peer, the index up to which
+    // its log is identical to ours.
+    pub fn highest_replicated_index(&self, matches: HashMap<String, i64>) -> i64 {
+        let mut indexes: Vec<i64> = matches.values().cloned().collect();
+        indexes.sort();
+        let mid = indexes.len() / 2;
+
+        // The second half of the array has match_index above the return value. For even,
+        // we round down so that [1, 2, 4, 7] ends up as "2" (with the latter 3 followers
+        // making up the majority).
+        indexes[mid]
+    }
+
     // Returns an rpc client which can be used to contact the supplied peer.
     pub async fn new_client(&mut self, address: &Server) -> Result<RaftClient<Channel>, Error> {
         let k = key(address);

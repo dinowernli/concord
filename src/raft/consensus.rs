@@ -413,6 +413,9 @@ struct FollowerPosition {
 
     // Highest index known to be replicated on the follower.
     match_index: i64,
+
+    // The actual server, for convenience.
+    server: Server,
 }
 
 impl Display for FollowerPosition {
@@ -477,6 +480,7 @@ impl RaftState {
                     // Optimistically start assuming next is the same as our own next.
                     next_index: self.store.log.next_index(),
                     match_index: -1,
+                    server: server.clone(),
                 },
             );
         }
@@ -595,24 +599,12 @@ impl RaftState {
     // to a majority of followers. In practice, this means that it is safe to
     // commit up to (and including) the result.
     fn compute_highest_majority_match(&self) -> i64 {
-        // TODO - delegate this to "cluster" as well based on the follower
-        // "match" positions. This prepares for the cluster supporting join
-        // quorum.
-
-        let mut matches: Vec<i64> = self
+        let matches = self
             .followers
-            .values()
-            .clone()
-            .into_iter()
-            .map(|f| f.match_index)
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.match_index))
             .collect();
-        matches.sort();
-        let mid = matches.len() / 2;
-
-        // The second half of the array has match_index above the return value. For even,
-        // we round down so that [1, 2, 4, 7] ends up as "2" (with the latter 3 followers
-        // making up the majority).
-        matches[mid]
+        self.cluster.highest_replicated_index(matches)
     }
 
     // Scans the state of our followers in the hope of finding a new index which
