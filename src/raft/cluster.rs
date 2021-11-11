@@ -1,5 +1,7 @@
+use crate::raft::raft_proto::entry::Data::Config;
 use crate::raft::raft_proto::raft_client::RaftClient;
 use crate::raft::raft_proto::{ClusterConfig, Server};
+use crate::raft::store::ConfigInfo;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint, Error};
@@ -11,6 +13,7 @@ pub struct Cluster {
     voters_next: HashMap<String, Server>,
     channels: HashMap<String, Channel>,
     last_known_leader: Option<Server>,
+    config_info: Option<ConfigInfo>,
 }
 
 impl Cluster {
@@ -22,6 +25,7 @@ impl Cluster {
             voters_next: HashMap::new(),
             channels: HashMap::new(),
             last_known_leader: None,
+            config_info: None,
         }
     }
 
@@ -39,6 +43,12 @@ impl Cluster {
     // Returns the address we are running on.
     pub fn me(&self) -> Server {
         self.me.clone()
+    }
+
+    // Returns whether "me" is a voting member of the cluster.
+    pub fn am_voting_member(&self) -> bool {
+        let k = key(&self.me);
+        self.voters.contains_key(k.as_str()) || self.voters_next.contains_key(k.as_str())
     }
 
     // Returns the addresses of all other members in the cluster.
@@ -92,11 +102,36 @@ impl Cluster {
         indexes[mid]
     }
 
-    // Updates the cluster according to the supplied configuration.
-    pub fn update(&mut self, config: ClusterConfig) {
-        // TODO(dinow): Handle the case where we are not part of the new config.
-        self.voters = server_map(config.voters);
-        self.voters_next = server_map(config.voters_next);
+    // Updates the cluster's members based on the supplied latest cluster information.
+    pub fn update(&mut self, info: ConfigInfo) {
+        if let Some(inner) = &self.config_info {
+            if inner == &info {
+                // Nothing to do.
+                return;
+            }
+        }
+
+        // Only keep going if there's an actual config inside.
+        let config;
+        match &info.latest {
+            None => return,
+            Some(entry) => match &entry.data {
+                Some(Config(c)) => config = c.clone(),
+                _ => return,
+            },
+        }
+
+        self.config_info = Some(info.clone());
+        if info.committed {
+            // Apply the "next voters" part of the latest config.
+            self.voters = server_map(config.voters_next);
+            self.voters_next = HashMap::new();
+        } else {
+            // Apply the "joint consensus" version of the config.
+            self.voters = server_map(config.voters);
+            self.voters_next = server_map(config.voters_next);
+        }
+        // We could probably reuse some of these. Clear them all for now.
         self.channels.drain();
     }
 
@@ -256,25 +291,6 @@ mod tests {
             ("server3".to_string(), 3),
         ]);
         assert_eq!(2, cluster.highest_replicated_index(data));
-    }
-
-    #[test]
-    fn test_update() {
-        let mut cluster = create_cluster();
-        assert_eq!(cluster.size(), 3);
-
-        let new_config = ClusterConfig {
-            voters: vec![
-                server("foo", 1234, "name"),
-                server("bar", 1234, "name"),
-                server("baz", 1234, "name"),
-                server("wiggle", 1234, "name"),
-                server("ziggle", 1234, "name"),
-            ],
-            voters_next: vec![],
-        };
-        cluster.update(new_config);
-        assert_eq!(cluster.size(), 5);
     }
 
     fn server(host: &str, port: i32, name: &str) -> Server {

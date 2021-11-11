@@ -1,6 +1,6 @@
 use crate::raft::log::{ContainsResult, LogSlice};
 use crate::raft::raft_proto::entry::Data;
-use crate::raft::raft_proto::EntryId;
+use crate::raft::raft_proto::{Entry, EntryId};
 use crate::raft::StateMachine;
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
@@ -29,6 +29,16 @@ pub struct Store {
 
     compaction_threshold_bytes: i64,
     name: String,
+}
+
+// Holds information about config struts in the store.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfigInfo {
+    // The latest appended entry containing a cluster config.
+    pub latest: Option<Entry>,
+
+    // Whether or not the latest entry has been committed.
+    pub committed: bool,
 }
 
 impl Store {
@@ -65,6 +75,12 @@ impl Store {
     // the id for the created entry.
     pub fn append(&mut self, term: i64, data: Data) -> EntryId {
         self.log.append(term, data)
+    }
+
+    // Returns information about cluster config entries in the store.
+    pub fn get_config_info(&self) -> ConfigInfo {
+        // TODO(dino): implement
+        unimplemented!();
     }
 
     // Compacts logs entries into a new snapshot if necessary.

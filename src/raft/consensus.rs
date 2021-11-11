@@ -161,6 +161,11 @@ impl RaftImpl {
                 return true;
             }
 
+            if !state.cluster.am_voting_member() {
+                info!("no longer voting member");
+                return true;
+            }
+
             // Prepare the election. Note that we don't reset the timer because this
             // would lead to cancelling our own ongoing execution.
             debug!(term, "starting election");
@@ -426,6 +431,10 @@ impl RaftImpl {
             term = state.term;
             entry_id = state.store.append(term, data);
             receiver = state.store.add_listener(entry_id.index);
+
+            // Latest appended/committed configs may have changed, update the cluster.
+            let config_info = state.store.get_config_info();
+            state.cluster.update(config_info);
         }
 
         let committed = receiver.await;
@@ -782,23 +791,9 @@ impl Raft for RaftImpl {
             }));
         }
 
+        // Store all the entries received.
         if !request.entries.is_empty() {
-            // Store all the entries received.
             state.store.log.append_all(request.entries.as_slice());
-
-            // The Raft spec says that a node should operate under the latest seen
-            // configuration (regardless of whether it has been committed).
-            for i in request.entries.len() - 1..0 {
-                if let Some(Data::Config(config)) = &request.entries[i].data {
-                    state.cluster.update(config.clone());
-                    let id = &request.entries[i].id.as_ref().expect("id").clone();
-                    info!(
-                        "Udpated cluster config based on entry: [term={}, index={}]",
-                        id.term, id.index
-                    );
-                    break;
-                }
-            }
         }
 
         // If the leader considers an entry committed, it is guaranteed that
@@ -806,6 +801,10 @@ impl Raft for RaftImpl {
         // is safe to apply the entries to the state machine.
         let leader_commit_index = request.committed;
         state.store.commit_to(leader_commit_index).await;
+
+        // The appending and committing may have changed the latest configs. Update the cluster.
+        let config_info = state.store.get_config_info();
+        state.cluster.update(config_info);
 
         debug!("handled request");
         Ok(Response::new(AppendResponse {
@@ -919,6 +918,9 @@ impl Raft for RaftImpl {
             status: status as i32,
             leader,
         }))
+
+        // TODO(dino): According to the paper, once the joint consensus has been committed,
+        // the system then transitions to the new configuration. We need to implement that.
     }
 }
 
