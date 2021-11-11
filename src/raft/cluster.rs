@@ -7,7 +7,8 @@ use tonic::transport::{Channel, Endpoint, Error};
 // Holds information about a Raft cluster.
 pub struct Cluster {
     me: Server,
-    others: Vec<Server>,
+    voters: HashMap<String, Server>,
+    voters_next: HashMap<String, Server>,
     channels: HashMap<String, Channel>,
     last_known_leader: Option<Server>,
 }
@@ -15,17 +16,10 @@ pub struct Cluster {
 impl Cluster {
     // Creates a new cluster object from the supplied servers.
     pub fn new(me: Server, all: &[Server]) -> Self {
-        let mut map = HashMap::new();
-        for server in all {
-            let k = key(&server);
-            if k == key(&me) {
-                continue;
-            }
-            map.insert(k, server.clone());
-        }
         Cluster {
             me,
-            others: map.into_values().collect(),
+            voters: server_map(all.to_vec()),
+            voters_next: HashMap::new(),
             channels: HashMap::new(),
             last_known_leader: None,
         }
@@ -49,12 +43,19 @@ impl Cluster {
 
     // Returns the addresses of all other members in the cluster.
     pub fn others(&self) -> Vec<Server> {
-        self.others.to_vec()
+        let mut all = self.all();
+        all.remove(key(&self.me).as_str());
+        all.into_values().collect()
     }
 
     // Returns the number of participants in the cluster (including us).
     pub fn size(&self) -> usize {
-        self.others.len() + 1
+        self.others().len() + 1
+    }
+
+    // Returns whether there is an ongoing cluster configuration transition.
+    pub fn has_ongoing_mutation(&self) -> bool {
+        !self.voters_next.is_empty()
     }
 
     // Returns whether or not the supplied votes constitute a quorum, given the
@@ -93,11 +94,9 @@ impl Cluster {
 
     // Updates the cluster according to the supplied configuration.
     pub fn update(&mut self, config: ClusterConfig) {
-        self.others = config
-            .members
-            .into_iter()
-            .filter(|s| key(&s) != key(&self.me))
-            .collect();
+        // TODO(dinow): Handle the case where we are not part of the new config.
+        self.voters = server_map(config.voters);
+        self.voters_next = server_map(config.voters_next);
         self.channels.drain();
     }
 
@@ -124,43 +123,34 @@ impl Cluster {
         Ok(RaftClient::new(channel))
     }
 
-    pub fn create_joint(&self, new_members: Vec<Server>) -> ClusterConfig {
-        // TODO - DONOTLAND
-        // This doesn't actually work because we need quorum among both the old
-        // members and the new members, which is different from quorum among the
-        // union. We probably want a special "joint" mode and to have the
-        // consensus module ask the cluster whether there is sufficient quorum
-        // based on a set of votes from different servers.
-
-        let mut keys = HashSet::<String>::new();
-        let mut union = Vec::<Server>::new();
-
-        union.push(self.me.clone());
-        keys.insert(key(&self.me));
-
-        for server in self
-            .others
-            .iter()
-            .cloned()
-            .chain(new_members.iter().cloned())
-        {
-            let k = key(&server);
-            if keys.contains(&k) {
-                continue;
-            }
-            keys.insert(k);
-            union.push(server);
-        }
-
+    // Returns a cluster configuration that represents joint consensus between the
+    // current voters and the supplied incoming voters. Must not be called if there
+    // is already an ongoing cluster transition.
+    pub fn create_joint(&self, new_voters: Vec<Server>) -> ClusterConfig {
+        // For now, we only allow one transition at a time.
+        assert!(!self.has_ongoing_mutation());
         ClusterConfig {
-            members: union,
-            members_next: new_members,
+            voters: self.voters.values().cloned().collect(),
+            voters_next: new_voters,
         }
+    }
+
+    // Returns all known members of the cluster.
+    fn all(&self) -> HashMap<String, Server> {
+        let mut result = HashMap::new();
+        result.insert(key(&self.me), self.me.clone());
+        result.extend(self.voters.clone());
+        result.extend(self.voters_next.clone());
+        result
     }
 }
 
 fn key(server: &Server) -> String {
     format!("{}:{}", server.host, server.port).to_string()
+}
+
+fn server_map(servers: Vec<Server>) -> HashMap<String, Server> {
+    servers.into_iter().map(|s| (key(&s), s.clone())).collect()
 }
 
 #[cfg(test)]
@@ -178,7 +168,7 @@ mod tests {
     fn test_initial() {
         let cluster = create_cluster();
         assert_eq!(cluster.size(), 3);
-        assert_eq!(cluster.others.len(), 2);
+        assert_eq!(cluster.others().len(), 2);
         assert!(cluster.leader().is_none());
     }
 
@@ -187,7 +177,7 @@ mod tests {
         let mut cluster = create_cluster();
         assert!(cluster.leader().is_none());
 
-        let other = cluster.others[0].clone();
+        let other = cluster.others()[0].clone();
         cluster.record_leader(&other);
 
         let leader = cluster.leader();
@@ -202,7 +192,7 @@ mod tests {
         let me = server("foo", 1234, "some-name");
         let cluster = Cluster::new(me.clone(), vec![me.clone()].as_slice());
         assert_eq!(cluster.size(), 1);
-        assert!(cluster.others.is_empty());
+        assert!(cluster.others().is_empty());
     }
 
     #[test]
@@ -274,14 +264,14 @@ mod tests {
         assert_eq!(cluster.size(), 3);
 
         let new_config = ClusterConfig {
-            members: vec![
+            voters: vec![
                 server("foo", 1234, "name"),
                 server("bar", 1234, "name"),
                 server("baz", 1234, "name"),
                 server("wiggle", 1234, "name"),
                 server("ziggle", 1234, "name"),
             ],
-            members_next: vec![],
+            voters_next: vec![],
         };
         cluster.update(new_config);
         assert_eq!(cluster.size(), 5);

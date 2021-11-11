@@ -18,10 +18,10 @@ message Server {
 // Configuration for the cluster.
 message ClusterConfig {
   // Determines which members are considered part of the cluster.
-  repeated Server members = 1;
+  repeated Server voters = 1;
 
   // Holds the next set of members for the cluster.
-  repeated Server members_next = 2;
+  repeated Server voters_next = 2;
 }
 
 // Identifies an entry in a given log.

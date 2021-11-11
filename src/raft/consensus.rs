@@ -1,6 +1,6 @@
 extern crate rand;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
@@ -29,7 +29,8 @@ use crate::raft;
 use crate::raft::cluster::Cluster;
 use crate::raft::diagnostics;
 use crate::raft::raft_proto::entry::Data;
-use crate::raft::raft_proto::{ChangeConfigRequest, ChangeConfigResponse, ClusterConfig};
+use crate::raft::raft_proto::entry::Data::{Config, Payload};
+use crate::raft::raft_proto::{ChangeConfigRequest, ChangeConfigResponse};
 use crate::raft::store::Store;
 use crate::raft_proto::raft_client::RaftClient;
 use crate::raft_proto::raft_server::Raft;
@@ -411,7 +412,7 @@ impl RaftImpl {
     // leader).
     async fn commit_internal(
         arc_state: Arc<Mutex<RaftState>>,
-        payload: Vec<u8>,
+        data: Data,
     ) -> Result<EntryId, raft_proto::Status> {
         let term;
         let entry_id;
@@ -423,7 +424,7 @@ impl RaftImpl {
             }
 
             term = state.term;
-            entry_id = state.store.log.append(term, payload);
+            entry_id = state.store.append(term, data);
             receiver = state.store.add_listener(entry_id.index);
         }
 
@@ -821,7 +822,7 @@ impl Raft for RaftImpl {
         let request = request.into_inner();
         debug!(?request, "handling request");
 
-        let result = RaftImpl::commit_internal(self.state.clone(), request.payload).await;
+        let result = RaftImpl::commit_internal(self.state.clone(), Payload(request.payload)).await;
         let leader = self.state.lock().await.cluster.leader().clone();
         let proto = match result {
             Ok(entry_id) => CommitResponse {
@@ -888,8 +889,9 @@ impl Raft for RaftImpl {
         request: Request<ChangeConfigRequest>,
     ) -> Result<Response<ChangeConfigResponse>, Status> {
         let request = request.into_inner();
-        debug!("[{}] Handling change config request", self.address.name);
+        debug!(?request, "handling request");
 
+        let joint_config;
         {
             let state = self.state.lock().await;
             if state.role != RaftRole::Leader {
@@ -898,22 +900,24 @@ impl Raft for RaftImpl {
                     leader: state.cluster.leader(),
                 }));
             }
-
-            // TODO
-            // 1) Create joint configuration
-            let joint_config = state.cluster.create_joint(request.members.to_vec());
-
-            // 2) Commit joint configuration
-            // 3) Return success
-
-            // TODO - create a commit_internal which takes either a "Data"
-
-            // ***
+            if state.cluster.has_ongoing_mutation() {
+                return Err(Status::already_exists(
+                    "Can't clobber ongoing cluster mutation",
+                ));
+            }
+            joint_config = state.cluster.create_joint(request.members.to_vec());
         }
 
+        let result = RaftImpl::commit_internal(self.state.clone(), Config(joint_config)).await;
+        let leader = self.state.lock().await.cluster.leader().clone();
+        let status = match result {
+            Ok(_) => raft_proto::Status::Success,
+            Err(status) => status,
+        };
+
         Ok(Response::new(ChangeConfigResponse {
-            status: raft_proto::Status::Success as i32,
-            leader: Some(self.address.clone()),
+            status: status as i32,
+            leader,
         }))
     }
 }

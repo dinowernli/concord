@@ -164,6 +164,10 @@ mod tests {
         async fn preempt_leader(&self) -> Result<Server, Status> {
             unimplemented!();
         }
+
+        async fn change_config(&self, _members: Vec<Server>) -> Result<(), Status> {
+            unimplemented!();
+        }
     }
 
     #[tokio::test]
