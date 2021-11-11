@@ -9,7 +9,7 @@ use std::error::Error;
 use std::time::Duration;
 
 use async_std::sync::{Arc, Mutex};
-use futures::future::join4;
+use futures::future::join5;
 use futures::future::join_all;
 use rand::seq::SliceRandom;
 use structopt::StructOpt;
@@ -41,6 +41,9 @@ struct Arguments {
 
     #[structopt(short = "c", long = "disable_commit")]
     disable_commit: bool,
+
+    #[structopt(short = "r", long = "disable_reconfigure")]
+    disable_reconfigure: bool,
 }
 
 fn server(host: &str, port: i32, name: &str) -> Server {
@@ -155,6 +158,26 @@ async fn run_put_loop(args: Arc<Arguments>, cluster: &Vec<Server>) {
     }
 }
 
+async fn run_reconfigure(args: Arc<Arguments>, old: Vec<Server>, new: Vec<Server>) {
+    if args.disable_reconfigure {
+        return;
+    }
+
+    info!(?old, ?new, "reconfiguring");
+    // TODO(dino): Have old and new actually be different.
+
+    let member = old.first().unwrap().clone();
+    let client = raft::new_client("main-reconfigure", &member);
+
+    let start = Instant::now();
+    match client.change_config(new).await {
+        Ok(_) => {
+            info!(latency_ms = %start.elapsed().as_millis(), "success")
+        }
+        Err(message) => error!("failed: {}", message),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // This allows configuring the filters using the RUST_LOG env variable.
@@ -186,11 +209,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let serving = join_all(servers);
-    let all = join4(
+    let all = join5(
         serving,
         run_put_loop(arguments.clone(), &addresses).instrument(info_span!("put")),
         run_preempt_loop(arguments.clone(), &addresses).instrument(info_span!("preempt")),
         run_validate_loop(arguments.clone(), diag.clone()).instrument(info_span!("validate")),
+        run_reconfigure(arguments.clone(), addresses.clone(), addresses.clone())
+            .instrument(info_span!("reconfigure")),
     );
 
     all.await;
