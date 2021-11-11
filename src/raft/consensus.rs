@@ -665,8 +665,19 @@ impl RaftState {
     // has been replicated to a majority. If such an index is found, this updates
     // the index this leader considers committed.
     async fn update_committed(&mut self) {
+        assert_eq!(self.role, RaftRole::Leader);
         let new_commit_index = self.compute_highest_majority_match();
         self.store.commit_to(new_commit_index).await;
+
+        // The committing may have changed the latest configs. Update the cluster.
+        self.update_cluster();
+    }
+
+    // Feeds the latest state of stored config info into the cluster, giving the
+    // cluster a chance to update itself.
+    fn update_cluster(&mut self) {
+        let config_info = self.store.get_config_info();
+        self.cluster.update(config_info);
     }
 
     // Returns a request which a candidate can send in order to request the vote
@@ -803,8 +814,7 @@ impl Raft for RaftImpl {
         state.store.commit_to(leader_commit_index).await;
 
         // The appending and committing may have changed the latest configs. Update the cluster.
-        let config_info = state.store.get_config_info();
-        state.cluster.update(config_info);
+        state.update_cluster();
 
         debug!("handled request");
         Ok(Response::new(AppendResponse {
