@@ -54,6 +54,7 @@ impl LogSlice {
 
     // Adds a new entry to the end of the slice. Returns the id of the
     // newly appended entry.
+    // TODO(dino): this is super dangerous if not called from "store".
     pub fn append(&mut self, term: i64, data: Data) -> EntryId {
         assert!(term >= self.last_known_id().term);
 
@@ -119,9 +120,25 @@ impl LogSlice {
         index <= self.previous_id.index
     }
 
+    // Returns a copy of the latest appended entry containing a config.
+    // Warning: this can be expensive because it walks the log backwards.
+    pub fn latest_config_entry(&self) -> Option<Entry> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        for i in self.entries.len() - 1..0 {
+            let entry = self.entries.get(i).unwrap();
+            if matches!(&entry.data, Some(Config(_))) {
+                return Some(entry.clone());
+            }
+        }
+        return None;
+    }
+
     // Adds the supplied entries to the end of the slice. Any conflicting
     // entries are replaced. Any existing entries with indexes higher than the
     // supplied entries are pruned.
+    // TODO(dino): this is super dangerous if not called from "store".
     pub fn append_all(&mut self, entries: &[Entry]) {
         assert!(!entries.is_empty(), "append_all called with empty entries");
 

@@ -1,5 +1,6 @@
 use crate::raft::log::{ContainsResult, LogSlice};
 use crate::raft::raft_proto::entry::Data;
+use crate::raft::raft_proto::entry::Data::Config;
 use crate::raft::raft_proto::{Entry, EntryId};
 use crate::raft::StateMachine;
 use async_std::sync::{Arc, Mutex};
@@ -20,6 +21,7 @@ pub struct Store {
     pub log: LogSlice,
     state_machine: Arc<Mutex<dyn StateMachine + Send>>,
     snapshot: Option<LogSnapshot>,
+    config_info: ConfigInfo,
 
     listener_uid: i64,
     listeners: BTreeSet<CommitListener>,
@@ -41,6 +43,15 @@ pub struct ConfigInfo {
     pub committed: bool,
 }
 
+impl ConfigInfo {
+    fn empty() -> Self {
+        ConfigInfo {
+            latest: None,
+            committed: false,
+        }
+    }
+}
+
 impl Store {
     pub fn new(
         state_machine: Arc<Mutex<dyn StateMachine + Send>>,
@@ -51,10 +62,14 @@ impl Store {
             log: LogSlice::initial(),
             state_machine,
             snapshot: None,
+            config_info: ConfigInfo::empty(),
+
             listener_uid: 0,
             listeners: BTreeSet::new(),
+
             committed: -1,
             applied: -1,
+
             compaction_threshold_bytes,
             name: name.to_string(),
         }
@@ -74,13 +89,33 @@ impl Store {
     // Applies the supplied data to the log (without necessarily committing it). Returns
     // the id for the created entry.
     pub fn append(&mut self, term: i64, data: Data) -> EntryId {
-        self.log.append(term, data)
+        // Make sure we only do the expensive "update_config_info" if the latest
+        // entry is actually a config entry.
+        let is_config = matches!(&data, Config(_));
+
+        let entry_id = self.log.append(term, data);
+        if is_config {
+            self.update_config_info();
+        }
+        entry_id
+    }
+
+    // Adds the supplied entries to the end of the store. Any conflicting
+    // entries are replaced. Any existing entries with indexes higher than the
+    // supplied entries are pruned.
+    pub fn append_all(&mut self, entries: &[Entry]) {
+        let is_any_config = entries.iter().any(|e| matches!(e.data, Some(Config(_))));
+
+        self.log.append_all(entries);
+
+        if is_any_config {
+            self.update_config_info();
+        }
     }
 
     // Returns information about cluster config entries in the store.
     pub fn get_config_info(&self) -> ConfigInfo {
-        // TODO(dino): implement
-        unimplemented!();
+        self.config_info.clone()
     }
 
     // Compacts logs entries into a new snapshot if necessary.
@@ -226,6 +261,21 @@ impl Store {
                 // Do nothing, we just let the sender go out of scope, which will notify the
                 // receiver of the cancellation
             }
+        }
+    }
+
+    // Updates our cached information about the latest config entry in the store.
+    fn update_config_info(&mut self) {
+        match self.log.latest_config_entry() {
+            Some(entry) => {
+                let index = entry.id.as_ref().expect("id").index;
+                assert!(matches!(&entry.data, Some(Config(_))));
+                self.config_info = ConfigInfo {
+                    latest: Some(entry),
+                    committed: self.committed >= index,
+                }
+            }
+            None => (),
         }
     }
 }

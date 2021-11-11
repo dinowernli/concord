@@ -804,7 +804,7 @@ impl Raft for RaftImpl {
 
         // Store all the entries received.
         if !request.entries.is_empty() {
-            state.store.log.append_all(request.entries.as_slice());
+            state.store.append_all(request.entries.as_slice());
         }
 
         // If the leader considers an entry committed, it is guaranteed that
