@@ -22,6 +22,9 @@ message ClusterConfig {
 
   // Holds the next set of members for the cluster.
   repeated Server voters_next = 2;
+
+  // A name for the config, used only for debugging.
+  string name = 3;
 }
 
 // Identifies an entry in a given log.

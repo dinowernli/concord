@@ -1,10 +1,11 @@
-use crate::raft::raft_proto::entry::Data::Config;
+use crate::raft::raft_proto::entry::Data::{Config, Payload};
 use crate::raft::raft_proto::raft_client::RaftClient;
 use crate::raft::raft_proto::{ClusterConfig, Server};
 use crate::raft::store::ConfigInfo;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint, Error};
+use tracing::info;
 
 // Holds information about a Raft cluster.
 pub struct Cluster {
@@ -104,6 +105,18 @@ impl Cluster {
 
     // Updates the cluster's members based on the supplied latest cluster information.
     pub fn update(&mut self, info: ConfigInfo) {
+        if let Some(entry) = &info.latest {
+            match &entry.data {
+                // TODO(dino): Why is this never happening?!
+                Some(Config(inner)) => {
+                    info!(name=%inner.name, ">>>> updating cluster with config info");
+                }
+                _ => {
+                    panic!("bad payload");
+                }
+            }
+        }
+
         if let Some(inner) = &self.config_info {
             if inner == &info {
                 // Nothing to do.
@@ -120,6 +133,8 @@ impl Cluster {
                 _ => return,
             },
         }
+
+        info!("updating cluster config");
 
         self.config_info = Some(info.clone());
         if info.committed {
@@ -167,6 +182,7 @@ impl Cluster {
         ClusterConfig {
             voters: self.voters.values().cloned().collect(),
             voters_next: new_voters,
+            name: "asdf".to_string(), // TODO(dino) fix/remove name
         }
     }
 

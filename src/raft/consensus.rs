@@ -428,6 +428,12 @@ impl RaftImpl {
                 return Err(raft_proto::Status::NotLeader);
             }
 
+            let mut is_config = false;
+            if let Config(inner) = &data {
+                info!(name=%inner.name, ">>>> commit_internal with config change");
+                is_config;
+            }
+
             term = state.term;
             entry_id = state.store.append(term, data);
             receiver = state.store.add_listener(entry_id.index);
@@ -873,7 +879,7 @@ impl Raft for RaftImpl {
         }))
     }
 
-    #[instrument(fields(server=?self.address),skip(self,request))]
+    #[instrument(fields(server=?self.address.name),skip(self,request))]
     async fn install_snapshot(
         &self,
         request: Request<InstallSnapshotRequest>,
@@ -893,12 +899,13 @@ impl Raft for RaftImpl {
         Ok(Response::new(InstallSnapshotResponse { term: state.term }))
     }
 
+    #[instrument(fields(server=?self.address.name),skip(self,request))]
     async fn change_config(
         &self,
         request: Request<ChangeConfigRequest>,
     ) -> Result<Response<ChangeConfigResponse>, Status> {
         let request = request.into_inner();
-        debug!(?request, "handling request");
+        info!(?request, "handling request");
 
         let joint_config;
         {
@@ -917,7 +924,11 @@ impl Raft for RaftImpl {
             joint_config = state.cluster.create_joint(request.members.to_vec());
         }
 
+        let joint = joint_config.clone();
         let result = RaftImpl::commit_internal(self.state.clone(), Config(joint_config)).await;
+
+        info!(?joint, "committed config");
+
         let leader = self.state.lock().await.cluster.leader().clone();
         let status = match result {
             Ok(_) => raft_proto::Status::Success,
@@ -928,9 +939,6 @@ impl Raft for RaftImpl {
             status: status as i32,
             leader,
         }))
-
-        // TODO(dino): According to the paper, once the joint consensus has been committed,
-        // the system then transitions to the new configuration. We need to implement that.
     }
 }
 
