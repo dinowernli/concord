@@ -69,7 +69,6 @@ impl Cluster {
     pub fn is_quorum(&self, votes: &Vec<Server>) -> bool {
         // First, get all the unique keys from the votes.
         let mut uniques = HashSet::new();
-        uniques.insert(key(&self.me));
         for server in votes {
             uniques.insert(key(&server));
         }
@@ -240,6 +239,7 @@ fn highest_replicated_index_among(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::raft_proto::{Entry, EntryId};
 
     fn create_cluster() -> Cluster {
         let s1 = server("foo", 1234, "name1");
@@ -295,6 +295,32 @@ mod tests {
     }
 
     #[test]
+    fn test_joint_consensus() {
+        let s1 = server("foo", 1234, "name");
+        let s2 = server("bar", 1234, "name");
+        let s3 = server("baz", 1234, "name");
+        let s4 = server("wiggle", 1234, "name");
+        let s5 = server("ziggle", 1234, "name");
+
+        let mut c = create_cluster();
+
+        let config_joint = entry_with_config(
+            vec![s1.clone(), s2.clone(), s3.clone()],
+            vec![s2.clone(), s4.clone(), s5.clone()],
+        );
+        let info_joint = ConfigInfo {
+            latest: Some(config_joint),
+            committed: false,
+        };
+
+        c.update(info_joint);
+
+        assert!(!c.is_quorum(&vec![s1.clone(), s2.clone()]));
+        assert!(c.is_quorum(&vec![s1.clone(), s2.clone(), s4.clone()]));
+        assert!(!c.is_quorum(&vec![s2.clone(), s4.clone()]));
+    }
+
+    #[test]
     fn test_dedup() {
         let s1 = server("foo", 1234, "name");
         let s2 = server("bar", 1234, "name");
@@ -319,18 +345,25 @@ mod tests {
 
     #[test]
     fn test_quorum() {
-        let cluster = create_cluster();
-        assert_eq!(cluster.voters.len(), 3);
+        let s1 = server("foo", 1234, "name1");
+        let s2 = server("bar", 1234, "name1");
+        let s3 = server("baz", 1234, "name1");
+        let s4 = server("wiggle", 1234, "name2");
+        let s5 = server("ziggle", 1234, "name2");
 
-        // No votes other than ourself, no quorum.
+        let s6 = server("biggle", 1234, "not part of the cluster");
+
+        let cluster = Cluster::new(
+            s2.clone(),
+            vec![s1.clone(), s2.clone(), s3.clone(), s4.clone(), s5.clone()].as_slice(),
+        );
+
         assert!(!cluster.is_quorum(&Vec::new()));
+        assert!(!cluster.is_quorum(&vec![s1.clone(), s2.clone()]));
+        assert!(!cluster.is_quorum(&vec![s1.clone(), s3.clone()]));
 
-        // One other vote, this is quorum.
-        assert!(cluster.is_quorum(&vec![server("foo", 1234, "name1")]));
-
-        // One other vote, but that's just also us. No quorum.
-        let me = cluster.me.clone();
-        assert!(!cluster.is_quorum(&vec![me]));
+        assert!(cluster.is_quorum(&vec![s1.clone(), s2.clone(), s3.clone()]));
+        assert!(!cluster.is_quorum(&vec![s1.clone(), s2.clone(), s6.clone()]));
     }
 
     #[test]
@@ -371,6 +404,16 @@ mod tests {
             host: host.to_string(),
             port,
             name: name.to_string(),
+        }
+    }
+
+    fn entry_with_config(voters: Vec<Server>, voters_next: Vec<Server>) -> Entry {
+        Entry {
+            id: Some(EntryId { term: 1, index: 3 }),
+            data: Some(Config(ClusterConfig {
+                voters,
+                voters_next,
+            })),
         }
     }
 }

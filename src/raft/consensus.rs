@@ -207,6 +207,10 @@ impl RaftImpl {
             }
 
             let mut votes = Vec::new();
+
+            // We always vote for ourself.
+            votes.push(state.cluster.me());
+
             for response in results {
                 match response {
                     Ok((peer, message)) => {
