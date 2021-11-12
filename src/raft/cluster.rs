@@ -97,9 +97,9 @@ impl Cluster {
     // its log is identical to ours.
     pub fn highest_replicated_index(&self, matches: HashMap<String, i64>) -> i64 {
         assert!(!matches.contains_key(key(&self.me).as_str()));
-        let mut result = highest_replicated_index_among(&matches, &self.voters);
+        let mut result = highest_replicated_index_among(&self.me, &matches, &self.voters);
         if !self.voters_next.is_empty() {
-            let other = highest_replicated_index_among(&matches, &self.voters_next);
+            let other = highest_replicated_index_among(&self.me, &matches, &self.voters_next);
             if other < result {
                 result = other;
             }
@@ -217,12 +217,16 @@ fn is_quorum_among(votes: &HashSet<String>, members: &HashMap<String, Server>) -
 }
 
 fn highest_replicated_index_among(
+    me: &Server,
     matches: &HashMap<String, i64>,
     members: &HashMap<String, Server>,
 ) -> i64 {
     let mut indexes: Vec<i64> = Vec::new();
-    for (key, _) in members {
-        let match_index = matches.get(key.as_str()).cloned().unwrap_or(-1);
+    for (k, _) in members {
+        if k == &key(me) {
+            continue;
+        }
+        let match_index = matches.get(k.as_str()).cloned().unwrap_or(-1);
         indexes.push(match_index);
     }
 
@@ -321,27 +325,36 @@ mod tests {
     }
 
     #[test]
-    fn test_highest_replicated_index() {
-        let cluster = create_cluster();
-        assert_eq!(cluster.size(), 3);
+    fn test_highest_replicated_index_odd() {
+        let s1 = server("foo", 1234, "name1");
+        let s2 = server("bar", 1234, "name1");
+        let s3 = server("baz", 1234, "name1");
+        let cluster = Cluster::new(
+            s2.clone(),
+            vec![s1.clone(), s2.clone(), s3.clone()].as_slice(),
+        );
 
-        let data = HashMap::from([("key1".to_string(), 4), ("key2".to_string(), 3)]);
+        let data = HashMap::from([(key(&s1).to_string(), 4), (key(&s3).to_string(), 3)]);
         assert_eq!(4, cluster.highest_replicated_index(data));
+    }
+
+    #[test]
+    fn test_highest_replicated_index_even() {
+        let s1 = server("foo", 1234, "name1");
+        let s2 = server("bar", 1234, "name1");
+        let s3 = server("baz", 1234, "name1");
+        let s4 = server("wiggle", 1234, "name2");
+        let cluster = Cluster::new(
+            s2.clone(),
+            vec![s1.clone(), s2.clone(), s3.clone(), s4.clone()].as_slice(),
+        );
 
         let data = HashMap::from([
-            ("key1".to_string(), 2),
-            ("key2".to_string(), 2),
-            ("key3".to_string(), 4),
-            ("key4".to_string(), 5),
+            (key(&s1).to_string(), 4),
+            (key(&s3).to_string(), 3),
+            (key(&s4).to_string(), 3),
         ]);
-        assert_eq!(4, cluster.highest_replicated_index(data));
-
-        let data = HashMap::from([
-            ("key1".to_string(), 2),
-            ("key2".to_string(), 2),
-            ("key3".to_string(), 3),
-        ]);
-        assert_eq!(2, cluster.highest_replicated_index(data));
+        assert_eq!(3, cluster.highest_replicated_index(data));
     }
 
     fn server(host: &str, port: i32, name: &str) -> Server {
