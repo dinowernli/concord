@@ -162,6 +162,11 @@ impl Store {
             );
         }
 
+        // Note that since we've only moved the committed index and not appended
+        // any new entries, we only need to do a full "update_config_info", it
+        // suffices to check whether we've committed the latest config yet.
+        self.update_config_info_committed();
+
         self.apply_committed().await;
         self.resolve_listeners();
     }
@@ -266,17 +271,19 @@ impl Store {
 
     // Updates our cached information about the latest config entry in the store.
     fn update_config_info(&mut self) {
-        match self.log.latest_config_entry() {
-            Some(entry) => {
-                let index = entry.id.as_ref().expect("id").index;
-                assert!(matches!(&entry.data, Some(Config(_))));
-                self.config_info = ConfigInfo {
-                    latest: Some(entry),
-                    committed: self.committed >= index,
-                }
-            }
-            None => (),
+        self.config_info.latest = self.log.latest_config_entry();
+        self.update_config_info_committed();
+    }
+
+    // Only updates the committed bit in the latest config info.
+    fn update_config_info_committed(&mut self) {
+        let entry = &self.config_info.latest;
+        if entry.is_none() {
+            return;
         }
+
+        let index = entry.as_ref().unwrap().id.as_ref().expect("id").index;
+        self.config_info.committed = self.committed >= index;
     }
 }
 

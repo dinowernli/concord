@@ -114,15 +114,17 @@ impl Cluster {
 
         // Only keep going if there's an actual config inside.
         let config;
+        let index;
         match &info.latest {
             None => return,
             Some(entry) => match &entry.data {
-                Some(Config(c)) => config = c.clone(),
+                Some(Config(c)) => {
+                    index = entry.id.as_ref().expect("id").index;
+                    config = c.clone();
+                }
                 _ => return,
             },
         }
-
-        info!(committed=info.committed, config_name=%config.name, "updating cluster config");
 
         self.config_info = Some(info.clone());
         if info.committed {
@@ -136,6 +138,8 @@ impl Cluster {
         }
         // We could probably reuse some of these. Clear them all for now.
         self.channels.drain();
+
+        info!(committed = info.committed, index, "new cluster config");
     }
 
     // Returns an rpc client which can be used to contact the supplied peer.
@@ -170,7 +174,6 @@ impl Cluster {
         ClusterConfig {
             voters: self.voters.values().cloned().collect(),
             voters_next: new_voters,
-            name: "asdf".to_string(), // TODO(dino) fix/remove name
         }
     }
 

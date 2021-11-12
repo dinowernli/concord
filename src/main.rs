@@ -14,7 +14,7 @@ use futures::future::join_all;
 use rand::seq::SliceRandom;
 use structopt::StructOpt;
 use tokio::time::{sleep, Instant};
-use tracing::{error, info, info_span, Instrument};
+use tracing::{debug, error, info, info_span, Instrument};
 use tracing_subscriber::EnvFilter;
 
 use raft::raft_proto;
@@ -158,25 +158,26 @@ async fn run_put_loop(args: Arc<Arguments>, cluster: &Vec<Server>) {
     }
 }
 
-async fn run_reconfigure(args: Arc<Arguments>, old: Vec<Server>, new: Vec<Server>) {
+async fn run_reconfigure_loop(args: Arc<Arguments>, old: Vec<Server>, new: Vec<Server>) {
     if args.disable_reconfigure {
         return;
     }
 
-    sleep(Duration::from_secs(5)).await;
+    loop {
+        sleep(Duration::from_secs(10)).await;
 
-    info!(?old, ?new, "reconfiguring");
-    // TODO(dino): Have old and new actually be different.
+        debug!(?old, ?new, "reconfiguring");
+        // TODO(dino): Have old and new actually be different.
 
-    let member = old.first().unwrap().clone();
-    let client = raft::new_client("main-reconfigure", &member);
-
-    let start = Instant::now();
-    match client.change_config(new).await {
-        Ok(_) => {
-            info!(latency_ms = %start.elapsed().as_millis(), "success")
+        let member = old.first().unwrap().clone();
+        let client = raft::new_client("main-reconfigure", &member);
+        let start = Instant::now();
+        match client.change_config(new.clone()).await {
+            Ok(_) => {
+                info!(latency_ms = %start.elapsed().as_millis(), "success")
+            }
+            Err(message) => error!("failed: {}", message),
         }
-        Err(message) => error!("failed: {}", message),
     }
 }
 
@@ -216,7 +217,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         run_put_loop(arguments.clone(), &addresses).instrument(info_span!("put")),
         run_preempt_loop(arguments.clone(), &addresses).instrument(info_span!("preempt")),
         run_validate_loop(arguments.clone(), diag.clone()).instrument(info_span!("validate")),
-        run_reconfigure(arguments.clone(), addresses.clone(), addresses.clone())
+        run_reconfigure_loop(arguments.clone(), addresses.clone(), addresses.clone())
             .instrument(info_span!("reconfigure")),
     );
 
