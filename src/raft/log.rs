@@ -126,7 +126,7 @@ impl LogSlice {
         if self.entries.is_empty() {
             return None;
         }
-        for i in self.entries.len() - 1..0 {
+        for i in (0..self.entries.len()).rev() {
             let entry = self.entries.get(i).unwrap();
             if matches!(&entry.data, Some(Config(_))) {
                 return Some(entry.clone());

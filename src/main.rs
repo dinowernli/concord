@@ -163,7 +163,7 @@ async fn run_reconfigure(args: Arc<Arguments>, old: Vec<Server>, new: Vec<Server
         return;
     }
 
-    sleep(Duration::from_secs(10)).await;
+    sleep(Duration::from_secs(5)).await;
 
     info!(?old, ?new, "reconfiguring");
     // TODO(dino): Have old and new actually be different.

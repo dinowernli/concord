@@ -428,12 +428,6 @@ impl RaftImpl {
                 return Err(raft_proto::Status::NotLeader);
             }
 
-            let mut is_config = false;
-            if let Config(inner) = &data {
-                info!(name=%inner.name, ">>>> commit_internal with config change");
-                is_config;
-            }
-
             term = state.term;
             entry_id = state.store.append(term, data);
             receiver = state.store.add_listener(entry_id.index);
@@ -905,7 +899,7 @@ impl Raft for RaftImpl {
         request: Request<ChangeConfigRequest>,
     ) -> Result<Response<ChangeConfigResponse>, Status> {
         let request = request.into_inner();
-        info!(?request, "handling request");
+        debug!(?request, "handling request");
 
         let joint_config;
         {
@@ -927,7 +921,7 @@ impl Raft for RaftImpl {
         let joint = joint_config.clone();
         let result = RaftImpl::commit_internal(self.state.clone(), Config(joint_config)).await;
 
-        info!(?joint, "committed config");
+        debug!(?joint, "committed config");
 
         let leader = self.state.lock().await.cluster.leader().clone();
         let status = match result {
