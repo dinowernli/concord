@@ -227,7 +227,7 @@ impl RaftImpl {
             return if state.cluster.is_quorum(&votes) {
                 info!(term, votes=?supporters, "won election");
                 state.role = RaftRole::Leader;
-                state.followers = state.create_follower_positions();
+                state.create_follower_positions(true /* clear_existing */);
                 state.timer_guard = None;
 
                 let me = state.name();
@@ -434,7 +434,10 @@ impl RaftImpl {
 
             // Latest appended/committed configs may have changed, update the cluster.
             let config_info = state.store.get_config_info();
-            state.cluster.update(config_info);
+            let updated = state.cluster.update(config_info);
+            if updated {
+                state.create_follower_positions(false /* clear_existing */);
+            }
         }
 
         let committed = receiver.await;
@@ -525,11 +528,19 @@ impl RaftState {
 
     // Returns a suitable initial map of follower positions. Meant to be called
     // by a new leader initializing itself.
-    fn create_follower_positions(&self) -> HashMap<String, FollowerPosition> {
-        let mut result = HashMap::new();
-        for server in self.cluster.others() {
-            result.insert(
-                address_key(&server),
+    fn create_follower_positions(&mut self, clear_existing: bool) {
+        if clear_existing {
+            self.followers.clear();
+        }
+
+        let others = self.cluster.others();
+        for server in others {
+            let k = address_key(&server);
+            if self.followers.contains_key(k.as_str()) {
+                continue;
+            }
+            self.followers.insert(
+                k,
                 FollowerPosition {
                     // Optimistically start assuming next is the same as our own next.
                     next_index: self.store.log.next_index(),
@@ -538,7 +549,6 @@ impl RaftState {
                 },
             );
         }
-        result
     }
 
     // Returns an append request from a leader to a follower, appending entries starting
@@ -622,8 +632,14 @@ impl RaftState {
             // The follower has rejected our entries, presumably because they could
             // not find the entry we sent as "previous". We repeatedly reduce the
             // "next" index until we hit a "previous" entry present on the follower.
-            follower.next_index = follower.next_index - 1;
-            info!(follower=%peer.name, state=%follower, "decremented");
+            let old_next = follower.next_index;
+            if response.next < follower.next_index {
+                follower.next_index = response.next;
+            } else {
+                follower.next_index = follower.next_index - 1;
+            }
+
+            info!(follower=%peer.name, state=%follower, old_next, "decremented");
             return;
         }
 
@@ -767,6 +783,7 @@ impl Raft for RaftImpl {
             return Ok(Response::new(AppendResponse {
                 term: state.term,
                 success: false,
+                next: state.store.log.next_index(),
             }));
         }
 
@@ -793,12 +810,14 @@ impl Raft for RaftImpl {
         // can happen whenever we have no entries (e.g.,initially or just after
         // a snapshot install).
         let previous = &request.previous.expect("previous");
+        let next_index = state.store.log.next_index();
         if state.store.log.contains(previous) == ContainsResult::ABSENT {
             // Let the leader know that this entry is too far in the future, so
             // it can try again from with earlier index.
             return Ok(Response::new(AppendResponse {
                 term,
                 success: false,
+                next: next_index,
             }));
         }
 
@@ -820,6 +839,7 @@ impl Raft for RaftImpl {
         Ok(Response::new(AppendResponse {
             term,
             success: true,
+            next: state.store.log.next_index(),
         }))
     }
 

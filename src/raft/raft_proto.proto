@@ -93,6 +93,9 @@ message AppendResponse {
 
   // Indicates whether or not the entries were appended successfully.
   bool success = 2;
+
+  // The current "next" index in the recipient's log.
+  int64 next = 3;
 }
 
 // Status of a requested operation.

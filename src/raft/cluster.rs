@@ -104,11 +104,12 @@ impl Cluster {
     }
 
     // Updates the cluster's members based on the supplied latest cluster information.
-    pub fn update(&mut self, info: ConfigInfo) {
+    // Returns whether an update took place.
+    pub fn update(&mut self, info: ConfigInfo) -> bool {
         if let Some(inner) = &self.config_info {
             if inner == &info {
                 // Nothing to do.
-                return;
+                return false;
             }
         }
 
@@ -116,13 +117,13 @@ impl Cluster {
         let config;
         let index;
         match &info.latest {
-            None => return,
+            None => return false,
             Some(entry) => match &entry.data {
                 Some(Config(c)) => {
                     index = entry.id.as_ref().expect("id").index;
                     config = c.clone();
                 }
-                _ => return,
+                _ => return false,
             },
         }
 
@@ -140,6 +141,7 @@ impl Cluster {
         self.channels.drain();
 
         info!(committed = info.committed, index, "new cluster config");
+        true
     }
 
     // Returns an rpc client which can be used to contact the supplied peer.
