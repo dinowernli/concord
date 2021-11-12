@@ -72,15 +72,22 @@ impl Cluster {
     // Returns whether or not the supplied votes constitute a quorum, given the
     // current cluster configuration.
     pub fn is_quorum(&self, votes: &Vec<Server>) -> bool {
+        // First, get all the unique keys from the votes.
         let mut uniques = HashSet::new();
-
-        // Always assume we vote for our outcome.
         uniques.insert(key(&self.me));
-
         for server in votes {
             uniques.insert(key(&server));
         }
-        2 * uniques.len() > self.size()
+
+        // Joint consensus means we must have quorum individually among both
+        // sets of members if present (trivially true if voters_next is empty).
+        if !is_quorum_among(&uniques, &self.voters) {
+            return false;
+        }
+        if !is_quorum_among(&uniques, &self.voters_next) {
+            return false;
+        }
+        true
     }
 
     // Returns the highest index which has been replicated to a sufficient quorum of
@@ -89,6 +96,9 @@ impl Cluster {
     // The supplied "matches" represents, for each known peer, the index up to which
     // its log is identical to ours.
     pub fn highest_replicated_index(&self, matches: HashMap<String, i64>) -> i64 {
+        // TODO - DO NOT LAND
+        // Need to change the quorum implementation to support joint consensus.
+
         let mut indexes: Vec<i64> = matches.values().cloned().collect();
         indexes.sort();
 
@@ -195,6 +205,21 @@ fn key(server: &Server) -> String {
 
 fn server_map(servers: Vec<Server>) -> HashMap<String, Server> {
     servers.into_iter().map(|s| (key(&s), s.clone())).collect()
+}
+
+fn is_quorum_among(votes: &HashSet<String>, members: &HashMap<String, Server>) -> bool {
+    if members.is_empty() {
+        return true;
+    }
+
+    // Count the number present in the members.
+    let mut count = 0;
+    for key in votes {
+        if members.contains_key(key.as_str()) {
+            count = count + 1;
+        }
+    }
+    2 * count > members.len()
 }
 
 #[cfg(test)]

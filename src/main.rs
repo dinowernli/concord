@@ -111,6 +111,8 @@ async fn run_preempt_loop(args: Arc<Arguments>, all: &Vec<Server>) {
     let name = "main-preempt";
     let client = raft::new_client(name, &member);
     loop {
+        sleep(Duration::from_secs(4)).await;
+
         let start = Instant::now();
         match client.preempt_leader().await {
             Ok(leader) => {
