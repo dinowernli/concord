@@ -96,21 +96,15 @@ impl Cluster {
     // The supplied "matches" represents, for each known peer, the index up to which
     // its log is identical to ours.
     pub fn highest_replicated_index(&self, matches: HashMap<String, i64>) -> i64 {
-        // TODO - DO NOT LAND
-        // Need to change the quorum implementation to support joint consensus.
-
-        let mut indexes: Vec<i64> = matches.values().cloned().collect();
-        indexes.sort();
-
-        // Note that we've implicitly appended ourselves to the end of the list because
-        // we assume no follower will be ahead of us (as leader) by construction.
-        //
-        // Examples:
-        // * [1, 3],    leader (3) ==> (len = 2) => (mid = 1)
-        // * [1, 1, 3], leader (3) ==> (len = 3) => (mid = 1)
-        let mid = indexes.len() / 2;
-
-        indexes[mid]
+        assert!(!matches.contains_key(key(&self.me).as_str()));
+        let mut result = highest_replicated_index_among(&matches, &self.voters);
+        if !self.voters_next.is_empty() {
+            let other = highest_replicated_index_among(&matches, &self.voters_next);
+            if other < result {
+                result = other;
+            }
+        }
+        result
     }
 
     // Updates the cluster's members based on the supplied latest cluster information.
@@ -222,6 +216,29 @@ fn is_quorum_among(votes: &HashSet<String>, members: &HashMap<String, Server>) -
     2 * count > members.len()
 }
 
+fn highest_replicated_index_among(
+    matches: &HashMap<String, i64>,
+    members: &HashMap<String, Server>,
+) -> i64 {
+    let mut indexes: Vec<i64> = Vec::new();
+    for (key, _) in members {
+        let match_index = matches.get(key.as_str()).cloned().unwrap_or(-1);
+        indexes.push(match_index);
+    }
+
+    indexes.sort();
+
+    // Note that we've implicitly appended ourselves to the end of the list because
+    // we assume no follower will be ahead of us (as leader) by construction.
+    //
+    // Examples:
+    // * [1, 3],    leader (3) ==> (len = 2) => (mid = 1)
+    // * [1, 1, 3], leader (3) ==> (len = 3) => (mid = 1)
+    let mid = indexes.len() / 2;
+
+    indexes[mid]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,21 +325,21 @@ mod tests {
         let cluster = create_cluster();
         assert_eq!(cluster.size(), 3);
 
-        let data = HashMap::from([("server1".to_string(), 4), ("server2".to_string(), 3)]);
+        let data = HashMap::from([("key1".to_string(), 4), ("key2".to_string(), 3)]);
         assert_eq!(4, cluster.highest_replicated_index(data));
 
         let data = HashMap::from([
-            ("server1".to_string(), 2),
-            ("server2".to_string(), 2),
-            ("server3".to_string(), 4),
-            ("server4".to_string(), 5),
+            ("key1".to_string(), 2),
+            ("key2".to_string(), 2),
+            ("key3".to_string(), 4),
+            ("key4".to_string(), 5),
         ]);
         assert_eq!(4, cluster.highest_replicated_index(data));
 
         let data = HashMap::from([
-            ("server1".to_string(), 2),
-            ("server2".to_string(), 2),
-            ("server3".to_string(), 3),
+            ("key1".to_string(), 2),
+            ("key2".to_string(), 2),
+            ("key3".to_string(), 3),
         ]);
         assert_eq!(2, cluster.highest_replicated_index(data));
     }
