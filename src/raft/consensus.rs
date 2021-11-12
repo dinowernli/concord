@@ -163,7 +163,7 @@ impl RaftImpl {
             }
 
             if !state.cluster.am_voting_member() {
-                info!("no longer voting member, not running election");
+                info!("not voting member, aborted election");
                 return true;
             }
 
@@ -705,7 +705,7 @@ impl RaftState {
         self.cluster.update(config_info);
 
         if self.role == Leader && !self.cluster.am_voting_member() {
-            info!("leader no longer voting member, stepping down");
+            info!(role=?self.role, "not voting member, stepping down");
             let term = self.term;
             self.become_follower(arc_state, term);
         }

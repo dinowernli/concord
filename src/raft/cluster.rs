@@ -178,10 +178,9 @@ impl Cluster {
         }
     }
 
-    // Returns all known members of the cluster.
+    // Returns all voting members of the cluster.
     fn all(&self) -> HashMap<String, Server> {
         let mut result = HashMap::new();
-        result.insert(key(&self.me), self.me.clone());
         result.extend(self.voters.clone());
         result.extend(self.voters_next.clone());
         result
@@ -247,6 +246,22 @@ mod tests {
         let s2 = server("bar", 1234, "name1");
         let s3 = server("baz", 1234, "name1");
         Cluster::new(s2.clone(), vec![s1, s2, s3].as_slice())
+    }
+
+    #[test]
+    fn test_all() {
+        let s1 = server("foo", 1234, "name1");
+        let s2 = server("bar", 1234, "name1");
+        let s3 = server("baz", 1234, "name1");
+        let cluster = Cluster::new(
+            s2.clone(),
+            vec![s1.clone(), s2.clone(), s3.clone()].as_slice(),
+        );
+
+        assert!(cluster.all().contains_key(key(&s1).as_str()));
+        assert!(cluster.all().contains_key(key(&s2).as_str()));
+        assert!(cluster.all().contains_key(key(&s3).as_str()));
+        assert_eq!(cluster.all().len(), 3);
     }
 
     #[test]
