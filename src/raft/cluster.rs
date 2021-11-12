@@ -59,11 +59,6 @@ impl Cluster {
         all.into_values().collect()
     }
 
-    // Returns the number of participants in the cluster (including us).
-    pub fn size(&self) -> usize {
-        self.others().len() + 1
-    }
-
     // Returns whether there is an ongoing cluster configuration transition.
     pub fn has_ongoing_mutation(&self) -> bool {
         !self.voters_next.is_empty()
@@ -257,7 +252,7 @@ mod tests {
     #[test]
     fn test_initial() {
         let cluster = create_cluster();
-        assert_eq!(cluster.size(), 3);
+        assert_eq!(cluster.voters.len(), 3);
         assert_eq!(cluster.others().len(), 2);
         assert!(cluster.leader().is_none());
     }
@@ -281,7 +276,6 @@ mod tests {
     fn test_singleton_cluster() {
         let me = server("foo", 1234, "some-name");
         let cluster = Cluster::new(me.clone(), vec![me.clone()].as_slice());
-        assert_eq!(cluster.size(), 1);
         assert!(cluster.others().is_empty());
     }
 
@@ -305,13 +299,13 @@ mod tests {
             .as_slice(),
         );
 
-        assert_eq!(cluster.size(), 3);
+        assert_eq!(cluster.voters.len(), 3);
     }
 
     #[test]
     fn test_quorum() {
         let cluster = create_cluster();
-        assert_eq!(cluster.size(), 3);
+        assert_eq!(cluster.voters.len(), 3);
 
         // No votes other than ourself, no quorum.
         assert!(!cluster.is_quorum(&Vec::new()));
