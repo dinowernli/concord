@@ -14,7 +14,7 @@ use futures::future::join_all;
 use rand::seq::SliceRandom;
 use structopt::StructOpt;
 use tokio::time::{sleep, Instant};
-use tracing::{debug, error, info, info_span, Instrument};
+use tracing::{error, info, info_span, Instrument};
 use tracing_subscriber::EnvFilter;
 
 use raft::raft_proto;
@@ -102,6 +102,7 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
 // cluster to recover by electing a new one.
 async fn run_preempt_loop(args: Arc<Arguments>, all: &Vec<Server>) {
     if args.disable_preempt {
+        info!("running without the preempt loop");
         return;
     }
 
@@ -126,6 +127,7 @@ async fn run_preempt_loop(args: Arc<Arguments>, all: &Vec<Server>) {
 // raft implementation.
 async fn run_validate_loop(args: Arc<Arguments>, diag: Arc<Mutex<Diagnostics>>) {
     if args.disable_validate {
+        info!("running without the validate loop");
         return;
     }
 
@@ -142,6 +144,7 @@ async fn run_validate_loop(args: Arc<Arguments>, diag: Arc<Mutex<Diagnostics>>) 
 // Repeatedly picks a random server in the cluster and sends a put request.
 async fn run_put_loop(args: Arc<Arguments>, all: &Vec<Server>) {
     if args.disable_commit {
+        info!("running without the put loop");
         return;
     }
 
@@ -167,12 +170,13 @@ async fn run_put_loop(args: Arc<Arguments>, all: &Vec<Server>) {
 
 async fn run_reconfigure_loop(args: Arc<Arguments>, all: &Vec<Server>) {
     if args.disable_reconfigure {
+        info!("running without the reconfigure loop");
         return;
     }
 
     let first = all.first().unwrap().clone();
     loop {
-        sleep(Duration::from_secs(10)).await;
+        sleep(Duration::from_secs(15)).await;
 
         // The new members are the first entry (always) and 2 out of the 4 others.
         let mut new = vec![first.clone()];

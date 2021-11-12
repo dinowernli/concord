@@ -27,6 +27,7 @@ use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 
 use crate::raft;
 use crate::raft::cluster::Cluster;
+use crate::raft::consensus::RaftRole::Leader;
 use crate::raft::diagnostics;
 use crate::raft::raft_proto::entry::Data;
 use crate::raft::raft_proto::entry::Data::{Config, Payload};
@@ -113,7 +114,7 @@ impl RaftImpl {
 
         let mut state = self.state.lock().await;
         let term = state.term;
-        info!(term, "starting");
+        debug!(term, "starting");
         state.become_follower(arc_state.clone(), term);
 
         tokio::spawn(async move {
@@ -162,7 +163,7 @@ impl RaftImpl {
             }
 
             if !state.cluster.am_voting_member() {
-                info!("no longer voting member");
+                info!("no longer voting member, not running election");
                 return true;
             }
 
@@ -252,13 +253,20 @@ impl RaftImpl {
         let mut first_heartbeat_done = false;
         loop {
             {
-                let state = arc_state.lock().await;
+                let arc_state_copy = arc_state.clone();
+                let mut state = arc_state.lock().await;
                 if state.term > term {
                     debug!(term=state.term, role=?state.role, "detected higher term");
                     return;
                 }
                 if state.role != RaftRole::Leader {
                     debug!(term=state.term, role=?state.role, "no longer leader");
+                    return;
+                }
+                if !state.cluster.am_voting_member() {
+                    info!("no longer voting member, stepping down");
+                    let t = state.term;
+                    state.become_follower(arc_state_copy, t);
                     return;
                 }
                 match &state.diagnostics {
@@ -332,6 +340,7 @@ impl RaftImpl {
         join_all(results).await;
 
         {
+            let arc_state_copy = arc_state.clone();
             let mut state = arc_state.lock().await;
             if state.term > term {
                 debug!(term=state.term, role=?state.role, "detected higher term");
@@ -341,7 +350,7 @@ impl RaftImpl {
                 debug!(term=state.term, role=?state.role, "no longer leader");
                 return;
             }
-            state.update_committed().await;
+            state.update_committed(arc_state_copy).await;
             debug!("done replicating entries");
         }
     }
@@ -680,20 +689,26 @@ impl RaftState {
     // Scans the state of our followers in the hope of finding a new index which
     // has been replicated to a majority. If such an index is found, this updates
     // the index this leader considers committed.
-    async fn update_committed(&mut self) {
+    async fn update_committed(&mut self, arc_state: Arc<Mutex<RaftState>>) {
         assert_eq!(self.role, RaftRole::Leader);
         let new_commit_index = self.compute_highest_majority_match();
         self.store.commit_to(new_commit_index).await;
 
         // The committing may have changed the latest configs. Update the cluster.
-        self.update_cluster();
+        self.update_cluster(arc_state);
     }
 
     // Feeds the latest state of stored config info into the cluster, giving the
     // cluster a chance to update itself.
-    fn update_cluster(&mut self) {
+    fn update_cluster(&mut self, arc_state: Arc<Mutex<RaftState>>) {
         let config_info = self.store.get_config_info();
         self.cluster.update(config_info);
+
+        if self.role == Leader && !self.cluster.am_voting_member() {
+            info!("leader no longer voting member, stepping down");
+            let term = self.term;
+            self.become_follower(arc_state, term);
+        }
     }
 
     // Returns a request which a candidate can send in order to request the vote
@@ -833,7 +848,7 @@ impl Raft for RaftImpl {
         state.store.commit_to(leader_commit_index).await;
 
         // The appending and committing may have changed the latest configs. Update the cluster.
-        state.update_cluster();
+        state.update_cluster(self.state.clone());
 
         debug!("handled request");
         Ok(Response::new(AppendResponse {
