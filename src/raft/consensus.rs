@@ -557,7 +557,7 @@ impl RaftState {
                 k,
                 FollowerPosition {
                     // Optimistically start assuming next is the same as our own next.
-                    next_index: self.store.log.next_index(),
+                    next_index: self.store.next_index(),
                     match_index: -1,
                     server: server.clone(),
                 },
@@ -803,7 +803,7 @@ impl Raft for RaftImpl {
             return Ok(Response::new(AppendResponse {
                 term: state.term,
                 success: false,
-                next: state.store.log.next_index(),
+                next: state.store.next_index(),
             }));
         }
 
@@ -830,7 +830,7 @@ impl Raft for RaftImpl {
         // can happen whenever we have no entries (e.g.,initially or just after
         // a snapshot install).
         let previous = &request.previous.expect("previous");
-        let next_index = state.store.log.next_index();
+        let next_index = state.store.next_index();
         if state.store.log.contains(previous) == ContainsResult::ABSENT {
             // Let the leader know that this entry is too far in the future, so
             // it can try again from with earlier index.
@@ -859,7 +859,7 @@ impl Raft for RaftImpl {
         Ok(Response::new(AppendResponse {
             term,
             success: true,
-            next: state.store.log.next_index(),
+            next: state.store.next_index(),
         }))
     }
 
@@ -1104,7 +1104,7 @@ mod tests {
             assert_eq!(state.cluster.leader(), Some(leader.clone()));
             assert_eq!(state.term, 12);
             assert!(!state.store.log.is_index_compacted(0)); // Not compacted
-            assert_eq!(state.store.log.next_index(), 3);
+            assert_eq!(state.store.next_index(), 3);
         }
 
         // Run a compaction, should have no effect
@@ -1112,7 +1112,7 @@ mod tests {
             let mut state = raft_state.lock().await;
             state.store.try_compact().await;
             assert!(!state.store.log.is_index_compacted(0)); // Not compacted
-            assert_eq!(state.store.log.next_index(), 3);
+            assert_eq!(state.store.next_index(), 3);
         }
 
         // Now send an append request with a payload large enough to trigger compaction.
@@ -1143,7 +1143,7 @@ mod tests {
         {
             let state = raft_state.lock().await;
             assert!(!state.store.log.is_index_compacted(0)); // Not compacted
-            assert_eq!(state.store.log.next_index(), 4); // New entry incorporated
+            assert_eq!(state.store.next_index(), 4); // New entry incorporated
         }
 
         // Run a compaction, this one should actually compact things now.

@@ -86,6 +86,11 @@ impl Store {
         self.snapshot.clone()
     }
 
+    // Returns the index of the first entry not (yet) present in the store.
+    pub fn next_index(&self) -> i64 {
+        self.log.next_index()
+    }
+
     // Applies the supplied data to the log (without necessarily committing it). Returns
     // the id for the created entry.
     pub fn append(&mut self, term: i64, data: Data) -> EntryId {
@@ -359,6 +364,7 @@ mod tests {
         assert_eq!(store.committed_index(), -1);
         assert_eq!(store.applied, -1);
         assert!(store.get_latest_snapshot().is_none());
+        assert_eq!(store.next_index(), 0);
     }
 
     #[tokio::test]
