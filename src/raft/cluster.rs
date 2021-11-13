@@ -295,6 +295,34 @@ mod tests {
     }
 
     #[test]
+    fn test_update() {
+        let s1 = server("foo", 1234, "name");
+        let s2 = server("bar", 1234, "name");
+        let s3 = server("baz", 1234, "name");
+        let s4 = server("wiggle", 1234, "name");
+        let s5 = server("ziggle", 1234, "name");
+
+        let mut c = create_cluster();
+
+        let config_joint = entry_with_config(
+            vec![s1.clone(), s2.clone(), s3.clone()],
+            vec![s2.clone(), s4.clone(), s5.clone()],
+        );
+        let info_joint = ConfigInfo {
+            latest: Some(config_joint),
+            committed: true,
+        };
+
+        c.update(info_joint);
+
+        assert!(!c.is_quorum(&vec![s1.clone(), s2.clone()]));
+        assert!(c.is_quorum(&vec![s1.clone(), s2.clone(), s4.clone()]));
+
+        // Because we've set commit:true, the cluster swaps straight to the new config.
+        assert!(c.is_quorum(&vec![s2.clone(), s4.clone()]));
+    }
+
+    #[test]
     fn test_joint_consensus() {
         let s1 = server("foo", 1234, "name");
         let s2 = server("bar", 1234, "name");
@@ -317,6 +345,8 @@ mod tests {
 
         assert!(!c.is_quorum(&vec![s1.clone(), s2.clone()]));
         assert!(c.is_quorum(&vec![s1.clone(), s2.clone(), s4.clone()]));
+
+        // Joint consensus, this is not enough for quorum.
         assert!(!c.is_quorum(&vec![s2.clone(), s4.clone()]));
     }
 
@@ -397,6 +427,29 @@ mod tests {
             (key(&s4).to_string(), 3),
         ]);
         assert_eq!(3, cluster.highest_replicated_index(data));
+    }
+
+    #[test]
+    fn test_create_joint() {
+        let s1 = server("foo", 1234, "name1");
+        let s2 = server("bar", 1234, "name1");
+        let s3 = server("baz", 1234, "name1");
+        let voters = vec![s1.clone(), s2.clone(), s3.clone()];
+        let cluster = Cluster::new(s2.clone(), voters.clone().as_slice());
+
+        let s4 = server("wiggle", 1234, "name1");
+        let s5 = server("ziggle", 1234, "name1");
+        let new_voters = vec![s1.clone(), s4.clone(), s5.clone()];
+
+        let config = cluster.create_joint(new_voters.clone());
+        assert_eq!(sorted(config.voters), sorted(voters));
+        assert_eq!(sorted(config.voters_next), sorted(new_voters));
+    }
+
+    fn sorted(input: Vec<Server>) -> Vec<Server> {
+        let mut result = input;
+        result.sort_by(|l, r| (&l.host, l.port).cmp(&(&r.host, r.port)));
+        result
     }
 
     fn server(host: &str, port: i32, name: &str) -> Server {
