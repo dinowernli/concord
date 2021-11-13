@@ -345,6 +345,7 @@ fn entry_id_key(entry_id: &EntryId) -> String {
 mod tests {
     use super::*;
     use crate::raft::raft_proto::entry::Data::Payload;
+    use crate::raft::raft_proto::{ClusterConfig, Server};
     use crate::raft::testing::FakeStateMachine;
     use futures::FutureExt;
 
@@ -470,5 +471,91 @@ mod tests {
         let last = snap.unwrap().last;
         assert_eq!(17, last.term);
         assert_eq!(22, last.index);
+    }
+
+    #[test]
+    fn test_config_info_append() {
+        let mut store = make_store();
+        assert!(store.config_info.latest.is_none());
+
+        store.append(17, Payload(Vec::new()));
+        assert!(store.config_info.latest.is_none());
+
+        let config = ClusterConfig {
+            voters: vec![],
+            voters_next: vec![],
+        };
+        store.append(17, Config(config.clone()));
+        assert!(!store.config_info.latest.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_config_info_append_all() {
+        let mut store = make_store();
+        assert!(store.get_config_info().latest.is_none());
+
+        store.append_all(&vec![
+            payload_entry(12, 0),
+            payload_entry(12, 1),
+            payload_entry(12, 2),
+        ]);
+        assert!(store.get_config_info().latest.is_none());
+
+        let voters = 7;
+        store.append_all(&vec![
+            payload_entry(12, 3),
+            config_entry(12, 4, voters),
+            payload_entry(12, 5),
+        ]);
+        assert!(store.get_config_info().latest.is_some());
+        match store.get_config_info().latest.unwrap().data.unwrap() {
+            Config(config) => assert_eq!(voters, config.voters.len()),
+            _ => panic!("bad entry contents"),
+        }
+
+        let voters = 5;
+        store.append_all(&vec![
+            config_entry(12, 6, 3),
+            config_entry(12, 7, 3),
+            config_entry(12, 8, voters),
+        ]);
+        assert!(store.get_config_info().latest.is_some());
+        match store.get_config_info().latest.unwrap().data.unwrap() {
+            Config(config) => assert_eq!(voters, config.voters.len()),
+            _ => panic!("bad entry contents"),
+        }
+        assert!(!store.get_config_info().committed);
+
+        store.commit_to(8).await;
+        assert!(store.get_config_info().committed);
+    }
+
+    fn payload_entry(term: i64, index: i64) -> Entry {
+        Entry {
+            id: Some(EntryId { term, index }),
+            data: Some(Payload(Vec::new())),
+        }
+    }
+
+    fn config_entry(term: i64, index: i64, num_voters: usize) -> Entry {
+        let mut voters = Vec::new();
+        for p in 0..num_voters {
+            voters.push(server("some-host", p as i32));
+        }
+        Entry {
+            id: Some(EntryId { term, index }),
+            data: Some(Config(ClusterConfig {
+                voters,
+                voters_next: Vec::new(),
+            })),
+        }
+    }
+
+    fn server(host: &str, port: i32) -> Server {
+        Server {
+            host: host.to_string(),
+            port,
+            name: String::new(),
+        }
     }
 }
