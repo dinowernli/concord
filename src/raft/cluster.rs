@@ -7,6 +7,13 @@ use std::time::Duration;
 use tonic::transport::{Channel, Endpoint, Error};
 use tracing::info;
 
+// Returns a string key for the supplied server. Two server structs
+// map to the same key if they are reachable at the same address. For
+// instance, two servers differing only in name will share a key.
+pub fn key(server: &Server) -> String {
+    format!("{}:{}", server.host, server.port).to_string()
+}
+
 // Holds information about a Raft cluster.
 pub struct Cluster {
     me: Server,
@@ -186,10 +193,6 @@ impl Cluster {
     }
 }
 
-fn key(server: &Server) -> String {
-    format!("{}:{}", server.host, server.port).to_string()
-}
-
 fn server_map(servers: Vec<Server>) -> HashMap<String, Server> {
     servers.into_iter().map(|s| (key(&s), s.clone())).collect()
 }
@@ -246,6 +249,18 @@ mod tests {
         let s2 = server("bar", 1234, "name1");
         let s3 = server("baz", 1234, "name1");
         Cluster::new(s2.clone(), vec![s1, s2, s3].as_slice())
+    }
+
+    #[test]
+    fn test_key() {
+        let s1 = server("foo", 1234, "name1");
+        let s2 = server("foo", 1234, "name2");
+        let s3 = server("bar", 1234, "name3");
+
+        assert_eq!(key(&s1), key(&s1));
+        assert_eq!(key(&s1), key(&s2));
+        assert_ne!(key(&s1), key(&s3));
+        assert_ne!(key(&s2), key(&s3));
     }
 
     #[test]

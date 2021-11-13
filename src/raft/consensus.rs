@@ -26,6 +26,7 @@ use raft_proto::{CommitRequest, CommitResponse, StepDownRequest, StepDownRespons
 use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 
 use crate::raft;
+use crate::raft::cluster::key;
 use crate::raft::cluster::Cluster;
 use crate::raft::consensus::RaftRole::Leader;
 use crate::raft::diagnostics;
@@ -304,7 +305,7 @@ impl RaftImpl {
                 // by installing a snapshot (if that entry has been compacted away in our log).
                 let next_index = state
                     .followers
-                    .get(address_key(&follower).as_str())
+                    .get(key(&follower).as_str())
                     .unwrap()
                     .next_index;
 
@@ -548,7 +549,7 @@ impl RaftState {
 
         let others = self.cluster.others();
         for server in others {
-            let k = address_key(&server);
+            let k = key(&server);
             if self.followers.contains_key(k.as_str()) {
                 continue;
             }
@@ -634,7 +635,7 @@ impl RaftState {
         response: &AppendResponse,
         request: &AppendRequest,
     ) {
-        let follower = self.followers.get_mut(address_key(&peer).as_str());
+        let follower = self.followers.get_mut(key(&peer).as_str());
         if follower.is_none() {
             info!(peer=%peer.name, "skipped response from unknown peer");
             return;
@@ -668,7 +669,7 @@ impl RaftState {
     fn record_follower_matches(&mut self, peer: &Server, match_index: i64) {
         let follower = self
             .followers
-            .get_mut(address_key(&peer).as_str())
+            .get_mut(key(&peer).as_str())
             .expect(format!("Unknown peer {}", &peer.name).as_str());
         let old_f = follower.clone();
         follower.match_index = match_index;
@@ -980,10 +981,6 @@ fn add_jitter(lower: i64) -> u64 {
     let mut rng = rand::thread_rng();
     let upper = (lower as f64 * 1.3) as i64;
     rng.gen_range(lower, upper) as u64
-}
-
-fn address_key(address: &Server) -> String {
-    format!("{}:{}", address.host, address.port)
 }
 
 #[cfg(test)]
