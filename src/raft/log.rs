@@ -54,7 +54,11 @@ impl LogSlice {
 
     // Adds a new entry to the end of the slice. Returns the id of the
     // newly appended entry.
-    // TODO(dino): this is super dangerous if not called from "store".
+    //
+    // TODO(dino): this is super dangerous if not called from "store" because
+    // store keeps track of the latest config entry. Once our call to
+    // "latest_config_entry" becomes cheap, store won't have to cache it anymore
+    // and this becomes a lot safer.
     pub fn append(&mut self, term: i64, data: Data) -> EntryId {
         assert!(term >= self.last_known_id().term);
 
@@ -122,10 +126,8 @@ impl LogSlice {
 
     // Returns a copy of the latest appended entry containing a config.
     // Warning: this can be expensive because it walks the log backwards.
+    // TODO(dino): cache this and make this cheap.
     pub fn latest_config_entry(&self) -> Option<Entry> {
-        if self.entries.is_empty() {
-            return None;
-        }
         for i in (0..self.entries.len()).rev() {
             let entry = self.entries.get(i).unwrap();
             if matches!(&entry.data, Some(Config(_))) {
@@ -138,7 +140,11 @@ impl LogSlice {
     // Adds the supplied entries to the end of the slice. Any conflicting
     // entries are replaced. Any existing entries with indexes higher than the
     // supplied entries are pruned.
-    // TODO(dino): this is super dangerous if not called from "store".
+    //
+    // TODO(dino): this is super dangerous if not called from "store" because
+    // store keeps track of the latest config entry. Once our call to
+    // "latest_config_entry" becomes cheap, store won't have to cache it anymore
+    // and this becomes a lot safer.
     pub fn append_all(&mut self, entries: &[Entry]) {
         assert!(!entries.is_empty(), "append_all called with empty entries");
 
@@ -269,6 +275,7 @@ fn size_bytes(entry: &Entry) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::raft_proto::ClusterConfig;
 
     #[test]
     fn test_initial() {
@@ -287,6 +294,7 @@ mod tests {
 
         assert_eq!(l.size_bytes(), 0);
         assert_eq!(l.next_index(), 18);
+        assert!(l.latest_config_entry().is_none());
     }
 
     #[test]
@@ -523,6 +531,22 @@ mod tests {
 
         let other = LogSlice::new(entry_id(6, 8));
         assert_eq!(other.last_known_id(), &entry_id(6, 8));
+    }
+
+    #[test]
+    fn test_latest_config_entry() {
+        let mut log = create_default_slice();
+
+        assert!(log.latest_config_entry().is_none());
+        log.append(
+            76, /* term */
+            Config(ClusterConfig {
+                voters: vec![],
+                voters_next: vec![],
+            }),
+        );
+
+        assert!(log.latest_config_entry().is_some());
     }
 
     fn create_default_slice() -> LogSlice {
