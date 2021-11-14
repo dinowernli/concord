@@ -1,6 +1,8 @@
 use raft_proto::{Entry, EntryId};
 
 use crate::raft::raft_proto;
+use crate::raft::raft_proto::entry::Data;
+use crate::raft::raft_proto::entry::Data::{Config, Payload};
 
 // Represents a contiguous slice of a raft log.
 pub struct LogSlice {
@@ -52,15 +54,20 @@ impl LogSlice {
 
     // Adds a new entry to the end of the slice. Returns the id of the
     // newly appended entry.
-    pub fn append(&mut self, term: i64, payload: Vec<u8>) -> EntryId {
+    //
+    // TODO(dino): this is super dangerous if not called from "store" because
+    // store keeps track of the latest config entry. Once our call to
+    // "latest_config_entry" becomes cheap, store won't have to cache it anymore
+    // and this becomes a lot safer.
+    pub fn append(&mut self, term: i64, data: Data) -> EntryId {
         assert!(term >= self.last_known_id().term);
 
-        let size_bytes = payload.len() as i64;
-        let entry = create_entry(term, self.next_index(), payload);
+        let entry = create_entry(term, self.next_index(), data);
+        let bytes = size_bytes(&entry);
         let entry_id = entry.id.clone().expect("entry");
 
         self.entries.push(entry);
-        self.size_bytes += size_bytes;
+        self.size_bytes += bytes;
         entry_id
     }
 
@@ -117,23 +124,41 @@ impl LogSlice {
         index <= self.previous_id.index
     }
 
+    // Returns a copy of the latest appended entry containing a config.
+    // Warning: this can be expensive because it walks the log backwards.
+    // TODO(dino): cache this and make this cheap.
+    pub fn latest_config_entry(&self) -> Option<Entry> {
+        for i in (0..self.entries.len()).rev() {
+            let entry = self.entries.get(i).unwrap();
+            if matches!(&entry.data, Some(Config(_))) {
+                return Some(entry.clone());
+            }
+        }
+        return None;
+    }
+
     // Adds the supplied entries to the end of the slice. Any conflicting
     // entries are replaced. Any existing entries with indexes higher than the
     // supplied entries are pruned.
+    //
+    // TODO(dino): this is super dangerous if not called from "store" because
+    // store keeps track of the latest config entry. Once our call to
+    // "latest_config_entry" becomes cheap, store won't have to cache it anymore
+    // and this becomes a lot safer.
     pub fn append_all(&mut self, entries: &[Entry]) {
         assert!(!entries.is_empty(), "append_all called with empty entries");
 
         for entry in entries {
-            let size_bytes = entry.payload.len() as i64;
+            let len_bytes = size_bytes(&entry);
             let index = entry.id.as_ref().expect("id").index;
             if index == self.next_index() {
                 self.entries.push(entry.clone());
-                self.size_bytes += size_bytes;
+                self.size_bytes += len_bytes;
             } else {
                 let local_index = self.local_index(index);
-                self.size_bytes -= self.entries[local_index].payload.len() as i64;
+                self.size_bytes -= size_bytes(&self.entries[local_index]);
                 self.entries[local_index] = entry.clone();
-                self.size_bytes += size_bytes;
+                self.size_bytes += len_bytes;
             }
         }
 
@@ -141,7 +166,7 @@ impl LogSlice {
         let last = entries.last().unwrap().id.as_ref().expect("id");
         let local_index = self.local_index(last.index);
         for entry in self.entries.drain((local_index + 1)..) {
-            self.size_bytes -= entry.payload.len() as i64;
+            self.size_bytes -= size_bytes(&entry);
         }
     }
 
@@ -210,7 +235,7 @@ impl LogSlice {
         let local_idx = self.local_index(entry_id.index) + 1;
 
         for entry in self.entries.drain(0..local_idx) {
-            self.size_bytes -= entry.payload.len() as i64;
+            self.size_bytes -= size_bytes(&entry);
         }
         self.previous_id = entry_id.clone();
     }
@@ -232,16 +257,25 @@ impl LogSlice {
     }
 }
 
-fn create_entry(term: i64, index: i64, payload: Vec<u8>) -> Entry {
+fn create_entry(term: i64, index: i64, data: Data) -> Entry {
     Entry {
         id: Some(EntryId { term, index }),
-        payload,
+        data: Some(data),
+    }
+}
+
+fn size_bytes(entry: &Entry) -> i64 {
+    match &entry.data {
+        Some(Payload(bytes)) => bytes.len() as i64,
+        Some(Config(_)) => 0,
+        None => 0,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::raft_proto::ClusterConfig;
 
     #[test]
     fn test_initial() {
@@ -260,6 +294,7 @@ mod tests {
 
         assert_eq!(l.size_bytes(), 0);
         assert_eq!(l.next_index(), 18);
+        assert!(l.latest_config_entry().is_none());
     }
 
     #[test]
@@ -277,7 +312,10 @@ mod tests {
     #[test]
     fn test_single_entry() {
         let mut l = LogSlice::initial();
-        l.append(72 /* term */, "some payload".as_bytes().to_vec());
+        l.append(
+            72, /* term */
+            Payload("some payload".as_bytes().to_vec()),
+        );
 
         let expected_id = entry_id(72 /* term */, 0 /* index */);
 
@@ -405,13 +443,13 @@ mod tests {
     #[should_panic]
     fn test_append_bad_term() {
         let mut l = create_default_slice();
-        l.append(73, "bad term".as_bytes().to_vec());
+        l.append(73, Payload("bad term".as_bytes().to_vec()));
     }
 
     #[test]
     fn test_append() {
         let mut l = create_default_slice();
-        let id = l.append(74, "bad term".as_bytes().to_vec());
+        let id = l.append(74, Payload("bad term".as_bytes().to_vec()));
         assert_eq!(74, id.term);
         assert_eq!(6, id.index);
     }
@@ -495,6 +533,22 @@ mod tests {
         assert_eq!(other.last_known_id(), &entry_id(6, 8));
     }
 
+    #[test]
+    fn test_latest_config_entry() {
+        let mut log = create_default_slice();
+
+        assert!(log.latest_config_entry().is_none());
+        log.append(
+            76, /* term */
+            Config(ClusterConfig {
+                voters: vec![],
+                voters_next: vec![],
+            }),
+        );
+
+        assert!(log.latest_config_entry().is_some());
+    }
+
     fn create_default_slice() -> LogSlice {
         let mut result = LogSlice::initial();
         result.append(71 /* term */, payload_of_size(1));
@@ -506,8 +560,8 @@ mod tests {
         result
     }
 
-    fn payload_of_size(size_bytes: i64) -> Vec<u8> {
-        [3].repeat(size_bytes as usize)
+    fn payload_of_size(size_bytes: i64) -> Data {
+        Payload([3].repeat(size_bytes as usize))
     }
 
     fn entry_id(term: i64, index: i64) -> EntryId {
@@ -517,7 +571,7 @@ mod tests {
     fn entry(term: i64, index: i64, payload_size_bytes: i64) -> Entry {
         Entry {
             id: Some(entry_id(term, index)),
-            payload: payload_of_size(payload_size_bytes),
+            data: Some(payload_of_size(payload_size_bytes)),
         }
     }
 }

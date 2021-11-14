@@ -9,7 +9,7 @@ use std::error::Error;
 use std::time::Duration;
 
 use async_std::sync::{Arc, Mutex};
-use futures::future::join4;
+use futures::future::join5;
 use futures::future::join_all;
 use rand::seq::SliceRandom;
 use structopt::StructOpt;
@@ -41,6 +41,9 @@ struct Arguments {
 
     #[structopt(short = "c", long = "disable_commit")]
     disable_commit: bool,
+
+    #[structopt(short = "r", long = "disable_reconfigure")]
+    disable_reconfigure: bool,
 }
 
 fn server(host: &str, port: i32, name: &str) -> Server {
@@ -60,12 +63,17 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
     // underlying Raft cluster.
     info!("created keyvalue service");
 
+    // The initial Raft cluster consists of only the first 3 entries, the other 2 remain
+    // idle.
+    assert!(all.len() >= 3);
+    let raft_cluster = vec![all[0].clone(), all[1].clone(), all[2].clone()];
+
     // A service used by the Raft cluster.
     let server_diagnostics = diagnostics.lock().await.get_server(&address);
     let state_machine = keyvalue.raft_state_machine();
     let raft = RaftImpl::new(
         address,
-        all,
+        &raft_cluster,
         state_machine,
         Some(server_diagnostics),
         Options::default(),
@@ -92,15 +100,19 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
 
 // Starts a loop which periodically preempts the cluster leader, forcing the
 // cluster to recover by electing a new one.
-async fn run_preempt_loop(args: Arc<Arguments>, cluster: &Vec<Server>) {
+async fn run_preempt_loop(args: Arc<Arguments>, all: &Vec<Server>) {
     if args.disable_preempt {
+        info!("running without the preempt loop");
         return;
     }
 
-    let member = cluster.first().unwrap().clone();
+    // First server guaranteed to always be part of the cluster.
+    let member = all.first().unwrap().clone();
     let name = "main-preempt";
     let client = raft::new_client(name, &member);
     loop {
+        sleep(Duration::from_secs(4)).await;
+
         let start = Instant::now();
         match client.preempt_leader().await {
             Ok(leader) => {
@@ -117,6 +129,7 @@ async fn run_preempt_loop(args: Arc<Arguments>, cluster: &Vec<Server>) {
 // raft implementation.
 async fn run_validate_loop(args: Arc<Arguments>, diag: Arc<Mutex<Diagnostics>>) {
     if args.disable_validate {
+        info!("running without the validate loop");
         return;
     }
 
@@ -131,8 +144,9 @@ async fn run_validate_loop(args: Arc<Arguments>, diag: Arc<Mutex<Diagnostics>>) 
 }
 
 // Repeatedly picks a random server in the cluster and sends a put request.
-async fn run_put_loop(args: Arc<Arguments>, cluster: &Vec<Server>) {
+async fn run_put_loop(args: Arc<Arguments>, all: &Vec<Server>) {
     if args.disable_commit {
+        info!("running without the put loop");
         return;
     }
 
@@ -142,7 +156,8 @@ async fn run_put_loop(args: Arc<Arguments>, cluster: &Vec<Server>) {
     };
     let mut i = 0;
     loop {
-        let target = cluster.choose(&mut rand::thread_rng()).expect("nonempty");
+        // First server guaranteed to always be part of the cluster.
+        let target = all.first().unwrap().clone();
         let address = format!("http://[{}]:{}", target.host, target.port);
         let mut client = KeyValueClient::connect(address).await.expect("connect");
         let start = Instant::now();
@@ -152,6 +167,44 @@ async fn run_put_loop(args: Arc<Arguments>, cluster: &Vec<Server>) {
         }
         i += 1;
         sleep(Duration::from_millis(1000)).await;
+    }
+}
+
+async fn run_reconfigure_loop(args: Arc<Arguments>, all: &Vec<Server>) {
+    if args.disable_reconfigure {
+        info!("running without the reconfigure loop");
+        return;
+    }
+
+    let first = all.first().unwrap().clone();
+    loop {
+        sleep(Duration::from_secs(15)).await;
+
+        // The new members are the first entry (always) and 2 out of the 4 others.
+        let mut new = vec![first.clone()];
+        assert!(all.len() >= 5);
+        let candidates = vec![
+            all[1].clone(),
+            all[2].clone(),
+            all[3].clone(),
+            all[4].clone(),
+        ];
+        for s in candidates.choose_multiple(&mut rand::thread_rng(), 2) {
+            new.push(s.clone());
+        }
+
+        let new_members: Vec<String> = new.iter().map(|s| s.name.to_string()).collect();
+        info!(?new_members, "reconfiguring");
+
+        // First server guaranteed to always be part of the cluster.
+        let client = raft::new_client("main-reconfigure", &first);
+        let start = Instant::now();
+        match client.change_config(new.clone()).await {
+            Ok(_) => {
+                info!(latency_ms = %start.elapsed().as_millis(), "success")
+            }
+            Err(message) => error!("failed: {}", message),
+        }
     }
 }
 
@@ -171,9 +224,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Note that we use the port as the name because we're running all these servers
     // locally and so the port is sufficient to identify the server.
     let addresses = vec![
-        server("::1", 12345, "12345"),
+        server("::1", 12345, "12345"), // Stays part of the cluster no matter what.
         server("::1", 12346, "12346"),
         server("::1", 12347, "12347"),
+        server("::1", 12348, "12348"),
+        server("::1", 12349, "12349"),
     ];
     info!("Starting {} servers", addresses.len());
 
@@ -186,11 +241,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let serving = join_all(servers);
-    let all = join4(
+    let all = join5(
         serving,
         run_put_loop(arguments.clone(), &addresses).instrument(info_span!("put")),
         run_preempt_loop(arguments.clone(), &addresses).instrument(info_span!("preempt")),
         run_validate_loop(arguments.clone(), diag.clone()).instrument(info_span!("validate")),
+        run_reconfigure_loop(arguments.clone(), &addresses).instrument(info_span!("reconfigure")),
     );
 
     all.await;

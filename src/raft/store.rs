@@ -1,5 +1,7 @@
 use crate::raft::log::{ContainsResult, LogSlice};
-use crate::raft::raft_proto::EntryId;
+use crate::raft::raft_proto::entry::Data;
+use crate::raft::raft_proto::entry::Data::Config;
+use crate::raft::raft_proto::{Entry, EntryId};
 use crate::raft::StateMachine;
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
@@ -19,6 +21,7 @@ pub struct Store {
     pub log: LogSlice,
     state_machine: Arc<Mutex<dyn StateMachine + Send>>,
     snapshot: Option<LogSnapshot>,
+    config_info: ConfigInfo,
 
     listener_uid: i64,
     listeners: BTreeSet<CommitListener>,
@@ -28,6 +31,25 @@ pub struct Store {
 
     compaction_threshold_bytes: i64,
     name: String,
+}
+
+// Holds information about config struts in the store.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfigInfo {
+    // The latest appended entry containing a cluster config.
+    pub latest: Option<Entry>,
+
+    // Whether or not the latest entry has been committed.
+    pub committed: bool,
+}
+
+impl ConfigInfo {
+    fn empty() -> Self {
+        ConfigInfo {
+            latest: None,
+            committed: false,
+        }
+    }
 }
 
 impl Store {
@@ -40,10 +62,14 @@ impl Store {
             log: LogSlice::initial(),
             state_machine,
             snapshot: None,
+            config_info: ConfigInfo::empty(),
+
             listener_uid: 0,
             listeners: BTreeSet::new(),
+
             committed: -1,
             applied: -1,
+
             compaction_threshold_bytes,
             name: name.to_string(),
         }
@@ -58,6 +84,43 @@ impl Store {
     // Returns a copy of the latest snapshot backing this store, if any.
     pub fn get_latest_snapshot(&self) -> Option<LogSnapshot> {
         self.snapshot.clone()
+    }
+
+    // Returns the index of the first entry not (yet) present in the store.
+    pub fn next_index(&self) -> i64 {
+        self.log.next_index()
+    }
+
+    // Applies the supplied data to the log (without necessarily committing it). Returns
+    // the id for the created entry.
+    pub fn append(&mut self, term: i64, data: Data) -> EntryId {
+        // Make sure we only do the expensive "update_config_info" if the latest
+        // entry is actually a config entry.
+        let is_config = matches!(&data, Config(_));
+
+        let entry_id = self.log.append(term, data);
+        if is_config {
+            self.update_config_info();
+        }
+        entry_id
+    }
+
+    // Adds the supplied entries to the end of the store. Any conflicting
+    // entries are replaced. Any existing entries with indexes higher than the
+    // supplied entries are pruned.
+    pub fn append_all(&mut self, entries: &[Entry]) {
+        let is_any_config = entries.iter().any(|e| matches!(e.data, Some(Config(_))));
+
+        self.log.append_all(entries);
+
+        if is_any_config {
+            self.update_config_info();
+        }
+    }
+
+    // Returns information about cluster config entries in the store.
+    pub fn get_config_info(&self) -> ConfigInfo {
+        self.config_info.clone()
     }
 
     // Compacts logs entries into a new snapshot if necessary.
@@ -103,6 +166,11 @@ impl Store {
                 &self.name, old_commit_index, self.committed
             );
         }
+
+        // Note that since we've only moved the committed index and not appended
+        // any new entries, we only need to do a full "update_config_info", it
+        // suffices to check whether we've committed the latest config yet.
+        self.update_config_info_committed();
 
         self.apply_committed().await;
         self.resolve_listeners();
@@ -173,17 +241,15 @@ impl Store {
             let entry = self.log.entry_at(self.applied);
             let entry_id = entry.id.expect("id").clone();
 
-            let result = self
-                .state_machine
-                .lock()
-                .await
-                .apply(&Bytes::from(entry.payload));
-            match result {
-                Ok(()) => {
-                    debug!(entry=%entry_id_key(&entry_id), "applied");
-                }
-                Err(msg) => {
-                    warn!(entry=%entry_id_key(&entry_id), "failed to apply: {}", msg);
+            if let Some(Data::Payload(bytes)) = entry.data {
+                let result = self.state_machine.lock().await.apply(&Bytes::from(bytes));
+                match result {
+                    Ok(()) => {
+                        debug!(entry=%entry_id_key(&entry_id), "applied");
+                    }
+                    Err(msg) => {
+                        warn!(entry=%entry_id_key(&entry_id), "failed to apply: {}", msg);
+                    }
                 }
             }
         }
@@ -206,6 +272,23 @@ impl Store {
                 // receiver of the cancellation
             }
         }
+    }
+
+    // Updates our cached information about the latest config entry in the store.
+    fn update_config_info(&mut self) {
+        self.config_info.latest = self.log.latest_config_entry();
+        self.update_config_info_committed();
+    }
+
+    // Only updates the committed bit in the latest config info.
+    fn update_config_info_committed(&mut self) {
+        let entry = &self.config_info.latest;
+        if entry.is_none() {
+            return;
+        }
+
+        let index = entry.as_ref().unwrap().id.as_ref().expect("id").index;
+        self.config_info.committed = self.committed >= index;
     }
 }
 
@@ -261,6 +344,8 @@ fn entry_id_key(entry_id: &EntryId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::raft_proto::entry::Data::Payload;
+    use crate::raft::raft_proto::{ClusterConfig, Server};
     use crate::raft::testing::FakeStateMachine;
     use futures::FutureExt;
 
@@ -280,13 +365,14 @@ mod tests {
         assert_eq!(store.committed_index(), -1);
         assert_eq!(store.applied, -1);
         assert!(store.get_latest_snapshot().is_none());
+        assert_eq!(store.next_index(), 0);
     }
 
     #[tokio::test]
     #[should_panic]
     async fn test_commit_to_bad_index() {
         let mut store = make_store();
-        store.log.append(2, Vec::new());
+        store.append(2, Payload(Vec::new()));
 
         // Attempt to "commit to" a value which hasn't yet been appended.
         store.commit_to(17).await;
@@ -295,7 +381,7 @@ mod tests {
     #[tokio::test]
     async fn test_commit_to() {
         let mut store = make_store();
-        let eid = store.log.append(2, Vec::new());
+        let eid = store.append(2, Payload(Vec::new()));
 
         // Should succeed.
         store.commit_to(eid.index).await;
@@ -309,9 +395,9 @@ mod tests {
         let mut store = make_store();
         let receiver = store.add_listener(2);
 
-        store.log.append(67, Vec::new());
-        store.log.append(67, Vec::new());
-        store.log.append(68, Vec::new());
+        store.append(67, Payload(Vec::new()));
+        store.append(67, Payload(Vec::new()));
+        store.append(68, Payload(Vec::new()));
 
         store.commit_to(2).await;
         let output = receiver.now_or_never();
@@ -329,7 +415,7 @@ mod tests {
         let receiver2 = store.add_listener(1);
         let receiver3 = store.add_listener(0);
 
-        store.log.append(67, Vec::new());
+        store.append(67, Payload(Vec::new()));
         store.commit_to(0).await;
 
         assert!(receiver1.now_or_never().is_some());
@@ -341,8 +427,8 @@ mod tests {
     async fn test_listener_past() {
         let mut store = make_store();
 
-        store.log.append(67, Vec::new());
-        store.log.append(67, Vec::new());
+        store.append(67, Payload(Vec::new()));
+        store.append(67, Payload(Vec::new()));
         store.commit_to(1).await;
 
         let receiver = store.add_listener(0);
@@ -352,9 +438,10 @@ mod tests {
     #[tokio::test]
     async fn test_compaction() {
         let mut store = make_store();
-        let eid = store
-            .log
-            .append(67, vec![0; 2 * COMPACTION_THRESHOLD_BYTES as usize]);
+        let eid = store.append(
+            67,
+            Payload(vec![0; 2 * COMPACTION_THRESHOLD_BYTES as usize]),
+        );
         assert!(store.log.size_bytes() > COMPACTION_THRESHOLD_BYTES);
 
         store.commit_to(eid.index).await;
@@ -384,5 +471,91 @@ mod tests {
         let last = snap.unwrap().last;
         assert_eq!(17, last.term);
         assert_eq!(22, last.index);
+    }
+
+    #[test]
+    fn test_config_info_append() {
+        let mut store = make_store();
+        assert!(store.config_info.latest.is_none());
+
+        store.append(17, Payload(Vec::new()));
+        assert!(store.config_info.latest.is_none());
+
+        let config = ClusterConfig {
+            voters: vec![],
+            voters_next: vec![],
+        };
+        store.append(17, Config(config.clone()));
+        assert!(!store.config_info.latest.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_config_info_append_all() {
+        let mut store = make_store();
+        assert!(store.get_config_info().latest.is_none());
+
+        store.append_all(&vec![
+            payload_entry(12, 0),
+            payload_entry(12, 1),
+            payload_entry(12, 2),
+        ]);
+        assert!(store.get_config_info().latest.is_none());
+
+        let voters = 7;
+        store.append_all(&vec![
+            payload_entry(12, 3),
+            config_entry(12, 4, voters),
+            payload_entry(12, 5),
+        ]);
+        assert!(store.get_config_info().latest.is_some());
+        match store.get_config_info().latest.unwrap().data.unwrap() {
+            Config(config) => assert_eq!(voters, config.voters.len()),
+            _ => panic!("bad entry contents"),
+        }
+
+        let voters = 5;
+        store.append_all(&vec![
+            config_entry(12, 6, 3),
+            config_entry(12, 7, 3),
+            config_entry(12, 8, voters),
+        ]);
+        assert!(store.get_config_info().latest.is_some());
+        match store.get_config_info().latest.unwrap().data.unwrap() {
+            Config(config) => assert_eq!(voters, config.voters.len()),
+            _ => panic!("bad entry contents"),
+        }
+        assert!(!store.get_config_info().committed);
+
+        store.commit_to(8).await;
+        assert!(store.get_config_info().committed);
+    }
+
+    fn payload_entry(term: i64, index: i64) -> Entry {
+        Entry {
+            id: Some(EntryId { term, index }),
+            data: Some(Payload(Vec::new())),
+        }
+    }
+
+    fn config_entry(term: i64, index: i64, num_voters: usize) -> Entry {
+        let mut voters = Vec::new();
+        for p in 0..num_voters {
+            voters.push(server("some-host", p as i32));
+        }
+        Entry {
+            id: Some(EntryId { term, index }),
+            data: Some(Config(ClusterConfig {
+                voters,
+                voters_next: Vec::new(),
+            })),
+        }
+    }
+
+    fn server(host: &str, port: i32) -> Server {
+        Server {
+            host: host.to_string(),
+            port,
+            name: String::new(),
+        }
     }
 }

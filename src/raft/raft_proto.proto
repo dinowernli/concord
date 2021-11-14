@@ -15,6 +15,15 @@ message Server {
   string name = 3;
 }
 
+// Configuration for the cluster.
+message ClusterConfig {
+  // Determines which members are considered part of the cluster.
+  repeated Server voters = 1;
+
+  // Holds the next set of members for the cluster.
+  repeated Server voters_next = 2;
+}
+
 // Identifies an entry in a given log.
 message EntryId {
   int64 term = 1;
@@ -24,7 +33,15 @@ message EntryId {
 // Represents an entry in a server's log.
 message Entry {
   EntryId id = 1;
-  bytes payload = 2;
+
+  oneof data {
+    // An opaque payload which can be applied to the state machine.
+    bytes payload = 2;
+
+    // An updated configuration for the cluster. Used to effect membership
+    // changes and similar reconfigurations.
+    ClusterConfig config = 3;
+  }
 }
 
 // Sent by candidate to request votes from its peers. If a quorum of votes is
@@ -76,6 +93,9 @@ message AppendResponse {
 
   // Indicates whether or not the entries were appended successfully.
   bool success = 2;
+
+  // The current "next" index in the recipient's log.
+  int64 next = 3;
 }
 
 // Status of a requested operation.
@@ -146,11 +166,32 @@ message InstallSnapshotResponse {
   int64 term = 1;
 }
 
+// A request to change the cluster's configuration. The actual transition
+// happens as a two-step process where the first step is to commit an
+// intermediate "joint consensus" configuration. This request returns once
+// that intermediate configuration has been committed (which guarantees that
+// the new config requested in this change will be applied eventually).
+message ChangeConfigRequest {
+  // The new desired (voting) members of the cluster.
+  repeated Server members = 1;
+}
+
+// A response for configuration changes.
+message ChangeConfigResponse {
+  // Indicates whether the configuration has been changed successfully.
+  Status status = 1;
+
+  // The last known leader of the raft cluster. Not populated if the cluster
+  // has never had a leader.
+  Server leader = 2;
+}
+
 service Raft {
   rpc Vote (VoteRequest) returns (VoteResponse) {}
   rpc Append (AppendRequest) returns (AppendResponse) {}
   rpc Commit (CommitRequest) returns (CommitResponse) {}
   rpc StepDown (StepDownRequest) returns (StepDownResponse) {}
   rpc InstallSnapshot (InstallSnapshotRequest) returns (InstallSnapshotResponse) {}
+  rpc ChangeConfig (ChangeConfigRequest) returns (ChangeConfigResponse) {}
 }
 
