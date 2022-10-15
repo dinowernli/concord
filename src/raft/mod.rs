@@ -21,6 +21,7 @@ mod cluster;
 mod consensus;
 mod diagnostics;
 mod log;
+mod network;
 mod state_machine;
 mod store;
 

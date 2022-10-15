@@ -985,11 +985,13 @@ fn add_jitter(lower: i64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::raft::network::InstrumentedGrpcService;
     use crate::raft::raft_proto::entry::Data;
     use crate::raft::raft_proto::raft_server::RaftServer;
     use crate::raft::testing::FakeStateMachine;
     use crate::raft_proto::Entry;
     use crate::testing::TestServer;
+    use tonic::client::GrpcService;
 
     use super::*;
 
@@ -1209,9 +1211,19 @@ mod tests {
         }
     }
 
-    async fn create_grpc_client(port: i32) -> RaftClient<Channel> {
-        RaftClient::connect(format!("http://[::1]:{}", port))
+    async fn create_grpc_client<T>(port: i32) -> Box<RaftClient<dyn GrpcService<T>>> {
+        // RaftClient::connect(format!("http://[::1]:{}", port))
+        //     .await
+        //     .expect("client")
+
+        let conn = tonic::transport::Endpoint::new(format!("http://[::1]:{}", port))
+            .expect("format")
+            .connect()
             .await
-            .expect("client")
+            .expect("connect");
+        let instrumented = InstrumentedGrpcService {
+            inner: tonic::client::Grpc::new(conn),
+        };
+        Box::new(RaftClient::new(instrumented))
     }
 }
