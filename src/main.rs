@@ -1,5 +1,4 @@
 #![feature(async_closure)]
-#![feature(map_first_last)]
 #![feature(trait_upcasting)]
 
 extern crate structopt;

@@ -1,5 +1,6 @@
 extern crate tokio_stream;
 
+use std::convert::Infallible;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::Sender;
@@ -25,7 +26,7 @@ impl TestServer {
     // anything goes wrong during setup.
     pub async fn run<S>(service: S) -> Self
     where
-        S: Service<Request<Body>, Response = Response<BoxBody>>
+        S: Service<Request<Body>, Response = Response<BoxBody>, Error = Infallible>
             + NamedService
             + Clone
             + Send
@@ -43,7 +44,7 @@ impl TestServer {
 
     async fn start<S>(&mut self, service: S)
     where
-        S: Service<Request<Body>, Response = Response<BoxBody>>
+        S: Service<Request<Body>, Response = Response<BoxBody>, Error = Infallible>
             + NamedService
             + Clone
             + Send
