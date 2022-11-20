@@ -1,11 +1,18 @@
+use crate::raft::failure_injection::{ChannelInfo, FailureInjectionMiddleware, FailureOptions};
 use crate::raft::raft_proto::entry::Data::Config;
 use crate::raft::raft_proto::raft_client::RaftClient;
 use crate::raft::raft_proto::{ClusterConfig, Server};
 use crate::raft::store::ConfigInfo;
+
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint, Error};
 use tracing::info;
+
+pub type RaftClientType = RaftClient<FailureInjectionMiddleware<Channel>>;
+
+// We deliberately inject some RPC failures by default.
+const DEAULT_FAILURE_OPTIONS: FailureOptions = FailureOptions::fail_with_probability(0.01);
 
 // Returns a string key for the supplied server. Two server structs
 // map to the same key if they are reachable at the same address. For
@@ -150,13 +157,19 @@ impl Cluster {
     }
 
     // Returns an rpc client which can be used to contact the supplied peer.
-    pub async fn new_client(&mut self, address: &Server) -> Result<RaftClient<Channel>, Error> {
+    pub async fn new_client(&mut self, address: &Server) -> Result<RaftClientType, Error> {
+        let channel_info = ChannelInfo::new(self.me.name.clone(), address.name.clone());
+
         let k = key(address);
         let cached = self.channels.get_mut(&k);
         if let Some(channel) = cached {
             // The "clone()" operation on channels is advertized as cheap and is the
             // recommended way to reuse channels.
-            return Ok(RaftClient::new(channel.clone()));
+            return Ok(RaftClient::new(wrap_channel(
+                channel.clone(),
+                DEAULT_FAILURE_OPTIONS,
+                channel_info,
+            )));
         }
 
         // Cache miss, create a new channel.
@@ -167,9 +180,13 @@ impl Cluster {
             .timeout(timeout.clone())
             .connect()
             .await?;
-
         self.channels.insert(k, channel.clone());
-        Ok(RaftClient::new(channel))
+
+        Ok(RaftClient::new(wrap_channel(
+            channel,
+            DEAULT_FAILURE_OPTIONS,
+            channel_info,
+        )))
     }
 
     // Returns a cluster configuration that represents joint consensus between the
@@ -191,6 +208,14 @@ impl Cluster {
         result.extend(self.voters_next.clone());
         result
     }
+}
+
+fn wrap_channel(
+    channel: Channel,
+    failure_options: FailureOptions,
+    channel_info: ChannelInfo,
+) -> FailureInjectionMiddleware<Channel> {
+    FailureInjectionMiddleware::new(channel, failure_options, channel_info)
 }
 
 fn server_map(servers: Vec<Server>) -> HashMap<String, Server> {
@@ -237,6 +262,30 @@ fn highest_replicated_index_among(
     let mid = indexes.len() / 2;
 
     indexes[mid]
+}
+
+#[cfg(test)]
+pub mod testing {
+    use super::*;
+
+    pub async fn create_local_client_for_testing(port: i32) -> RaftClientType {
+        let dst = format!("http://[::1]:{}", port);
+        let timeout = Duration::from_secs(1);
+        let channel = Endpoint::new(dst.clone())
+            .expect("endpoint")
+            .connect_timeout(timeout.clone())
+            .timeout(timeout.clone())
+            .connect()
+            .await
+            .expect("channel");
+
+        let channel_info = ChannelInfo::new(format!("{}", port), dst.clone());
+        RaftClient::new(wrap_channel(
+            channel,
+            FailureOptions::no_failures(),
+            channel_info,
+        ))
+    }
 }
 
 #[cfg(test)]

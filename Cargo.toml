@@ -18,6 +18,8 @@ tokio-stream = { version = "0.1.11", features = ["net"] }
 tonic = "0.8.1"
 tracing = "0.1.29"
 tracing-subscriber = {version = "0.3.1", features = ["env-filter"]}
+tower = "0.4.13"
+pin-project = "1.0.12"
 
 [build-dependencies]
 tonic-build = "0.8.1"

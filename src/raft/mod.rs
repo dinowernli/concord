@@ -20,6 +20,7 @@ mod client;
 mod cluster;
 mod consensus;
 mod diagnostics;
+mod failure_injection;
 mod log;
 mod state_machine;
 mod store;
