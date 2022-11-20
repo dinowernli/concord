@@ -13,7 +13,6 @@ use futures::FutureExt;
 use rand::Rng;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, info_span, instrument, warn, Instrument};
 
@@ -26,15 +25,14 @@ use raft_proto::{CommitRequest, CommitResponse, StepDownRequest, StepDownRespons
 use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 
 use crate::raft;
-use crate::raft::cluster::key;
 use crate::raft::cluster::Cluster;
+use crate::raft::cluster::{key, RaftClientType};
 use crate::raft::consensus::RaftRole::Leader;
 use crate::raft::diagnostics;
 use crate::raft::raft_proto::entry::Data;
 use crate::raft::raft_proto::entry::Data::{Config, Payload};
 use crate::raft::raft_proto::{ChangeConfigRequest, ChangeConfigResponse};
 use crate::raft::store::Store;
-use crate::raft_proto::raft_client::RaftClient;
 use crate::raft_proto::raft_server::Raft;
 
 // Parameters used to configure the behavior of a cluster participant.
@@ -363,7 +361,7 @@ impl RaftImpl {
     // Send a request to the follower (baked into "client") to send the supplied request
     // to install a snapshot.
     async fn replicate_snapshot(
-        mut client: RaftClient<Channel>,
+        mut client: RaftClientType,
         arc_state: Arc<Mutex<RaftState>>,
         follower: Server,
         install_request: InstallSnapshotRequest,
@@ -391,7 +389,7 @@ impl RaftImpl {
     // Send a request to the follower (baked into "client") to send the supplied request
     // to append entries we have but the follower might not.
     async fn replicate_append(
-        mut client: RaftClient<Channel>,
+        mut client: RaftClientType,
         arc_state: Arc<Mutex<RaftState>>,
         follower: Server,
         append_request: AppendRequest,
@@ -728,7 +726,7 @@ impl RaftState {
 
     // Requests a vote from a follower. Used to run leader elections.
     async fn request_vote(
-        mut client: RaftClient<Channel>,
+        mut client: RaftClientType,
         peer: Server,
         req: VoteRequest,
     ) -> Result<(Server, VoteResponse), Status> {
@@ -985,6 +983,7 @@ fn add_jitter(lower: i64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::raft::cluster::testing::create_local_client_for_testing;
     use crate::raft::raft_proto::entry::Data;
     use crate::raft::raft_proto::raft_server::RaftServer;
     use crate::raft::testing::FakeStateMachine;
@@ -1025,7 +1024,7 @@ mod tests {
             committed: 0,
         };
 
-        let mut client = create_grpc_client(server.port().unwrap() as i32).await;
+        let mut client = create_local_client_for_testing(server.port().unwrap() as i32).await;
         let append_response_1 = client
             .append(Request::new(append_request.clone()))
             .await
@@ -1089,7 +1088,7 @@ mod tests {
             committed: 0,
         };
 
-        let mut client = create_grpc_client(server.port().unwrap() as i32).await;
+        let mut client = create_local_client_for_testing(server.port().unwrap() as i32).await;
         let append_response_1 = client
             .append(append_request)
             .await
@@ -1207,11 +1206,5 @@ mod tests {
             port,
             name: port.to_string(),
         }
-    }
-
-    async fn create_grpc_client(port: i32) -> RaftClient<Channel> {
-        RaftClient::connect(format!("http://[::1]:{}", port))
-            .await
-            .expect("client")
     }
 }

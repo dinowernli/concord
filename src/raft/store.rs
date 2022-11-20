@@ -33,7 +33,7 @@ pub struct Store {
     name: String,
 }
 
-// Holds information about config struts in the store.
+// Holds information about cluster configuration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConfigInfo {
     // The latest appended entry containing a cluster config.
