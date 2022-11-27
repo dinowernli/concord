@@ -35,6 +35,8 @@ use crate::raft::raft_proto::{ChangeConfigRequest, ChangeConfigResponse};
 use crate::raft::store::Store;
 use crate::raft_proto::raft_server::Raft;
 
+const RPC_TIMEOUT_MS: u64 = 100;
+
 // Parameters used to configure the behavior of a cluster participant.
 pub struct Options {
     // Timeout after which a server in follower state starts a new election.
@@ -367,7 +369,7 @@ impl RaftImpl {
         install_request: InstallSnapshotRequest,
     ) {
         let mut request = Request::new(install_request.clone());
-        request.set_timeout(Duration::from_millis(100));
+        request.set_timeout(Duration::from_millis(RPC_TIMEOUT_MS));
         let result = client.install_snapshot(request).await;
 
         let mut state = arc_state.lock().await;
@@ -395,7 +397,7 @@ impl RaftImpl {
         append_request: AppendRequest,
     ) {
         let mut request = Request::new(append_request.clone());
-        request.set_timeout(Duration::from_millis(100));
+        request.set_timeout(Duration::from_millis(RPC_TIMEOUT_MS));
         let result = client.append(request).await;
 
         let mut state = arc_state.lock().await;
@@ -731,7 +733,7 @@ impl RaftState {
         req: VoteRequest,
     ) -> Result<(Server, VoteResponse), Status> {
         let mut request = Request::new(req.clone());
-        request.set_timeout(Duration::from_millis(100));
+        request.set_timeout(Duration::from_millis(RPC_TIMEOUT_MS));
         let result = client.vote(request).await;
         result.map(|response| (peer, response.into_inner()))
     }
