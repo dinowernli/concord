@@ -12,7 +12,11 @@ use tracing::info;
 pub type RaftClientType = RaftClient<FailureInjectionMiddleware<Channel>>;
 
 // We deliberately inject some RPC failures by default.
-const DEAULT_FAILURE_OPTIONS: FailureOptions = FailureOptions::fail_with_probability(0.01);
+const DEAULT_FAILURE_OPTIONS: FailureOptions = FailureOptions {
+    failure_probability: 0.01,
+    latency_probability: 0.05,
+    latency_ms: 50,
+};
 
 // Returns a string key for the supplied server. Two server structs
 // map to the same key if they are reachable at the same address. For
