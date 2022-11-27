@@ -7,7 +7,7 @@ use crate::raft::store::ConfigInfo;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint, Error};
-use tracing::info;
+use tracing::debug;
 
 pub type RaftClientType = RaftClient<FailureInjectionMiddleware<Channel>>;
 
@@ -66,8 +66,26 @@ impl Cluster {
 
     // Returns whether "me" is a voting member of the cluster.
     pub fn am_voting_member(&self) -> bool {
-        let k = key(&self.me);
+        self.is_voting_member(&self.me)
+    }
+
+    // Returns whether the supplied server is a voting member of the cluster.
+    pub fn is_voting_member(&self, server: &Server) -> bool {
+        let k = key(server);
         self.voters.contains_key(k.as_str()) || self.voters_next.contains_key(k.as_str())
+    }
+
+    // Returns whether "me" is eligible for candidacy as a leader. This is true if we're a
+    // voting member and if there isn't a known next membership state where we're absent.
+    pub fn am_eligible_candidate(&self) -> bool {
+        let k = key(&self.me);
+        if !self.voters_next.is_empty() && !self.voters_next.contains_key(k.as_str()) {
+            // Known next membership state where "me" is absent.
+            false
+        } else {
+            // Otherwise, we're happy as long as "me" is a voting member.
+            self.am_voting_member()
+        }
     }
 
     // Returns the addresses of all other members in the cluster.
@@ -156,7 +174,7 @@ impl Cluster {
         // We could probably reuse some of these. Clear them all for now.
         self.channels.drain();
 
-        info!(committed = info.committed, index, "new cluster config");
+        debug!(committed = info.committed, index, "new cluster config");
         true
     }
 
