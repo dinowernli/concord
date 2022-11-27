@@ -63,7 +63,7 @@ pub struct Options {
 impl Options {
     pub fn default() -> Self {
         Options {
-            follower_timeout_ms: 100,
+            follower_timeout_ms: 200,
             candidate_timeouts_ms: 300,
             leader_replicate_ms: 50,
             compaction_threshold_bytes: 10 * 1000 * 1000,
@@ -142,7 +142,23 @@ impl RaftImpl {
     async fn election_loop(arc_state: Arc<Mutex<RaftState>>, term: i64) {
         let timeout_ms = arc_state.lock().await.options.candidate_timeouts_ms.clone();
         let mut term = term;
-        while !RaftImpl::run_election(arc_state.clone(), term).await {
+
+        loop {
+            let eligible = arc_state.lock().await.cluster.am_eligible_candidate();
+
+            if !eligible {
+                // Wait for longer than the regular election timeout, mostly because servers
+                // will remain in this state for as long as they are not part of the cluster.
+                sleep(Duration::from_millis(add_jitter(2000))).await;
+                continue;
+            }
+
+            // Try and actually get elected, stop the process on completion.
+            if RaftImpl::run_election(arc_state.clone(), term).await {
+                break;
+            }
+
+            // Not successful, try again in the next iteration with a new term.
             term = term + 1;
             sleep(Duration::from_millis(add_jitter(timeout_ms))).await;
         }
@@ -170,7 +186,7 @@ impl RaftImpl {
 
             // Prepare the election. Note that we don't reset the timer because this
             // would lead to cancelling our own ongoing execution.
-            debug!(term, "starting election");
+            info!(term, "starting election");
             state.role = RaftRole::Candidate;
             state.term = term;
             state.voted_for = Some(state.cluster.me());
@@ -298,6 +314,11 @@ impl RaftImpl {
         {
             let mut state = arc_state.lock().await;
             debug!("replicating entries");
+            if state.term > term {
+                debug!(term=state.term, role=?state.role, "detected higher term");
+                return;
+            }
+
             let others = state.cluster.others();
             for follower in others {
                 // Figure out which entry the follower is expecting next and decide whether to
@@ -453,6 +474,16 @@ impl RaftImpl {
                 state.create_follower_positions(false /* clear_existing */);
             }
         }
+
+        // Make an attempt to replicate the newly appended entry to followers. This is
+        // optional an intended to cut the happy-path latency by avoiding having to wait
+        // for the next organic heartbeat to happen.
+        //
+        // TODO(dino): should probably rate limit this to make sure lots of commit operations
+        // don't cause lots of stray RPCs.
+        tokio::spawn(async move {
+            Self::replicate_entries(arc_state.clone(), term).await;
+        });
 
         let committed = receiver.await;
         match committed {
@@ -710,7 +741,7 @@ impl RaftState {
         self.cluster.update(config_info);
 
         if self.role == Leader && !self.cluster.am_voting_member() {
-            info!(role=?self.role, "not voting member, stepping down");
+            info!(role=?self.role, me=?self.cluster.me().name, "not voting member, stepping down");
             let term = self.term;
             self.become_follower(arc_state, term);
         }
@@ -754,6 +785,17 @@ impl Raft for RaftImpl {
                 term: state.term,
                 granted: false,
             }));
+        }
+
+        // There could be former members of the cluster requesting votes even though they
+        // are no longer voting members. Reject their votes.
+        if let Some(server) = request.candidate.clone() {
+            if !state.cluster.is_voting_member(&server) {
+                return Ok(Response::new(VoteResponse {
+                    term: state.term,
+                    granted: false,
+                }));
+            }
         }
 
         // If we're in an outdated term, we revert to follower in the new later

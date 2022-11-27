@@ -200,7 +200,7 @@ async fn run_reconfigure_loop(args: Arc<Arguments>, all: &Vec<Server>) {
         let start = Instant::now();
         match client.change_config(new.clone()).await {
             Ok(_) => {
-                info!(latency_ms = %start.elapsed().as_millis(), "success")
+                info!(latency_ms = %start.elapsed().as_millis(), ?new_members, "success")
             }
             Err(message) => error!("failed: {}", message),
         }
