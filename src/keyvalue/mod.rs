@@ -2,6 +2,7 @@
 // cluster. Users of this module are expected to run the service in their grpc
 // server and/or use the generated grpc client code to make requests.
 
+pub use crate::keyvalue::store::{MapStore, Store};
 pub use service::KeyValueService;
 
 pub mod grpc {

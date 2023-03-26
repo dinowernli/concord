@@ -10,38 +10,38 @@ use crate::keyvalue::keyvalue_proto::operation::Op;
 use crate::keyvalue::keyvalue_proto::{
     Entry, GetRequest, GetResponse, Operation, PutRequest, PutResponse, SetOperation,
 };
-use crate::keyvalue::store::{MapStore, Store};
+use crate::keyvalue::store::Store;
 use crate::raft::raft_proto::Server;
-use crate::raft::{new_client, Client, StateMachine};
-
-// This allows us to combine two non-auto traits into one.
-trait StoreStateMachine: Store + StateMachine {}
-impl<T: Store + StateMachine> StoreStateMachine for T {}
+use crate::raft::{new_client, Client};
 
 pub struct KeyValueService {
     // A name for this service, used for debugging, log messages, etc.
     name: String,
 
-    // Holds the actual key-value data.
-    store: Arc<Mutex<dyn StoreStateMachine + Send>>,
+    // Holds the actual key-value data. We only ever read - writes happen via
+    // the raft client, and we let someone else (the raft server) apply changes
+    // to the store via raft state machine updates.
+    store: Arc<Mutex<dyn Store + Send>>,
 
     // A client talking to the underlying Raft cluster.
     raft: Box<dyn Client + Sync + Send>,
 }
 
 impl KeyValueService {
-    // Creates a new instance of the service which will use the cluster of the
-    // supplied member for its Raft consensus.
-    pub fn new(name: &str, raft_member: &Server) -> KeyValueService {
+    // Creates a new instance of the service.
+    //
+    // The instance will only ever read from the supplied store, and will connect to the
+    // supplied raft cluster (represented by an arbitrary member) in order to commit writes.
+    pub fn new(
+        name: &str,
+        raft_member: &Server,
+        store: Arc<Mutex<dyn Store + Send>>,
+    ) -> KeyValueService {
         KeyValueService {
             name: name.into(),
-            store: Arc::new(Mutex::new(MapStore::new())),
+            store,
             raft: new_client(name.into(), raft_member),
         }
-    }
-
-    pub fn raft_state_machine(&self) -> Arc<Mutex<dyn StateMachine + Send>> {
-        self.store.clone()
     }
 
     fn make_set_operation(key: &[u8], value: &[u8]) -> Operation {
@@ -138,7 +138,9 @@ mod tests {
 
     use crate::keyvalue::keyvalue_proto::key_value_client::KeyValueClient;
     use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
+    use crate::keyvalue::store::MapStore;
     use crate::raft::raft_proto::EntryId;
+    use crate::raft::StateMachine;
     use crate::testing::TestServer;
 
     use super::*;

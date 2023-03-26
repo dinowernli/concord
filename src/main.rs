@@ -23,7 +23,7 @@ use raft_proto::Server;
 use crate::keyvalue::grpc::KeyValueClient;
 use crate::keyvalue::grpc::KeyValueServer;
 use crate::keyvalue::grpc::PutRequest;
-use crate::keyvalue::KeyValueService;
+use crate::keyvalue::{KeyValueService, MapStore};
 use crate::raft_proto::raft_server::RaftServer;
 
 mod keyvalue;
@@ -56,11 +56,7 @@ fn server(host: &str, port: i32, name: &str) -> Server {
 //#[instrument(skip(all,diagnostics))]
 async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<Diagnostics>>) {
     let server = address.name.to_string();
-    let keyvalue = KeyValueService::new(server.as_str(), &address);
-
-    // A service used to serve the keyvalue store, backed by the
-    // underlying Raft cluster.
-    info!("created keyvalue service");
+    let kv_store = Arc::new(Mutex::new(MapStore::new()));
 
     // The initial Raft cluster consists of only the first 3 entries, the other 2 remain
     // idle.
@@ -69,21 +65,28 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
 
     // A service used by the Raft cluster.
     let server_diagnostics = diagnostics.lock().await.get_server(&address);
-    let state_machine = keyvalue.raft_state_machine();
+
+    // Set up the grpc service for the key-value store.
+    let keyvalue = KeyValueService::new(server.as_str(), &address, kv_store.clone());
+    let kv_grpc = KeyValueServer::new(keyvalue);
+    info!("created keyvalue service");
+
+    // Set up the grpc service for the raft participant.
     let raft = RaftImpl::new(
         address,
         &raft_cluster,
-        state_machine,
+        kv_store.clone(), // The raft cluster participant is the one applying the KV writes.
         Some(server_diagnostics),
         Options::default(),
     );
-
     raft.start().await;
     info!("created raft service");
+    let raft_grpc = RaftServer::new(raft);
 
+    // Put it all together and serve.
     let serve = tonic::transport::Server::builder()
-        .add_service(RaftServer::new(raft))
-        .add_service(KeyValueServer::new(keyvalue))
+        .add_service(raft_grpc)
+        .add_service(kv_grpc)
         .serve(
             format!("[{}]:{}", address.host, address.port)
                 .parse()
