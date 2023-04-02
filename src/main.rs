@@ -13,11 +13,11 @@ use futures::future::join_all;
 use rand::seq::SliceRandom;
 use structopt::StructOpt;
 use tokio::time::{sleep, Instant};
-use tracing::{error, info, info_span, Instrument};
+use tracing::{debug, error, info, info_span, Instrument};
 use tracing_subscriber::EnvFilter;
 
 use raft::raft_proto;
-use raft::{Diagnostics, Options, RaftImpl};
+use raft::{Diagnostics, FailureOptions, Options, RaftImpl};
 use raft_proto::Server;
 
 use crate::keyvalue::grpc::KeyValueClient;
@@ -29,6 +29,13 @@ use crate::raft_proto::raft_server::RaftServer;
 mod keyvalue;
 mod raft;
 mod testing;
+
+// We deliberately inject some RPC failures by default.
+const DEFAULT_FAILURE_OPTIONS: FailureOptions = FailureOptions {
+    failure_probability: 0.01,
+    latency_probability: 0.05,
+    latency_ms: 50,
+};
 
 #[derive(Debug, StructOpt, Copy, Clone)]
 struct Arguments {
@@ -69,7 +76,6 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
     // Set up the grpc service for the key-value store.
     let keyvalue = KeyValueService::new(server.as_str(), &address, kv_store.clone());
     let kv_grpc = KeyValueServer::new(keyvalue);
-    info!("created keyvalue service");
 
     // Set up the grpc service for the raft participant.
     let raft = RaftImpl::new(
@@ -78,12 +84,13 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
         kv_store.clone(), // The raft cluster participant is the one applying the KV writes.
         Some(server_diagnostics),
         Options::default(),
+        Some(DEFAULT_FAILURE_OPTIONS),
     );
     raft.start().await;
-    info!("created raft service");
     let raft_grpc = RaftServer::new(raft);
 
     // Put it all together and serve.
+    info!("Created raft and key-value service");
     let serve = tonic::transport::Server::builder()
         .add_service(raft_grpc)
         .add_service(kv_grpc)
@@ -164,7 +171,11 @@ async fn run_put_loop(args: Arc<Arguments>, all: &Vec<Server>) {
         let mut client = KeyValueClient::connect(address).await.expect("connect");
         let start = Instant::now();
         match client.put(request.clone()).await {
-            Ok(_) => info!(i, latency_ms=%start.elapsed().as_millis(), "success"),
+            Ok(_) => {
+                if i % 10 == 1 {
+                    info!(i, latency_ms=%start.elapsed().as_millis(), "success")
+                }
+            }
             Err(msg) => info!(i, latency_ms=%start.elapsed().as_millis(), "failure: {}", msg),
         }
         i += 1;
@@ -196,7 +207,7 @@ async fn run_reconfigure_loop(args: Arc<Arguments>, all: &Vec<Server>) {
         }
 
         let new_members: Vec<String> = new.iter().map(|s| s.name.to_string()).collect();
-        info!(?new_members, "reconfiguring");
+        debug!(?new_members, "reconfiguring");
 
         // First server guaranteed to always be part of the cluster.
         let client = raft::new_client("main-reconfigure", &first);
@@ -205,7 +216,7 @@ async fn run_reconfigure_loop(args: Arc<Arguments>, all: &Vec<Server>) {
             Ok(_) => {
                 info!(latency_ms = %start.elapsed().as_millis(), ?new_members, "success")
             }
-            Err(message) => error!("failed: {}", message),
+            Err(message) => error!("reconfigure failed: {}", message),
         }
     }
 }

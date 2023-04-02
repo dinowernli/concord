@@ -11,6 +11,7 @@
 pub use client::{new_client, Client};
 pub use consensus::{Options, RaftImpl};
 pub use diagnostics::Diagnostics;
+pub use failure_injection::FailureOptions;
 pub use state_machine::{StateMachine, StateMachineResult};
 
 #[path = "generated/raft_proto.rs"]

@@ -19,6 +19,7 @@ use tower::BoxError;
 use tracing::debug;
 
 // Options used to control RPC failure injection.
+#[derive(Debug, Clone)]
 pub struct FailureOptions {
     // Probability with which intercepted RPCs should succeed.
     pub failure_probability: f64,
@@ -32,7 +33,6 @@ pub struct FailureOptions {
 
 impl FailureOptions {
     // Returns failure injection options which don't add any failures.
-    #[cfg(test)]
     pub const fn no_failures() -> Self {
         Self {
             failure_probability: 0.0,

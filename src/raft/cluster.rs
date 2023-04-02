@@ -11,13 +11,6 @@ use tracing::debug;
 
 pub type RaftClientType = RaftClient<FailureInjectionMiddleware<Channel>>;
 
-// We deliberately inject some RPC failures by default.
-const DEAULT_FAILURE_OPTIONS: FailureOptions = FailureOptions {
-    failure_probability: 0.01,
-    latency_probability: 0.05,
-    latency_ms: 50,
-};
-
 // Returns a string key for the supplied server. Two server structs
 // map to the same key if they are reachable at the same address. For
 // instance, two servers differing only in name will share a key.
@@ -33,6 +26,7 @@ pub struct Cluster {
     channels: HashMap<String, Channel>,
     last_known_leader: Option<Server>,
     config_info: Option<ConfigInfo>,
+    failure_injection: FailureOptions,
 }
 
 impl Cluster {
@@ -45,6 +39,23 @@ impl Cluster {
             channels: HashMap::new(),
             last_known_leader: None,
             config_info: None,
+            failure_injection: FailureOptions::no_failures(),
+        }
+    }
+
+    pub fn new_with_failures(
+        me: Server,
+        all: &[Server],
+        failure_injection: FailureOptions,
+    ) -> Self {
+        Cluster {
+            me,
+            voters: server_map(all.to_vec()),
+            voters_next: HashMap::new(),
+            channels: HashMap::new(),
+            last_known_leader: None,
+            config_info: None,
+            failure_injection,
         }
     }
 
@@ -184,12 +195,13 @@ impl Cluster {
 
         let k = key(address);
         let cached = self.channels.get_mut(&k);
+        let failure_options = self.failure_injection.clone();
         if let Some(channel) = cached {
             // The "clone()" operation on channels is advertized as cheap and is the
             // recommended way to reuse channels.
             return Ok(RaftClient::new(wrap_channel(
                 channel.clone(),
-                DEAULT_FAILURE_OPTIONS,
+                failure_options,
                 channel_info,
             )));
         }
@@ -206,7 +218,7 @@ impl Cluster {
 
         Ok(RaftClient::new(wrap_channel(
             channel,
-            DEAULT_FAILURE_OPTIONS,
+            failure_options.clone(),
             channel_info,
         )))
     }
