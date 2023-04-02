@@ -23,7 +23,7 @@ use raft_proto::Server;
 use crate::keyvalue::grpc::KeyValueClient;
 use crate::keyvalue::grpc::KeyValueServer;
 use crate::keyvalue::grpc::PutRequest;
-use crate::keyvalue::{KeyValueService, MapStore};
+use crate::keyvalue::{DebugHttpService, KeyValueService, MapStore};
 use crate::raft_proto::raft_server::RaftServer;
 
 mod keyvalue;
@@ -77,6 +77,10 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
     let keyvalue = KeyValueService::new(server.as_str(), &address, kv_store.clone());
     let kv_grpc = KeyValueServer::new(keyvalue);
 
+    // Set up the debug http service for the key-value store.
+    let kv2 = KeyValueService::new(server.as_str(), &address, kv_store.clone());
+    let kv_http = DebugHttpService::new(kv2);
+
     // Set up the grpc service for the raft participant.
     let raft = RaftImpl::new(
         address,
@@ -92,8 +96,10 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
     // Put it all together and serve.
     info!("Created raft and key-value service");
     let serve = tonic::transport::Server::builder()
+        .accept_http1(true)
         .add_service(raft_grpc)
         .add_service(kv_grpc)
+        .add_service(kv_http)
         .serve(
             format!("[{}]:{}", address.host, address.port)
                 .parse()
