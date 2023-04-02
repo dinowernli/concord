@@ -29,6 +29,7 @@ use crate::raft::cluster::Cluster;
 use crate::raft::cluster::{key, RaftClientType};
 use crate::raft::consensus::RaftRole::Leader;
 use crate::raft::diagnostics;
+use crate::raft::failure_injection::FailureOptions;
 use crate::raft::raft_proto::entry::Data;
 use crate::raft::raft_proto::entry::Data::{Config, Payload};
 use crate::raft::raft_proto::{ChangeConfigRequest, ChangeConfigResponse};
@@ -86,17 +87,21 @@ impl RaftImpl {
         state_machine: Arc<Mutex<dyn StateMachine + Send>>,
         diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
         options: Options,
+        failure_injection: Option<FailureOptions>,
     ) -> RaftImpl {
         let store = Store::new(
             state_machine,
             options.compaction_threshold_bytes,
             server.name.as_str(),
         );
-        let cluster = Cluster::new(server.clone(), all.as_slice());
+        let cluster = match failure_injection {
+            Some(f) => Cluster::new_with_failures(server.clone(), all.as_slice(), f),
+            None => Cluster::new(server.clone(), all.as_slice()),
+        };
         RaftImpl {
             address: server.clone(),
             state: Arc::new(Mutex::new(RaftState {
-                options: options,
+                options,
                 store,
                 cluster,
                 diagnostics,
@@ -180,13 +185,13 @@ impl RaftImpl {
             }
 
             if !state.cluster.am_voting_member() {
-                info!("not voting member, aborted election");
+                debug!("not voting member, aborted election");
                 return true;
             }
 
             // Prepare the election. Note that we don't reset the timer because this
             // would lead to cancelling our own ongoing execution.
-            info!(term, "starting election");
+            debug!(term, "starting election");
             state.role = RaftRole::Candidate;
             state.term = term;
             state.voted_for = Some(state.cluster.me());
@@ -247,7 +252,7 @@ impl RaftImpl {
             let arc_state_copy = arc_state.clone();
             let supporters: Vec<String> = votes.iter().map(|s| s.name.to_string()).collect();
             return if state.cluster.is_quorum(&votes) {
-                info!(term, votes=?supporters, "won election");
+                debug!(term, votes=?supporters, "won election");
                 state.role = RaftRole::Leader;
                 state.create_follower_positions(true /* clear_existing */);
                 state.timer_guard = None;
@@ -298,7 +303,7 @@ impl RaftImpl {
 
             RaftImpl::replicate_entries(arc_state.clone(), term).await;
             if !first_heartbeat_done {
-                info!(term, role=?RaftRole::Leader, "established");
+                debug!(term, role=?RaftRole::Leader, "established");
                 first_heartbeat_done = true;
             }
 
@@ -432,7 +437,7 @@ impl RaftImpl {
         }
 
         match result {
-            Err(message) => warn!("append rpc failed: {}", message),
+            Err(message) => debug!("append rpc failed: {}", message),
             Ok(response) => {
                 let message = response.into_inner();
                 let other_term = message.term;
@@ -684,7 +689,7 @@ impl RaftState {
                 follower.next_index = follower.next_index - 1;
             }
 
-            info!(follower=%peer.name, state=%follower, old_next, "decremented");
+            debug!(follower=%peer.name, state=%follower, old_next, "decremented");
             return;
         }
 
@@ -741,7 +746,7 @@ impl RaftState {
         self.cluster.update(config_info);
 
         if self.role == Leader && !self.cluster.am_voting_member() {
-            info!(role=?self.role, me=?self.cluster.me().name, "not voting member, stepping down");
+            debug!(role=?self.role, me=?self.cluster.me().name, "not voting member, stepping down");
             let term = self.term;
             self.become_follower(arc_state, term);
         }
@@ -1225,6 +1230,7 @@ mod tests {
             Arc::new(Mutex::new(FakeStateMachine::new())),
             None, /* diagnostics */
             create_config_for_testing(),
+            None, /* failure injection */
         )
     }
 
