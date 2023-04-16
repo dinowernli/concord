@@ -8,21 +8,21 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::body::BoxBody;
 use tonic::codegen::http::{Request, Response};
 use tonic::codegen::Service;
-use tonic::transport::Body;
 use tonic::server::NamedService;
+use tonic::transport::Body;
 
 // A helper struct which can be used to test grpc services. Runs a real server
 // which binds to an arbitrary port and provides access to the resulting port.
 // Also takes care of tearing down the server when the instance goes out of
 // scope.
-pub struct TestServer {
+pub struct TestRpcServer {
     port: Option<u16>,
     shutdown: Option<Sender<()>>,
 }
 
-impl TestServer {
+impl TestRpcServer {
     // One-stop-shop for running a single service on an arbitrary port. Returns
-    // the instance of TestService which provides access to the port. Panics if
+    // the instance of TestRpcServer which provides access to the port. Panics if
     // anything goes wrong during setup.
     pub async fn run<S>(service: S) -> Self
     where
@@ -34,7 +34,7 @@ impl TestServer {
         S::Future: Send + 'static,
         S::Error: std::error::Error + Send + Sync,
     {
-        let mut server = TestServer {
+        let mut server = TestRpcServer {
             port: None,
             shutdown: None,
         };
@@ -86,7 +86,7 @@ impl TestServer {
     }
 }
 
-impl Drop for TestServer {
+impl Drop for TestRpcServer {
     fn drop(&mut self) {
         self.stop();
     }

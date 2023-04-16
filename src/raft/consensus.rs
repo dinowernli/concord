@@ -1037,7 +1037,7 @@ mod tests {
     use crate::raft::raft_proto::raft_server::RaftServer;
     use crate::raft::testing::FakeStateMachine;
     use crate::raft_proto::Entry;
-    use crate::testing::TestServer;
+    use crate::testing::TestRpcServer;
 
     use super::*;
 
@@ -1056,7 +1056,7 @@ mod tests {
     async fn test_load_snapshot_and_append() {
         let raft = create_raft();
         let raft_state = raft.state.clone();
-        let server = TestServer::run(RaftServer::new(raft)).await;
+        let server = TestRpcServer::run(RaftServer::new(raft)).await;
 
         // Make an append request coming from a supposed leader, for a bunch of
         // entries far in the future.
@@ -1121,7 +1121,7 @@ mod tests {
     async fn test_append_and_compact() {
         let raft = create_raft();
         let raft_state = raft.state.clone();
-        let server = TestServer::run(RaftServer::new(raft)).await;
+        let server = TestRpcServer::run(RaftServer::new(raft)).await;
 
         // Make an append request coming from a leader, appending one record.
         let leader = create_fake_server_list()[1].clone();
