@@ -4,27 +4,30 @@
 extern crate structopt;
 extern crate tracing;
 
-use std::error::Error;
-use std::time::Duration;
-
 use async_std::sync::{Arc, Mutex};
+use axum::routing::get;
+use axum::Router;
 use futures::future::join5;
 use futures::future::join_all;
+use multiplex_tonic_hyper::MakeMultiplexer;
 use rand::seq::SliceRandom;
+use std::error::Error;
+use std::net::SocketAddr;
+use std::time::Duration;
 use structopt::StructOpt;
 use tokio::time::{sleep, Instant};
+use tower::make::Shared;
 use tracing::{debug, error, info, info_span, Instrument};
 use tracing_subscriber::EnvFilter;
-
-use raft::raft_proto;
-use raft::{Diagnostics, FailureOptions, Options, RaftImpl};
-use raft_proto::Server;
 
 use crate::keyvalue::grpc::KeyValueClient;
 use crate::keyvalue::grpc::KeyValueServer;
 use crate::keyvalue::grpc::PutRequest;
 use crate::keyvalue::{KeyValueService, MapStore};
+use crate::raft::raft_proto;
+use crate::raft::{Diagnostics, FailureOptions, Options, RaftImpl};
 use crate::raft_proto::raft_server::RaftServer;
+use crate::raft_proto::Server;
 
 mod keyvalue;
 mod raft;
@@ -60,6 +63,16 @@ fn server(host: &str, port: i32, name: &str) -> Server {
     }
 }
 
+fn make_address(address: &Server) -> SocketAddr {
+    format!("[{}]:{}", address.host, address.port)
+        .parse()
+        .unwrap()
+}
+
+async fn root() -> &'static str {
+    "Hello, World!\n"
+}
+
 //#[instrument(skip(all,diagnostics))]
 async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<Diagnostics>>) {
     let server = address.name.to_string();
@@ -89,19 +102,31 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
     raft.start().await;
     let raft_grpc = RaftServer::new(raft);
 
-    // Put it all together and serve.
-    info!("Created raft and key-value service");
-    let serve = tonic::transport::Server::builder()
-        .add_service(raft_grpc)
-        .add_service(kv_grpc)
-        .serve(
-            format!("[{}]:{}", address.host, address.port)
-                .parse()
-                .unwrap(),
-        )
-        .await;
+    let kv2 = Arc::new(KeyValueService::new(
+        server.as_str(),
+        &address,
+        kv_store.clone(),
+    ));
+    let kvhttp = Arc::new(keyvalue::HttpHandler::new(kv2));
+    let web_service = Router::new()
+        .route("/", get(root))
+        .nest("/keyvalue", kvhttp.routes())
+        .into_make_service();
 
-    match serve {
+    let grpc_service = Shared::new(
+        tonic::transport::Server::builder()
+            .add_service(raft_grpc)
+            .add_service(kv_grpc)
+            .into_service(),
+    );
+
+    let multiplexer = MakeMultiplexer::new(grpc_service, web_service);
+    let serve = hyper::Server::bind(&make_address(&address)).serve(multiplexer);
+
+    info!("Started server");
+
+    let done = serve.await;
+    match done {
         Ok(()) => info!("Serving terminated successfully"),
         Err(message) => error!("Serving terminated unsuccessfully: {}", message),
     }
