@@ -1,11 +1,11 @@
 extern crate bytes;
 extern crate im;
 
-use std::collections::VecDeque;
 use bytes::Bytes;
 use im::HashMap;
-use prost::Message;
 use keyvalue_proto::{Entry, Operation, Snapshot};
+use prost::Message;
+use std::collections::VecDeque;
 
 use crate::keyvalue::keyvalue_proto;
 use crate::keyvalue::keyvalue_proto::operation::Op::Set;

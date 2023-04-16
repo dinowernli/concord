@@ -1,4 +1,5 @@
 use async_std::sync::{Arc, Mutex};
+use async_trait::async_trait;
 use bytes::Bytes;
 use prost::Message;
 use tonic::{Request, Response, Status};
@@ -56,7 +57,7 @@ impl KeyValueService {
     }
 }
 
-#[tonic::async_trait]
+#[async_trait]
 impl KeyValue for KeyValueService {
     #[instrument(fields(server=%self.name),skip(self,request))]
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
@@ -141,7 +142,7 @@ mod tests {
     use crate::keyvalue::store::MapStore;
     use crate::raft::raft_proto::EntryId;
     use crate::raft::StateMachine;
-    use crate::testing::TestServer;
+    use crate::testing::TestRpcServer;
 
     use super::*;
 
@@ -151,7 +152,7 @@ mod tests {
         store: Arc<Mutex<MapStore>>,
     }
 
-    #[tonic::async_trait]
+    #[async_trait]
     impl Client for FakeRaftClient {
         async fn commit(&self, payload: &[u8]) -> Result<EntryId, Status> {
             let copy = payload.to_vec();
@@ -176,7 +177,7 @@ mod tests {
     async fn test_get() {
         let service = create_service();
         let store = service.store.clone();
-        let server = TestServer::run(KeyValueServer::new(service)).await;
+        let server = TestRpcServer::run(KeyValueServer::new(service)).await;
 
         store
             .lock()
@@ -204,7 +205,7 @@ mod tests {
     async fn test_put() {
         let service = create_service();
         let store = service.store.clone();
-        let server = TestServer::run(KeyValueServer::new(service)).await;
+        let server = TestRpcServer::run(KeyValueServer::new(service)).await;
 
         let request = PutRequest {
             key: "foo".as_bytes().to_vec(),

@@ -1,5 +1,8 @@
 #[cfg(test)]
-pub use server::TestServer;
-
+pub use http_server::TestHttpServer;
 #[cfg(test)]
-mod server;
+pub use rpc_server::TestRpcServer;
+#[cfg(test)]
+mod http_server;
+#[cfg(test)]
+mod rpc_server;
