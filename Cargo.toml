@@ -2,26 +2,26 @@
 name = "concord"
 version = "0.1.0"
 authors = ["Dino Wernli <dinowernli@gmail.com>"]
-edition = "2018"
+edition = "2021"
 
 [dependencies]
-async-std = {version = "1.9.0", features = ["attributes"]}
-async-trait = "0.1.51"
-bytes = "0.5.6"
-chrono = "0.4.23"
-futures = "0.3.5"
-im = "15.0.0"
-prost = "0.11"
-rand = "0.7.3"
-structopt = "0.3.25"
-timer = "0.2.0"
-tokio = { version = "1.21", features = ["macros", "rt-multi-thread"] }
-tokio-stream = { version = "0.1.11", features = ["net"] }
-tonic = "0.8.1"
-tracing = "0.1.29"
+async-std = {version = "1.12", features = ["attributes"]}
+async-trait = "0.1.80"
+bytes = "0.6"
+chrono = "0.4"
+futures = "0.3"
+im = "15"
+prost = "0.12"
+rand = "0.8"
+structopt = "0.3"
+timer = "0.2"
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }
+tokio-stream = { version = "0.1.15", features = ["net"] }
+tonic = "0.11"
+tracing = "0.1.40"
 tracing-subscriber = {version = "0.3.1", features = ["env-filter"]}
 tower = "0.4.13"
-pin-project = "1.0.12"
+pin-project = "1.1"
 
 [build-dependencies]
-tonic-build = "0.8.1"
+tonic-build = "0.11"

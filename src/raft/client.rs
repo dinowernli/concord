@@ -139,9 +139,9 @@ impl ClientImpl {
             Err(status) => return Failure(tonic::Status::internal(status.to_string())),
             Ok(response) => {
                 let proto: CommitResponse = response.into_inner();
-                match Status::from_i32(proto.status) {
-                    Some(Status::Success) => Success(proto.entry_id.expect("entryid")),
-                    Some(Status::NotLeader) => NewLeader(proto.leader),
+                match Status::try_from(proto.status) {
+                    Ok(Status::Success) => Success(proto.entry_id.expect("entryid")),
+                    Ok(Status::NotLeader) => NewLeader(proto.leader),
                     _ => Failure(bad_status(proto.status)),
                 }
             }
@@ -163,9 +163,9 @@ impl ClientImpl {
             Err(status) => return Failure(tonic::Status::internal(status.to_string())),
             Ok(response) => {
                 let proto: StepDownResponse = response.into_inner();
-                match Status::from_i32(proto.status) {
-                    Some(Status::Success) => Success(proto.leader.expect("leader")),
-                    Some(Status::NotLeader) => NewLeader(proto.leader),
+                match Status::try_from(proto.status) {
+                    Ok(Status::Success) => Success(proto.leader.expect("leader")),
+                    Ok(Status::NotLeader) => NewLeader(proto.leader),
                     _ => Failure(bad_status(proto.status)),
                 }
             }
@@ -188,9 +188,9 @@ impl ClientImpl {
             Err(status) => return Failure(tonic::Status::internal(status.to_string())),
             Ok(response) => {
                 let proto: ChangeConfigResponse = response.into_inner();
-                match Status::from_i32(proto.status) {
-                    Some(Status::Success) => Success(()),
-                    Some(Status::NotLeader) => NewLeader(proto.leader),
+                match Status::try_from(proto.status) {
+                    Ok(Status::Success) => Success(()),
+                    Ok(Status::NotLeader) => NewLeader(proto.leader),
                     _ => Failure(bad_status(proto.status)),
                 }
             }
