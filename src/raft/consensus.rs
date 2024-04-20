@@ -1027,7 +1027,7 @@ impl Raft for RaftImpl {
 fn add_jitter(lower: i64) -> u64 {
     let mut rng = rand::thread_rng();
     let upper = (lower as f64 * 1.3) as i64;
-    rng.gen_range(lower, upper) as u64
+    rng.gen_range(lower..upper) as u64
 }
 
 #[cfg(test)]
