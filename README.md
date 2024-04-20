@@ -1,7 +1,5 @@
 # Concord
 
-[![Build Status](https://travis-ci.org/dinowernli/concord.svg?branch=master)](https://travis-ci.org/dinowernli/concord)
-
 A distributed key-value store in Rust:
 * Comes with a grpc-based implementation of Raft.
 * Designed to have no external dependencies.
