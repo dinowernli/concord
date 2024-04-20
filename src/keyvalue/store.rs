@@ -2,18 +2,14 @@ extern crate bytes;
 extern crate im;
 
 use std::collections::VecDeque;
-
 use bytes::Bytes;
 use im::HashMap;
 use prost::Message;
-
 use keyvalue_proto::{Entry, Operation, Snapshot};
 
 use crate::keyvalue::keyvalue_proto;
 use crate::keyvalue::keyvalue_proto::operation::Op::Set;
 use crate::raft::{StateMachine, StateMachineResult};
-
-use self::bytes::Buf;
 
 #[derive(Debug, Clone)]
 pub struct StoreError {
@@ -159,7 +155,7 @@ impl Store for MapStore {
 
 impl StateMachine for MapStore {
     fn apply(&mut self, payload: &Bytes) -> StateMachineResult {
-        let parsed = Operation::decode(payload.bytes());
+        let parsed = Operation::decode(payload.to_owned());
         if parsed.is_err() {
             return Err(format!(
                 "Failed to parse bytes: {:?}",
@@ -195,7 +191,7 @@ impl StateMachine for MapStore {
     // Discards all versions present in the current store instance, replacing
     // them with the supplied version.
     fn load_snapshot(&mut self, snapshot: &Bytes) -> StateMachineResult {
-        let parsed = Snapshot::decode(snapshot.bytes());
+        let parsed = Snapshot::decode(snapshot.to_owned());
         if parsed.is_err() {
             return Err(format!(
                 "Failed to parse snapshot: {:?}",
