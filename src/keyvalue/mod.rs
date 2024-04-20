@@ -2,13 +2,13 @@
 // cluster. Users of this module are expected to run the service in their grpc
 // server and/or use the generated grpc client code to make requests.
 
-pub use crate::keyvalue::store::{MapStore, Store};
+pub use crate::keyvalue::store::{MapStore};
 pub use service::KeyValueService;
 
 pub mod grpc {
     pub use crate::keyvalue::keyvalue_proto::key_value_client::KeyValueClient;
     pub use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
-    pub use crate::keyvalue::keyvalue_proto::{GetRequest, GetResponse, PutRequest, PutResponse};
+    pub use crate::keyvalue::keyvalue_proto::{PutRequest};
 }
 
 #[path = "generated/keyvalue_proto.rs"]
