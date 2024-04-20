@@ -201,7 +201,7 @@ impl ClientImpl {
 #[async_trait]
 impl Client for ClientImpl {
     async fn commit(&self, payload: &[u8]) -> Result<EntryId, tonic::Status> {
-        let op = async move |leader| ClientImpl::commit_impl(leader, payload).await;
+        let op = move |leader| async move { ClientImpl::commit_impl(leader, payload).await };
         self.retry_helper(op).await
     }
 
@@ -212,7 +212,7 @@ impl Client for ClientImpl {
 
     async fn change_config(&self, members: Vec<Server>) -> Result<(), tonic::Status> {
         let members = &members;
-        let op = async move |leader| ClientImpl::change_config_impl(leader, members).await;
+        let op = move |leader| async move { ClientImpl::change_config_impl(leader, members).await };
         self.retry_helper(op).await
     }
 }
