@@ -91,6 +91,7 @@ impl RaftImpl {
     ) -> RaftImpl {
         let store = Store::new(
             state_machine,
+            diagnostics.clone(),
             options.compaction_threshold_bytes,
             server.name.as_str(),
         );

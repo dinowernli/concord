@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use async_std::sync::{Arc, Mutex};
 use tracing::info;
@@ -63,7 +63,7 @@ impl Diagnostics {
             let mut candidate: Option<Server> = None;
             for (_, server) in &self.servers {
                 let s = server.lock().await;
-                if s.latest_term().unwrap_or(-1) < term {
+                if s.latest_leader_term().unwrap_or(-1) < term {
                     // This server hasn't seen a leader for this term yet. Stop.
                     return Ok(());
                 }
@@ -94,17 +94,27 @@ impl Diagnostics {
     }
 }
 
+struct AppliedCommit {
+    term: i64,
+    index: i64,
+    digest: u64,
+}
+
 // Holds information about a single server's execution as part of a raft
 // cluster over time.
 pub struct ServerDiagnostics {
     // Keeps track of the leader for each term.
     leaders: BTreeMap<i64, Server>,
+
+    // Keeps track of all applied commits, in order.
+    applied: VecDeque<AppliedCommit>,
 }
 
 impl ServerDiagnostics {
     fn new() -> Self {
         ServerDiagnostics {
             leaders: BTreeMap::new(),
+            applied: VecDeque::new(),
         }
     }
 
@@ -115,7 +125,45 @@ impl ServerDiagnostics {
         self.leaders.insert(term, leader.clone());
     }
 
-    fn latest_term(&self) -> Option<i64> {
+    pub fn report_apply(&mut self, term: i64, index: i64, digest: u64) {
+        self.applied.push_back(AppliedCommit {
+            term,
+            index,
+            digest,
+        });
+    }
+
+    // Removes all diagnostic entries for terms strictly before the supplied term.
+    fn prune(&mut self, term: i64) {
+        self.prune_leader(term);
+        self.prune_applied(term);
+    }
+
+    fn prune_applied(&mut self, term: i64) {
+        loop {
+            if self.applied.front().filter(|&f| f.term < term).is_some() {
+                self.applied.pop_front();
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn prune_leader(&mut self, term: i64) {
+        loop {
+            if self.first_leader_term().filter(|&t| t < term).is_some() {
+                self.leaders.pop_first();
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn first_leader_term(&self) -> Option<i64> {
+        self.leaders.first_key_value().map(|(k, _)| k.clone())
+    }
+
+    fn latest_leader_term(&self) -> Option<i64> {
         self.leaders.last_key_value().map(|(k, _)| k.clone())
     }
 }
