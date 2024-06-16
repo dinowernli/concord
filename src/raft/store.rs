@@ -1,4 +1,5 @@
 use crate::raft::StateMachine;
+use crate::raft::diagnostics::ServerDiagnostics;
 use crate::raft::log::{ContainsResult, LogSlice};
 use crate::raft::raft_common_proto::entry::Data;
 use crate::raft::raft_common_proto::entry::Data::Config;
@@ -8,6 +9,7 @@ use bytes::Bytes;
 use futures::channel::oneshot::{Receiver, Sender, channel};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
+use std::hash::{Hash, Hasher};
 use tonic::Status;
 use tracing::{debug, info, warn};
 
@@ -22,6 +24,7 @@ pub struct Store {
     compaction_threshold_bytes: i64,
     name: String,
     state_machine: Arc<Mutex<dyn StateMachine + Send>>,
+    diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
 
     // Persistent raft state as defined in the paper.
     log: LogSlice,
@@ -39,7 +42,7 @@ pub struct Store {
 }
 
 // Holds information about cluster configuration.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ConfigInfo {
     // The latest appended entry containing a cluster config.
     pub latest: Option<Entry>,
@@ -61,6 +64,7 @@ impl Store {
     pub fn new(
         state_machine: Arc<Mutex<dyn StateMachine + Send>>,
         initial_snapshot: LogSnapshot,
+        diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
         compaction_threshold_bytes: i64,
         name: &str,
     ) -> Self {
@@ -69,6 +73,7 @@ impl Store {
             name: name.to_string(),
             compaction_threshold_bytes,
             state_machine,
+            diagnostics,
 
             log: LogSlice::initial(),
             snapshot: initial_snapshot,
@@ -301,6 +306,23 @@ impl Store {
         Status::ok("")
     }
 
+    // If diagnostics is enabled, report that the supplied entry has been applied
+    // to the state machine.
+    async fn report_apply(&self, entry_id: &EntryId, bytes: &Vec<u8>) {
+        let diag = self.diagnostics.clone();
+        if !diag.is_some() {
+            return;
+        }
+
+        let digest = Self::make_digest(&bytes);
+        let term = entry_id.term;
+        let index = entry_id.index;
+        diag.expect("option")
+            .lock()
+            .await
+            .report_apply(term, index, digest);
+    }
+
     // Called to apply any committed values that haven't been applied to the
     // state machine. This method is always safe to call, on leaders and followers.
     async fn apply_committed(&mut self) {
@@ -310,7 +332,12 @@ impl Store {
             let entry_id = entry.id.expect("id").clone();
 
             if let Some(Data::Payload(bytes)) = entry.data {
+                // Report for debugging purposes.
+                self.report_apply(&entry_id, &bytes).await;
+
+                // Apply the entry in the state machine.
                 let result = self.state_machine.lock().await.apply(&Bytes::from(bytes));
+
                 match result {
                     Ok(()) => {
                         debug!(entry=%entry_id_key(&entry_id), "applied");
@@ -357,6 +384,12 @@ impl Store {
 
         let index = entry.as_ref().unwrap().id.as_ref().expect("id").index;
         self.config_info.committed = self.committed >= index;
+    }
+
+    fn make_digest(bytes: &Vec<u8>) -> u64 {
+        let mut hasher = std::hash::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        hasher.finish()
     }
 }
 
@@ -431,6 +464,7 @@ mod tests {
         Store::new(
             Arc::new(Mutex::new(state_machine)),
             snapshot,
+            None, /* diagnostics */
             COMPACTION_THRESHOLD_BYTES,
             "testing-store",
         )
