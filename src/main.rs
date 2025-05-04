@@ -1,6 +1,3 @@
-#![feature(async_closure)]
-#![feature(trait_upcasting)]
-
 extern crate structopt;
 extern crate tracing;
 
