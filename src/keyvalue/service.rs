@@ -160,6 +160,7 @@ mod tests {
                 .lock()
                 .await
                 .apply(&Bytes::from(copy))
+                .await
                 .expect("bad payload");
             Ok(EntryId { term: 0, index: 0 })
         }
@@ -175,14 +176,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_get() {
-        let service = create_service();
+        let service = create_service().await;
         let store = service.store.clone();
         let server = TestRpcServer::run(KeyValueServer::new(service)).await;
 
         store
             .lock()
             .await
-            .set(Bytes::from("foo"), Bytes::from("bar"));
+            .set(Bytes::from("foo"), Bytes::from("bar"))
+            .await;
 
         let request = GetRequest {
             key: "foo".as_bytes().to_vec(),
@@ -203,7 +205,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_put() {
-        let service = create_service();
+        let service = create_service().await;
         let store = service.store.clone();
         let server = TestRpcServer::run(KeyValueServer::new(service)).await;
 
@@ -227,8 +229,8 @@ mod tests {
     }
 
     // Returns an instance of the service struct we're testing
-    fn create_service() -> KeyValueService {
-        let store = Arc::new(Mutex::new(MapStore::new()));
+    async fn create_service() -> KeyValueService {
+        let store = Arc::new(Mutex::new(MapStore::create_in_memory().await));
         KeyValueService {
             name: "test".into(),
             store: store.clone(),

@@ -1,15 +1,16 @@
 extern crate bytes;
 extern crate im;
 
+use crate::keyvalue::keyvalue_proto;
+use crate::keyvalue::keyvalue_proto::operation::Op::Set;
+use crate::keyvalue::persistence::{FilePersistence, Persistence};
+use crate::raft::{StateMachine, StateMachineResult};
+use async_trait::async_trait;
 use bytes::Bytes;
 use im::HashMap;
 use keyvalue_proto::{Entry, Operation, Snapshot};
 use prost::Message;
 use std::collections::VecDeque;
-
-use crate::keyvalue::keyvalue_proto;
-use crate::keyvalue::keyvalue_proto::operation::Op::Set;
-use crate::raft::{StateMachine, StateMachineResult};
 
 #[derive(Debug, Clone)]
 pub struct StoreError {
@@ -27,6 +28,7 @@ impl StoreError {
 // A versioned key-value store where both the key and the value type are bytes.
 // Each modification to the store creates a new version, leaving older versions
 // still accessible until trimmed.
+#[async_trait]
 pub trait Store {
     // Returns the latest value associated with the supplied key.
     fn get(&self, key: &Bytes) -> Option<Bytes>;
@@ -37,13 +39,7 @@ pub trait Store {
     fn get_at(&self, key: &Bytes, version: i64) -> Result<Option<Bytes>, StoreError>;
 
     // Updates the supplied (key, value) pair, creating a new version.
-    fn set(&mut self, key: Bytes, value: Bytes);
-
-    // Trims all versions smaller than the supplied version. In the event where
-    // this would lead to trimming all versions present, the latest version is
-    // preserved to avoid losing state entirely. As a corollary, this means
-    // that trimming can never cause the latest value to change.
-    fn trim(&mut self, version: i64);
+    async fn set(&mut self, key: Bytes, value: Bytes);
 
     // Returns the latest (highest) version present in this store.
     fn latest_version(&self) -> i64;
@@ -53,6 +49,9 @@ pub trait Store {
 pub struct MapStore {
     // Holds a contiguous sequence of versions. This list is never empty.
     versions: VecDeque<MapVersion>,
+
+    // If present, we will make sure all operations are reflected in persistently.
+    persistence: Option<Box<dyn Persistence + Send>>,
 }
 
 // Holds the data associated with a particular version of the store. The data
@@ -64,23 +63,32 @@ struct MapVersion {
 }
 
 impl MapStore {
-    pub fn new() -> Self {
+    pub async fn new(directory: Option<String>) -> Self {
         MapStore {
             versions: create_deque(MapVersion {
                 version: 0,
                 data: HashMap::new(),
             }),
+            persistence: match directory {
+                None => None,
+                Some(dir) => Some(Box::new(FilePersistence::create(dir).await)),
+            },
         }
     }
 
-    fn apply_operation(&mut self, operation: Operation) -> Result<(), StoreError> {
+    pub async fn create_in_memory() -> Self {
+        Self::new(None /* directory */).await
+    }
+
+    async fn apply_operation(&mut self, operation: Operation) -> Result<(), StoreError> {
         match operation.op {
             Some(Set(set)) => {
                 if !set.entry.is_some() {
                     return Err(StoreError::new("No entry present in 'set' operation"));
                 }
                 let entry = set.entry.unwrap();
-                self.set(Bytes::from(entry.key), Bytes::from(entry.value));
+                self.set(Bytes::from(entry.key), Bytes::from(entry.value))
+                    .await;
                 Ok(())
             }
             _ => Err(StoreError::new("Unrecognized operation type")),
@@ -115,6 +123,7 @@ impl MapStore {
     }
 }
 
+#[async_trait]
 impl Store for MapStore {
     fn get(&self, key: &Bytes) -> Option<Bytes> {
         self.get_at(key, self.latest_version())
@@ -132,20 +141,23 @@ impl Store for MapStore {
             .cloned())
     }
 
-    fn set(&mut self, key: Bytes, value: Bytes) {
+    async fn set(&mut self, key: Bytes, value: Bytes) {
         let latest = self.versions.back().unwrap();
         let new_version = latest.version + 1;
-        let new_data = latest.data.update(key, value);
+        let new_data = latest.data.update(key.clone(), value.clone());
+
+        if self.persistence.as_ref().is_some() {
+            let entry = Entry {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            };
+            self.persistence.as_mut().unwrap().add(&entry).await;
+        }
+
         self.versions.push_back(MapVersion {
             version: new_version,
             data: new_data,
         });
-    }
-
-    fn trim(&mut self, version: i64) {
-        while self.earliest_version() < version && self.num_versions() > 1 {
-            self.versions.pop_front();
-        }
     }
 
     fn latest_version(&self) -> i64 {
@@ -153,8 +165,9 @@ impl Store for MapStore {
     }
 }
 
+#[async_trait]
 impl StateMachine for MapStore {
-    fn apply(&mut self, payload: &Bytes) -> StateMachineResult {
+    async fn apply(&mut self, payload: &Bytes) -> StateMachineResult {
         let parsed = Operation::decode(payload.to_owned());
         if parsed.is_err() {
             return Err(format!(
@@ -162,7 +175,7 @@ impl StateMachine for MapStore {
                 parsed.err().unwrap()
             ));
         }
-        let applied = self.apply_operation(parsed.unwrap());
+        let applied = self.apply_operation(parsed.unwrap()).await;
         if applied.is_err() {
             return Err(format!(
                 "Failed to apply operation: {:?}",
@@ -229,7 +242,7 @@ mod tests {
     fn make_set_op(k: &Bytes, v: &Bytes) -> Operation {
         Operation {
             op: Some(Set(SetOperation {
-                entry: Some(keyvalue_proto::Entry {
+                entry: Some(Entry {
                     key: k.to_vec(),
                     value: v.to_vec(),
                 }),
@@ -237,25 +250,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_map_store_get_set() {
-        let mut store = MapStore::new();
+    #[tokio::test]
+    async fn test_map_store_get_set() {
+        let mut store = MapStore::create_in_memory().await;
 
         let k = Bytes::from("some-key");
         assert!(store.get(&k).is_none());
 
         let v1 = Bytes::from("value1");
-        store.set(k.clone(), v1.clone());
+        store.set(k.clone(), v1.clone()).await;
         assert_eq!(v1, store.get(&k).unwrap());
 
         let v2 = Bytes::from("value2");
-        store.set(k.clone(), v2.clone());
+        store.set(k.clone(), v2.clone()).await;
         assert_eq!(v2, store.get(&k).unwrap());
     }
 
-    #[test]
-    fn test_map_store_apply_happy() {
-        let mut store = MapStore::new();
+    #[tokio::test]
+    async fn test_map_store_apply_happy() {
+        let mut store = MapStore::create_in_memory().await;
 
         let k = Bytes::from("some-key");
         let v = Bytes::from("some-value");
@@ -264,35 +277,35 @@ mod tests {
         let serialized = op.encode_to_vec();
 
         assert!(store.get(&k).is_none());
-        store.apply(&Bytes::from(serialized)).expect("apply");
+        store.apply(&Bytes::from(serialized)).await.expect("apply");
         assert_eq!(v, store.get(&k).unwrap());
     }
 
-    #[test]
-    fn test_map_store_apply_malformed() {
-        let mut store = MapStore::new();
+    #[tokio::test]
+    async fn test_map_store_apply_malformed() {
+        let mut store = MapStore::create_in_memory().await;
 
         let gibberish = Bytes::from("not an actual valid proto");
-        assert!(store.apply(&gibberish).is_err());
+        assert!(store.apply(&gibberish).await.is_err());
     }
 
-    #[test]
-    fn test_map_store_snapshot() {
+    #[tokio::test]
+    async fn test_map_store_snapshot() {
         let k1 = Bytes::from("key1");
         let v1 = Bytes::from("value1");
         let k2 = Bytes::from("key2");
         let v2 = Bytes::from("value2");
 
-        let mut store = MapStore::new();
-        store.set(k1.clone(), v1.clone());
+        let mut store = MapStore::create_in_memory().await;
+        store.set(k1.clone(), v1.clone()).await;
         assert_eq!(store.latest_version(), 1);
 
         let snap = store.create_snapshot();
 
-        let mut other_store = MapStore::new();
-        other_store.set(k2.clone(), v2.clone());
-        other_store.set(k2.clone(), v2.clone());
-        other_store.set(k2.clone(), v2.clone());
+        let mut other_store = MapStore::create_in_memory().await;
+        other_store.set(k2.clone(), v2.clone()).await;
+        other_store.set(k2.clone(), v2.clone()).await;
+        other_store.set(k2.clone(), v2.clone()).await;
         assert_eq!(other_store.latest_version(), 3);
 
         // Check that the value present in the snapshot is not in the store.
@@ -306,48 +319,35 @@ mod tests {
         assert_eq!(other_store.latest_version(), 1);
     }
 
-    #[test]
-    fn test_map_store_load_snapshot_malformed() {
-        let mut store = MapStore::new();
+    #[tokio::test]
+    async fn test_map_store_load_snapshot_malformed() {
+        let mut store = MapStore::create_in_memory().await;
 
         let gibberish = Bytes::from("not an actual valid proto");
         assert!(store.load_snapshot(&gibberish).is_err());
     }
 
-    #[test]
-    fn test_map_store_versions() {
+    #[tokio::test]
+    async fn test_map_store_versions() {
         let k1 = Bytes::from("key1");
         let v1 = Bytes::from("bar");
         let v2 = Bytes::from("baz");
         let v3 = Bytes::from("fib");
-        let mut store = MapStore::new();
+        let mut store = MapStore::create_in_memory().await;
         assert_eq!(store.latest_version(), 0);
 
-        store.set(k1.clone(), v1.clone());
+        store.set(k1.clone(), v1.clone()).await;
         assert_eq!(store.latest_version(), 1);
 
-        store.set(k1.clone(), v2.clone());
+        store.set(k1.clone(), v2.clone()).await;
         assert_eq!(store.latest_version(), 2);
 
-        store.set(k1.clone(), v3.clone());
+        store.set(k1.clone(), v3.clone()).await;
         assert_eq!(store.latest_version(), 3);
 
         // Check that the versions have been updated correctly.
         assert_eq!(store.get_at(&k1, 1).unwrap().unwrap(), &v1);
         assert_eq!(store.get_at(&k1, 2).unwrap().unwrap(), &v2);
         assert_eq!(store.get_at(&k1, 3).unwrap().unwrap(), &v3);
-
-        // Trim versions 0 and 1 above.
-        store.trim(2);
-
-        assert!(store.get_at(&k1, 1).is_err());
-        assert_eq!(store.get_at(&k1, 2).unwrap().unwrap(), &v2);
-        assert_eq!(store.get_at(&k1, 3).unwrap().unwrap(), &v3);
-
-        // Trim everything, should preserve the latest version.
-        store.trim(17);
-
-        assert_eq!(store.get_at(&k1, 3).unwrap().unwrap(), &v3);
-        assert_eq!(store.get(&k1).unwrap(), &v3);
     }
 }

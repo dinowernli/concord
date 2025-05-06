@@ -69,7 +69,7 @@ fn make_address(address: &Server) -> SocketAddr {
 //#[instrument(skip(all,diagnostics))]
 async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<Diagnostics>>) {
     let server = address.name.to_string();
-    let kv_store = Arc::new(Mutex::new(MapStore::new()));
+    let kv_store = Arc::new(Mutex::new(MapStore::create_in_memory().await));
 
     // The initial Raft cluster consists of only the first 3 entries, the other 2 remain
     // idle.
