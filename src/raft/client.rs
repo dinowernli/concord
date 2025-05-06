@@ -17,6 +17,12 @@ use crate::raft::raft_proto::{
 };
 use crate::raft_proto::raft_client::RaftClient;
 
+// How long to wait if the server points us to a new leader.
+const NEW_LEADER_WAIT_MS: u64 = 5;
+// How long to wait if the server tells us there is no leader. This is a bit
+// longer to allow the cluster to elect a new leader.
+const NO_LEADER_WAIT_MS: u64 = 80;
+
 // Returns a new client instance talking to a Raft cluster.
 // - address: The address this client is running on. Mostly used for logging.
 // - member: The address of a (any) member of the Raft cluster.
@@ -103,18 +109,19 @@ impl ClientImpl {
         let mut leader = self.leader.lock().await.clone();
         let attempts = self.max_leader_follow_attempts;
         for _ in 0..attempts {
-            match operation(leader.clone()).await {
+            let retry_wait_ms = match operation(leader.clone()).await {
                 Failure(status) => return Err(status),
                 Success(result) => return Ok(result),
                 NewLeader(Some(new_leader)) => {
                     self.update_leader(&new_leader).await;
                     leader = new_leader;
+                    NEW_LEADER_WAIT_MS
                 }
                 // Right indicates not leader, but if this is empty we don't have
                 // an updated leader yet, just retry without doing anything.
-                NewLeader(None) => (),
-            }
-            sleep(Duration::from_millis(300)).await;
+                NewLeader(None) => NO_LEADER_WAIT_MS,
+            };
+            sleep(Duration::from_millis(retry_wait_ms)).await;
         }
         Err(tonic::Status::internal(format!(
             "Failed to contact leader after {} attempts",
