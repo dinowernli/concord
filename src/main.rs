@@ -90,7 +90,9 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
         Some(server_diagnostics),
         Options::default(),
         Some(DEFAULT_FAILURE_OPTIONS),
-    );
+    )
+    .await;
+
     raft.start().await;
     let raft_grpc = RaftServer::new(raft);
 

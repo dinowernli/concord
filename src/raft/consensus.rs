@@ -33,7 +33,7 @@ use crate::raft::failure_injection::FailureOptions;
 use crate::raft::raft_proto::entry::Data;
 use crate::raft::raft_proto::entry::Data::{Config, Payload};
 use crate::raft::raft_proto::{ChangeConfigRequest, ChangeConfigResponse};
-use crate::raft::store::Store;
+use crate::raft::store::{LogSnapshot, Store};
 use crate::raft_proto::raft_server::Raft;
 
 const RPC_TIMEOUT_MS: u64 = 100;
@@ -81,7 +81,7 @@ pub struct RaftImpl {
 }
 
 impl RaftImpl {
-    pub fn new(
+    pub async fn new(
         server: &Server,
         all: &Vec<Server>,
         state_machine: Arc<Mutex<dyn StateMachine + Send>>,
@@ -89,8 +89,18 @@ impl RaftImpl {
         options: Options,
         failure_injection: Option<FailureOptions>,
     ) -> RaftImpl {
+        let snapshot_bytes = state_machine.lock().await.create_snapshot();
+        let snapshot = LogSnapshot {
+            snapshot: snapshot_bytes,
+            last: EntryId {
+                term: -1,
+                index: -1,
+            },
+        };
+
         let store = Store::new(
             state_machine,
+            snapshot,
             options.compaction_threshold_bytes,
             server.name.as_str(),
         );
@@ -621,19 +631,14 @@ impl RaftState {
     // Returns a request which the leader can send to a follower in order to install the
     // same snapshot currently held on the leader.
     fn create_snapshot_request(&self) -> InstallSnapshotRequest {
-        let mut snapshot: Vec<u8> = vec![];
-        let mut last: Option<EntryId> = None;
-        match self.store.get_latest_snapshot() {
-            None => (),
-            Some(snap) => {
-                snapshot = snap.snapshot.to_vec();
-                last = Some(snap.last.clone());
-            }
-        }
+        let snap = self.store.get_latest_snapshot();
+        let bytes = snap.snapshot.to_vec();
+        let last = Some(snap.last.clone());
+
         InstallSnapshotRequest {
             term: self.term,
             leader: Some(self.cluster.me()),
-            snapshot,
+            snapshot: bytes,
             last,
         }
     }
@@ -1043,7 +1048,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_initial_state() {
-        let raft = create_raft();
+        let raft = create_raft().await;
         let state = raft.state.lock().await;
         assert_eq!(state.role, RaftRole::Follower);
         assert_eq!(state.term, 0);
@@ -1054,7 +1059,7 @@ mod tests {
     // sending those same entries succeeds.
     #[tokio::test]
     async fn test_load_snapshot_and_append() {
-        let raft = create_raft();
+        let raft = create_raft().await;
         let raft_state = raft.state.clone();
         let server = TestRpcServer::run(RaftServer::new(raft)).await;
 
@@ -1119,7 +1124,7 @@ mod tests {
     // follower's log grows too large, it will correctly compact.
     #[tokio::test]
     async fn test_append_and_compact() {
-        let raft = create_raft();
+        let raft = create_raft().await;
         let raft_state = raft.state.clone();
         let server = TestRpcServer::run(RaftServer::new(raft)).await;
 
@@ -1199,15 +1204,7 @@ mod tests {
             let mut state = raft_state.lock().await;
             state.store.try_compact().await;
             assert!(state.store.log.is_index_compacted(0)); // Compacted
-            assert_eq!(
-                state
-                    .store
-                    .get_latest_snapshot()
-                    .expect("snapshot")
-                    .last
-                    .index,
-                3
-            )
+            assert_eq!(state.store.get_latest_snapshot().last.index, 3)
         }
     }
 
@@ -1222,7 +1219,7 @@ mod tests {
         EntryId { term, index }
     }
 
-    fn create_raft() -> RaftImpl {
+    async fn create_raft() -> RaftImpl {
         let servers = create_fake_server_list();
         RaftImpl::new(
             &servers[0].clone(),
@@ -1232,6 +1229,7 @@ mod tests {
             create_config_for_testing(),
             None, /* failure injection */
         )
+        .await
     }
 
     fn create_config_for_testing() -> Options {

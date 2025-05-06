@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 pub struct Store {
     pub log: LogSlice,
     state_machine: Arc<Mutex<dyn StateMachine + Send>>,
-    snapshot: Option<LogSnapshot>,
+    snapshot: LogSnapshot,
     config_info: ConfigInfo,
 
     listener_uid: i64,
@@ -55,20 +55,22 @@ impl ConfigInfo {
 impl Store {
     pub fn new(
         state_machine: Arc<Mutex<dyn StateMachine + Send>>,
+        initial_snapshot: LogSnapshot,
         compaction_threshold_bytes: i64,
         name: &str,
     ) -> Self {
+        let index = initial_snapshot.last.index;
         Self {
             log: LogSlice::initial(),
             state_machine,
-            snapshot: None,
+            snapshot: initial_snapshot,
             config_info: ConfigInfo::empty(),
 
             listener_uid: 0,
             listeners: BTreeSet::new(),
 
-            committed: -1,
-            applied: -1,
+            committed: index,
+            applied: index,
 
             compaction_threshold_bytes,
             name: name.to_string(),
@@ -82,7 +84,7 @@ impl Store {
     }
 
     // Returns a copy of the latest snapshot backing this store, if any.
-    pub fn get_latest_snapshot(&self) -> Option<LogSnapshot> {
+    pub fn get_latest_snapshot(&self) -> LogSnapshot {
         self.snapshot.clone()
     }
 
@@ -132,7 +134,7 @@ impl Store {
                 snapshot: self.state_machine.lock().await.create_snapshot(),
                 last: latest_id.clone(),
             };
-            self.snapshot = Some(snap);
+            self.snapshot = snap;
 
             // Note that we prefer not to clear the log slice entirely
             // because although losing uncommitted entries is safe, the
@@ -228,7 +230,7 @@ impl Store {
 
         self.applied = last.index;
         self.committed = last.index;
-        self.snapshot = Some(LogSnapshot { last, snapshot });
+        self.snapshot = LogSnapshot { last, snapshot };
 
         Status::ok("")
     }
@@ -352,8 +354,17 @@ mod tests {
     const COMPACTION_THRESHOLD_BYTES: i64 = 5000;
 
     fn make_store() -> Store {
+        let state_machine = FakeStateMachine::new();
+        let snapshot = LogSnapshot {
+            last: EntryId {
+                term: -1,
+                index: -1,
+            },
+            snapshot: state_machine.create_snapshot(),
+        };
         Store::new(
-            Arc::new(Mutex::new(FakeStateMachine::new())),
+            Arc::new(Mutex::new(state_machine)),
+            snapshot,
             COMPACTION_THRESHOLD_BYTES,
             "testing-store",
         )
@@ -364,7 +375,6 @@ mod tests {
         let store = make_store();
         assert_eq!(store.committed_index(), -1);
         assert_eq!(store.applied, -1);
-        assert!(store.get_latest_snapshot().is_none());
         assert_eq!(store.next_index(), 0);
     }
 
@@ -453,7 +463,8 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot() {
         let mut store = make_store();
-        assert!(store.get_latest_snapshot().is_none());
+        assert_eq!(store.get_latest_snapshot().last.term, -1);
+        assert_eq!(store.get_latest_snapshot().last.index, -1);
 
         store
             .install_snapshot(
@@ -467,10 +478,8 @@ mod tests {
         assert_eq!(22, store.committed_index());
 
         let snap = store.get_latest_snapshot();
-        assert!(snap.is_some());
-        let last = snap.unwrap().last;
-        assert_eq!(17, last.term);
-        assert_eq!(22, last.index);
+        assert_eq!(17, snap.last.term);
+        assert_eq!(22, snap.last.index);
     }
 
     #[test]
