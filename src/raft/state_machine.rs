@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use bytes::Bytes;
 
 // Result of executing an operation on the state machine.
@@ -5,10 +6,11 @@ pub type StateMachineResult = Result<(), String>;
 
 // A state machine kept on every server in a raft cluster. The consensus
 // implementation applies payloads once they are committed.
+#[async_trait]
 pub trait StateMachine {
     // Applies the supplied payload and incorporates it in the state of the
     // state machine.
-    fn apply(&mut self, operation: &Bytes) -> StateMachineResult;
+    async fn apply(&mut self, operation: &Bytes) -> StateMachineResult;
 
     // Creates a snapshot of the full current state in a format that can loaded
     // with a call to 'load_snapshot'.

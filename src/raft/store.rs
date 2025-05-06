@@ -244,7 +244,12 @@ impl Store {
             let entry_id = entry.id.expect("id").clone();
 
             if let Some(Data::Payload(bytes)) = entry.data {
-                let result = self.state_machine.lock().await.apply(&Bytes::from(bytes));
+                let result = self
+                    .state_machine
+                    .lock()
+                    .await
+                    .apply(&Bytes::from(bytes))
+                    .await;
                 match result {
                     Ok(()) => {
                         debug!(entry=%entry_id_key(&entry_id), "applied");
