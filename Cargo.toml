@@ -5,28 +5,27 @@ authors = ["Dino Wernli <dinowernli@gmail.com>"]
 edition = "2021"
 
 [dependencies]
-async-std = {version = "1.12", features = ["attributes"]}
+async-std = {version = "1.13"}
 async-trait = "0.1.80"
-axum = "0.6.12"
+axum = "0.8"
+axum_tonic = "0.3"
 bytes = "1.6"
 chrono = "0.4"
 futures = "0.3"
-hyper="0.14.25"
-multiplex-tonic-hyper = "0.1"
 im = "15"
-prost = "0.12"
+prost = "0.13.5"
 rand = "0.8"
 reqwest = "0.12"
 structopt = "0.3"
 timer = "0.2"
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }
-tokio-stream = { version = "0.1.15", features = ["net"] }
-tonic = "0.11"
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.12.3"
 tracing = "0.1.40"
 tracing-subscriber = {version = "0.3.1", features = ["env-filter"]}
-tower = "0.4.13"
+tower = "0.5.2"
 pin-project = "1.1"
 querystring = "1.1"
 
 [build-dependencies]
-tonic-build = "0.11"
+tonic-build = "0.12.3"
