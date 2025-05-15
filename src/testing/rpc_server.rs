@@ -9,7 +9,6 @@ use tonic::body::BoxBody;
 use tonic::codegen::http::{Request, Response};
 use tonic::codegen::Service;
 use tonic::server::NamedService;
-use tonic::transport::Body;
 
 // A helper struct which can be used to test grpc services. Runs a real server
 // which binds to an arbitrary port and provides access to the resulting port.
@@ -26,7 +25,7 @@ impl TestRpcServer {
     // anything goes wrong during setup.
     pub async fn run<S>(service: S) -> Self
     where
-        S: Service<Request<Body>, Response = Response<BoxBody>, Error = Infallible>
+        S: Service<Request<BoxBody>, Response = Response<BoxBody>, Error = Infallible>
             + NamedService
             + Clone
             + Send
@@ -44,7 +43,7 @@ impl TestRpcServer {
 
     async fn start<S>(&mut self, service: S)
     where
-        S: Service<Request<Body>, Response = Response<BoxBody>, Error = Infallible>
+        S: Service<Request<BoxBody>, Response = Response<BoxBody>, Error = Infallible>
             + NamedService
             + Clone
             + Send

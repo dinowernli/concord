@@ -1,11 +1,13 @@
 use axum::routing::get;
 use axum::Router;
-use hyper::{Body, StatusCode};
 use std::sync::Arc;
 use tonic::Request;
 
 use crate::keyvalue::keyvalue_proto::key_value_server::KeyValue;
 use crate::keyvalue::keyvalue_proto::GetRequest;
+use axum::body::Body;
+use axum::http::Request as HttpRequest;
+use axum::http::StatusCode;
 
 // Provides an HTTP interface for the supplied KeyValue instance.
 #[derive(Clone)]
@@ -23,25 +25,19 @@ impl HttpHandler {
      * include /get?key=foo.
      */
     pub fn routes(self: Arc<Self>) -> Router {
-        let hello = move |req: hyper::Request<Body>| async move { self.handle_get(req).await };
-        Router::new().route("/get", get(hello))
+        let handler = move |request| async move { self.handle_get(request).await };
+        Router::new().route("/get", get(handler))
     }
 
-    fn make_response(code: StatusCode, message: String) -> hyper::Response<Body> {
-        hyper::Response::builder()
-            .status(code)
-            .body(Body::from(format!("{}\n", message)))
-            .unwrap()
+    fn invalid(message: String) -> (StatusCode, String) {
+        (StatusCode::BAD_REQUEST, message)
     }
 
-    fn invalid(message: String) -> hyper::Response<Body> {
-        Self::make_response(StatusCode::BAD_REQUEST, message)
-    }
-
-    async fn handle_get(&self, request: hyper::Request<Body>) -> hyper::Response<Body> {
+    async fn handle_get(self: Arc<Self>, request: HttpRequest<Body>) -> (StatusCode, String) {
+        let kv = self.service.clone();
         let query = match request.uri().query() {
             Some(q) => q,
-            None => return HttpHandler::invalid("must pass query".to_string()),
+            None => return Self::invalid("must pass query".to_string()),
         };
 
         let parsed = querystring::querify(query);
@@ -51,7 +47,7 @@ impl HttpHandler {
             .map(|(_, b)| b.to_string())
         {
             Some(value) => value,
-            _ => return HttpHandler::invalid("must pass key parameter".to_string()),
+            _ => return Self::invalid("must pass key parameter".to_string()),
         };
 
         let request = Request::new(GetRequest {
@@ -59,27 +55,24 @@ impl HttpHandler {
             version: -1,
         });
 
-        match self.service.get(request).await {
+        match kv.get(request).await {
             Ok(p) => {
                 let proto = p.into_inner();
                 match proto.entry {
                     Some(e) => match String::from_utf8(e.value) {
-                        Ok(value) => HttpHandler::make_response(
+                        Ok(value) => (
                             StatusCode::OK,
                             format!("{}={}, version={}", key, value, proto.version),
                         ),
-                        _ => HttpHandler::make_response(
+                        _ => (
                             StatusCode::BAD_REQUEST,
                             format!("failed to parse value as utf8 for key {}", key),
                         ),
                     },
-                    None => HttpHandler::make_response(
-                        StatusCode::NOT_FOUND,
-                        format!("no value for key {}", key),
-                    ),
+                    None => (StatusCode::NOT_FOUND, format!("no value for key {}", key)),
                 }
             }
-            Err(status) => HttpHandler::make_response(
+            Err(status) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to query keyvalue store {}", status.to_string()),
             ),

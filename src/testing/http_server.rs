@@ -2,6 +2,8 @@ extern crate tokio_stream;
 
 use axum::routing::IntoMakeService;
 use axum::Router;
+use std::net::SocketAddr;
+use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::Sender;
 
@@ -37,16 +39,15 @@ impl TestHttpServer {
         self.shutdown = Some(tx);
 
         // Assign to an arbitrary free port
-        let addr = ([127, 0, 0, 1], 0).into();
-        let server_builder = hyper::Server::bind(&addr);
-        self.port = Some(server_builder.local_addr().port());
+        let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+        let listener = TcpListener::bind(addr).await.expect("Failed to bind");
+        self.port = Some(listener.local_addr().unwrap().port());
 
         tokio::spawn(async {
             let shutdown = async {
                 rx.await.ok();
             };
-            server_builder
-                .serve(router)
+            axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown)
                 .await
                 .expect("server");

@@ -2,17 +2,18 @@ extern crate structopt;
 extern crate tracing;
 
 use async_std::sync::{Arc, Mutex};
-use axum::Router;
+use axum::routing::Router;
+use axum_tonic::NestTonic;
+use axum_tonic::RestGrpcService;
 use futures::future::join5;
 use futures::future::join_all;
-use multiplex_tonic_hyper::MakeMultiplexer;
 use rand::seq::SliceRandom;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::time::Duration;
 use structopt::StructOpt;
+use tokio::net::TcpListener;
 use tokio::time::{sleep, Instant};
-use tower::make::Shared;
 use tracing::{debug, error, info, info_span, Instrument};
 use tracing_subscriber::EnvFilter;
 
@@ -100,23 +101,15 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
     // TODO(dino): See if we can reuse/share the "kv1" instance above.
     let kv2 = KeyValueService::new(server.as_str(), &address, kv_store.clone());
     let kv_http = Arc::new(keyvalue::HttpHandler::new(Arc::new(kv2)));
-    let web_service = Router::new()
-        .nest("/keyvalue", kv_http.routes())
-        .into_make_service();
+    let web = Router::new().nest("/keyvalue", kv_http.routes());
+    let grpc = Router::new().nest_tonic(raft_grpc).nest_tonic(kv_grpc);
 
-    // Put the pieces together to serve on a single port.
-    let grpc_service = Shared::new(
-        tonic::transport::Server::builder()
-            .add_service(raft_grpc)
-            .add_service(kv_grpc)
-            .into_service(),
-    );
-    let multiplexer = MakeMultiplexer::new(grpc_service, web_service);
-    let serve = hyper::Server::bind(&make_address(&address)).serve(multiplexer);
+    let rest_grpc = RestGrpcService::new(web, grpc).into_make_service();
+    let listener = TcpListener::bind(&make_address(&address)).await.expect("bind");
 
     info!("Started server (http, grpc) on port {}", address.port);
 
-    match serve.await {
+    match axum::serve(listener, rest_grpc).await {
         Ok(()) => info!("Serving terminated successfully"),
         Err(message) => error!("Serving terminated unsuccessfully: {}", message),
     }
