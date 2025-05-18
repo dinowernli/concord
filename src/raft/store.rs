@@ -1,8 +1,9 @@
-use crate::raft::StateMachine;
 use crate::raft::log::{ContainsResult, LogSlice};
+use crate::raft::persistence::{Persistence, PersistenceOptions};
 use crate::raft::raft_common_proto::entry::Data;
 use crate::raft::raft_common_proto::entry::Data::Config;
 use crate::raft::raft_common_proto::{Entry, EntryId, Server};
+use crate::raft::{StateMachine, persistence};
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::channel::oneshot::{Receiver, Sender, channel};
@@ -22,6 +23,7 @@ pub struct Store {
     compaction_threshold_bytes: i64,
     name: String,
     state_machine: Arc<Mutex<dyn StateMachine + Send>>,
+    persistence: Box<dyn Persistence + Send>,
 
     // Persistent raft state as defined in the paper.
     log: LogSlice,
@@ -44,7 +46,7 @@ pub struct ConfigInfo {
     // The latest appended entry containing a cluster config.
     pub latest: Option<Entry>,
 
-    // Whether or not the latest entry has been committed.
+    // Whether the latest entry has been committed.
     pub committed: bool,
 }
 
@@ -58,17 +60,23 @@ impl ConfigInfo {
 }
 
 impl Store {
-    pub fn new(
+    pub async fn new(
         state_machine: Arc<Mutex<dyn StateMachine + Send>>,
         initial_snapshot: LogSnapshot,
         compaction_threshold_bytes: i64,
         name: &str,
+        persistence_options: PersistenceOptions,
     ) -> Self {
+        let persistence = persistence::new(persistence_options)
+            .await
+            .expect("create persistence");
+        
         let index = initial_snapshot.last.index;
         Self {
             name: name.to_string(),
             compaction_threshold_bytes,
             state_machine,
+            persistence,
 
             log: LogSlice::initial(),
             snapshot: initial_snapshot,
@@ -419,7 +427,7 @@ mod tests {
 
     const COMPACTION_THRESHOLD_BYTES: i64 = 5000;
 
-    fn make_store() -> Store {
+    async fn make_store() -> Store {
         let state_machine = FakeStateMachine::new();
         let snapshot = LogSnapshot {
             last: EntryId {
@@ -433,12 +441,14 @@ mod tests {
             snapshot,
             COMPACTION_THRESHOLD_BYTES,
             "testing-store",
+            PersistenceOptions::NoPersistenceForTesting,
         )
+        .await
     }
 
-    #[test]
-    fn test_initial() {
-        let store = make_store();
+    #[tokio::test]
+    async fn test_initial() {
+        let store = make_store().await;
         assert_eq!(store.committed_index(), -1);
         assert_eq!(store.applied, -1);
         assert_eq!(store.next_index(), 0);
@@ -447,7 +457,7 @@ mod tests {
     #[tokio::test]
     #[should_panic]
     async fn test_commit_to_bad_index() {
-        let mut store = make_store();
+        let mut store = make_store().await;
         store.append(2, Payload(Vec::new()));
 
         // Attempt to "commit to" a value which hasn't yet been appended.
@@ -456,7 +466,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_to() {
-        let mut store = make_store();
+        let mut store = make_store().await;
         let eid = store.append(2, Payload(Vec::new()));
 
         // Should succeed.
@@ -468,7 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_listener() {
-        let mut store = make_store();
+        let mut store = make_store().await;
         let receiver = store.add_listener(2);
 
         store.append(67, Payload(Vec::new()));
@@ -486,7 +496,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_listener_multi() {
-        let mut store = make_store();
+        let mut store = make_store().await;
         let receiver1 = store.add_listener(0);
         let receiver2 = store.add_listener(1);
         let receiver3 = store.add_listener(0);
@@ -501,7 +511,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_listener_past() {
-        let mut store = make_store();
+        let mut store = make_store().await;
 
         store.append(67, Payload(Vec::new()));
         store.append(67, Payload(Vec::new()));
@@ -513,7 +523,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_compaction() {
-        let mut store = make_store();
+        let mut store = make_store().await;
         let eid = store.append(
             67,
             Payload(vec![0; 2 * COMPACTION_THRESHOLD_BYTES as usize]),
@@ -528,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot() {
-        let mut store = make_store();
+        let mut store = make_store().await;
         assert_eq!(store.get_latest_snapshot().last.term, -1);
         assert_eq!(store.get_latest_snapshot().last.index, -1);
 
@@ -548,9 +558,9 @@ mod tests {
         assert_eq!(22, snap.last.index);
     }
 
-    #[test]
-    fn test_config_info_append() {
-        let mut store = make_store();
+    #[tokio::test]
+    async fn test_config_info_append() {
+        let mut store = make_store().await;
         assert!(store.config_info.latest.is_none());
 
         store.append(17, Payload(Vec::new()));
@@ -566,7 +576,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_config_info_append_all() {
-        let mut store = make_store();
+        let mut store = make_store().await;
         assert!(store.get_config_info().latest.is_none());
 
         store.append_all(&vec![

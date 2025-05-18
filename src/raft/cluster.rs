@@ -1,9 +1,9 @@
 use crate::raft::failure_injection::{ChannelInfo, FailureInjectionMiddleware, FailureOptions};
+use crate::raft::store::ConfigInfo;
+
 use crate::raft::raft_common_proto::entry::Data::Config;
 use crate::raft::raft_common_proto::{ClusterConfig, Server};
 use crate::raft::raft_service_proto::raft_client::RaftClient;
-use crate::raft::store::ConfigInfo;
-
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint, Error};

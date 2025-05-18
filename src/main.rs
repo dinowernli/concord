@@ -8,12 +8,14 @@ use axum_tonic::RestGrpcService;
 use futures::future::join_all;
 use futures::future::join5;
 use rand::seq::SliceRandom;
+use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::time::Duration;
 use structopt::StructOpt;
 use tokio::net::TcpListener;
 use tokio::time::{Instant, sleep};
+use tower::make::Shared;
 use tracing::{Instrument, debug, error, info, info_span};
 use tracing_subscriber::EnvFilter;
 
@@ -35,6 +37,8 @@ const DEFAULT_FAILURE_OPTIONS: FailureOptions = FailureOptions {
     latency_probability: 0.05,
     latency_ms: 50,
 };
+
+const CLUSTER_NAME: &str = "dev-cluster";
 
 #[derive(Debug, StructOpt, Copy, Clone)]
 struct Arguments {
@@ -65,8 +69,7 @@ fn make_address(address: &Server) -> SocketAddr {
         .unwrap()
 }
 
-//#[instrument(skip(all,diagnostics))]
-async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<Diagnostics>>) {
+async fn create_sever(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<Diagnostics>>) -> Shared<RestGrpcService> {
     let server = address.name.to_string();
     let kv_store = Arc::new(Mutex::new(MapStore::new()));
 
@@ -82,18 +85,30 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
     let kv1 = KeyValueService::new(server.as_str(), &address, kv_store.clone());
     let kv_grpc = KeyValueServer::new(kv1);
 
+    // Use something like /tmp/concord/<cluster>/<server> for persistence
+    let persistence_path = env::temp_dir()
+        .as_path()
+        .join("concord")
+        .join(CLUSTER_NAME)
+        .join(&server);
+    let options = Options::new(persistence_path.to_str().unwrap().as_ref());
+
     // Set up the grpc service for the raft participant.
     let raft = RaftImpl::new(
         address,
         &raft_cluster,
         kv_store.clone(), // The raft cluster participant is the one applying the KV writes.
         Some(server_diagnostics),
-        Options::default(),
+        options,
         Some(DEFAULT_FAILURE_OPTIONS),
     )
-    .await;
+        .await;
 
+    // TODO(dino): note that this causes instances to start trying to talk to other instances. So
+    // if initialization takes a sufficiently long time, some of the participants may not be able
+    // to talk to each other. We probably want to move this out of the service creation phase.
     raft.start().await;
+
     let raft_grpc = RaftServer::new(raft);
 
     // Set up the webservice serving the contents of the kvstore.
@@ -103,14 +118,17 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
     let web = Router::new().nest("/keyvalue", kv_http.routes());
     let grpc = Router::new().nest_tonic(raft_grpc).nest_tonic(kv_grpc);
 
-    let rest_grpc = RestGrpcService::new(web, grpc).into_make_service();
+    RestGrpcService::new(web, grpc).into_make_service()
+}
+
+//#[instrument(skip(all,diagnostics))]
+async fn run_server(address: Server, service: Shared<RestGrpcService>) {
     let listener = TcpListener::bind(&make_address(&address))
         .await
         .expect("bind");
 
     info!("Started server (http, grpc) on port {}", address.port);
-
-    match axum::serve(listener, rest_grpc).await {
+    match axum::serve(listener, service).await {
         Ok(()) => info!("Serving terminated successfully"),
         Err(message) => error!("Serving terminated unsuccessfully: {}", message),
     }
@@ -255,10 +273,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!("Starting {} servers", addresses.len());
 
     let diag = Arc::new(Mutex::new(Diagnostics::new()));
-    let mut servers = Vec::new();
+
+    let mut services: Vec<(Server, Shared<RestGrpcService>)> = Vec::new();
     for address in &addresses {
+        let service = create_sever(&address.clone(), &addresses, diag.clone()).await;
+        services.push((address.clone(), service));
+    }
+
+    let mut servers = Vec::new();
+    for (address, service) in services {
         let span = info_span!("serve", server=%address.name);
-        let running = run_server(&address, &addresses, diag.clone());
+        let running = run_server(address, service);
         servers.push(running.instrument(span));
     }
 
