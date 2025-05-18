@@ -1,11 +1,11 @@
-use crate::raft::error::{RaftError, RaftResult};
 use crate::raft::failure_injection::{ChannelInfo, FailureInjectionMiddleware, FailureOptions};
 use crate::raft::raft_common_proto::entry::Data::Config;
 use crate::raft::raft_common_proto::{ClusterConfig, Server};
 use crate::raft::raft_service_proto::raft_client::RaftClient;
 use crate::raft::store::ConfigInfo;
-use std::cmp::PartialEq;
+use crate::raft::error::{RaftError, RaftResult};
 
+use std::cmp::PartialEq;
 use async_std::sync::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

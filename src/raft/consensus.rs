@@ -18,6 +18,7 @@ use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 use diagnostics::ServerDiagnostics;
 use raft::StateMachine;
 use raft::log::ContainsResult;
+
 use raft::raft_common_proto::EntryId;
 use raft::raft_service_proto::{AppendRequest, AppendResponse, VoteRequest, VoteResponse};
 use raft::raft_service_proto::{CommitRequest, CommitResponse, StepDownRequest, StepDownResponse};
@@ -28,16 +29,16 @@ use crate::raft::cluster::{Cluster, QuorumResult};
 use crate::raft::cluster::{RaftClientType, key};
 use crate::raft::consensus::CommitError::{Internal, NotLeader};
 use crate::raft::consensus::RaftRole::Leader;
-use crate::raft::diagnostics;
 use crate::raft::error::{RaftError, RaftResult};
 use crate::raft::failure_injection::FailureOptions;
+use crate::raft::persistence::PersistenceOptions;
 use crate::raft::raft_common_proto::Server;
 use crate::raft::raft_common_proto::entry::Data;
 use crate::raft::raft_common_proto::entry::Data::{Config, Payload};
-use crate::raft::raft_service_proto;
 use crate::raft::raft_service_proto::raft_server::Raft;
 use crate::raft::raft_service_proto::{ChangeConfigRequest, ChangeConfigResponse};
 use crate::raft::store::{LogSnapshot, Store};
+use crate::raft::{diagnostics, raft_service_proto};
 
 const RPC_TIMEOUT_MS: u64 = 100;
 
@@ -61,18 +62,23 @@ pub struct Options {
     // entries stored locally.
     compaction_threshold_bytes: i64,
 
-    // How frequently to check whether or not a compaction is necessary.
+    // How frequently to check whether a compaction is necessary.
     compaction_check_periods_ms: i64,
+
+    // A directory on disk to use for persisting state.
+    persistence_options: PersistenceOptions,
 }
 
 impl Options {
-    pub fn default() -> Self {
+    pub fn new(persistence_directory: &str) -> Self {
+        let persistence = PersistenceOptions::Directory(persistence_directory.to_string());
         Options {
             follower_timeout_ms: 200,
             candidate_timeouts_ms: 300,
             leader_replicate_ms: 50,
             compaction_threshold_bytes: 10 * 1000 * 1000,
             compaction_check_periods_ms: 5000,
+            persistence_options: persistence,
         }
     }
 }
@@ -102,15 +108,18 @@ impl RaftImpl {
             },
         };
 
+        let persistence_options = options.persistence_options.clone();
         let store = Store::new(
             state_machine,
             snapshot,
             diagnostics.clone(),
             options.compaction_threshold_bytes,
             server.name.as_str(),
-        );
+            persistence_options
+        ).await;
 
         let cluster = Cluster::new_with_failures(server.clone(), all.as_slice(), failures.clone());
+
         RaftImpl {
             address: server.clone(),
             state: Arc::new(Mutex::new(RaftState {
@@ -1129,7 +1138,6 @@ fn add_jitter(lower: i64) -> u64 {
 mod tests {
     use crate::raft::cluster::testing::create_local_client_for_testing;
     use crate::raft::raft_common_proto::Entry;
-    use crate::raft::raft_common_proto::entry::Data;
     use crate::raft::raft_service_proto::raft_server::RaftServer;
     use crate::raft::testing::FakeStateMachine;
     use crate::testing::TestRpcServer;
@@ -1334,6 +1342,7 @@ mod tests {
             leader_replicate_ms: 100000000,
             compaction_threshold_bytes: 1000,
             compaction_check_periods_ms: 10000000000,
+            persistence_options: PersistenceOptions::NoPersistenceForTesting,
         }
     }
 
