@@ -1,11 +1,11 @@
+use crate::raft::StateMachine;
 use crate::raft::log::{ContainsResult, LogSlice};
 use crate::raft::raft_proto::entry::Data;
 use crate::raft::raft_proto::entry::Data::Config;
-use crate::raft::raft_proto::{Entry, EntryId};
-use crate::raft::StateMachine;
+use crate::raft::raft_proto::{Entry, EntryId, Server};
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
-use futures::channel::oneshot::{channel, Receiver, Sender};
+use futures::channel::oneshot::{Receiver, Sender, channel};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use tonic::Status;
@@ -18,19 +18,24 @@ use tracing::{debug, info, warn};
 // Also takes care of periodic compaction, updating listeners when the committed
 // portion reaches as certain index, etc.
 pub struct Store {
-    pub log: LogSlice,
+    // Dependencies and constants.
+    compaction_threshold_bytes: i64,
+    name: String,
     state_machine: Arc<Mutex<dyn StateMachine + Send>>,
+
+    // Persistent raft state as defined in the paper.
+    log: LogSlice,
     snapshot: LogSnapshot,
+    term: i64,
+    voted_for: Option<Server>,
+
+    // Non-persistent. Just bookkeeping.
+    committed: i64,
+    applied: i64,
     config_info: ConfigInfo,
 
     listener_uid: i64,
     listeners: BTreeSet<CommitListener>,
-
-    committed: i64,
-    applied: i64,
-
-    compaction_threshold_bytes: i64,
-    name: String,
 }
 
 // Holds information about cluster configuration.
@@ -61,19 +66,22 @@ impl Store {
     ) -> Self {
         let index = initial_snapshot.last.index;
         Self {
-            log: LogSlice::initial(),
+            name: name.to_string(),
+            compaction_threshold_bytes,
             state_machine,
+
+            log: LogSlice::initial(),
             snapshot: initial_snapshot,
+            term: 0,
+            voted_for: None,
+
+            // Non-persistent. Just bookkeeping.
+            committed: index,
+            applied: index,
             config_info: ConfigInfo::empty(),
 
             listener_uid: 0,
             listeners: BTreeSet::new(),
-
-            committed: index,
-            applied: index,
-
-            compaction_threshold_bytes,
-            name: name.to_string(),
         }
     }
 
@@ -118,6 +126,26 @@ impl Store {
         if is_any_config {
             self.update_config_info();
         }
+    }
+
+    pub fn term(&self) -> i64 {
+        self.term
+    }
+
+    pub fn voted_for(&self) -> Option<Server> {
+        self.voted_for.clone()
+    }
+
+    // Updates just the "voted_for" part of the persistent state.
+    pub fn update_voted_for(&mut self, voted_for: &Option<Server>) {
+        let term = self.term;
+        self.update_term_info(term, voted_for);
+    }
+
+    // Updates the term information in persistent state.
+    pub fn update_term_info(&mut self, term: i64, voted_for: &Option<Server>) {
+        self.term = term;
+        self.voted_for = voted_for.clone();
     }
 
     // Returns information about cluster config entries in the store.
@@ -176,6 +204,44 @@ impl Store {
 
         self.apply_committed().await;
         self.resolve_listeners();
+    }
+
+    // Returns true if the supplied index lies before the range of entries present
+    // in our in-memory log (e.g., because it was compacted into a snapshot).
+    pub fn is_index_compacted(&self, index: i64) -> bool {
+        self.log.is_index_compacted(index)
+    }
+
+    // Returns the entry id for the entry at the supplied index. Must only be
+    // called if the index is known to be present in memory.
+    //
+    // Note that for the entry immediately before the start of the log slice, the
+    // entry id can be returned, but not the full entry.
+    pub fn entry_id_at_index(&self, index: i64) -> EntryId {
+        self.log.id_at(index)
+    }
+
+    // Returns the highest index known to exist (even if the entry is not held
+    // in this instance). Returns -1 if there are no known entries at all.
+    pub fn last_known_log_entry_id(&self) -> &EntryId {
+        self.log.last_known_id()
+    }
+
+    // Returns true if the supplied last entry id is at least as up-to-date
+    // as the slice of the log tracked by this instance.
+    pub fn log_entry_is_up_to_date(&self, other_last: &EntryId) -> bool {
+        self.log.is_up_to_date(other_last)
+    }
+
+    // Returns true if the supplied entry is present in this slice.
+    pub fn log_contains(&self, query: &EntryId) -> ContainsResult {
+        self.log.contains(query)
+    }
+
+    // Returns all entries strictly after the supplied id. Must only be called
+    // if the supplied entry id is present in the slice.
+    pub fn get_entries_after(&self, entry_id: &EntryId) -> Vec<Entry> {
+        self.log.get_entries_after(entry_id)
     }
 
     // Registers a listener for the supplied index.
