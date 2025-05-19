@@ -98,7 +98,7 @@ impl LogSlice {
         }
 
         // Terms are equal, last index decides.
-        return other_last.index >= this_last.index;
+        other_last.index >= this_last.index
     }
 
     // Returns true if the supplied entry is present in this slice.
