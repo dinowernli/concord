@@ -1,7 +1,7 @@
 extern crate tokio_stream;
 
-use axum::Router;
 use axum::routing::IntoMakeService;
+use axum::Router;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;

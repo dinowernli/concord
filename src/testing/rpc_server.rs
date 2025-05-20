@@ -6,8 +6,8 @@ use tokio::sync::oneshot;
 use tokio::sync::oneshot::Sender;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::body::BoxBody;
-use tonic::codegen::Service;
 use tonic::codegen::http::{Request, Response};
+use tonic::codegen::Service;
 use tonic::server::NamedService;
 
 // A helper struct which can be used to test grpc services. Runs a real server

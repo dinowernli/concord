@@ -7,9 +7,9 @@ pub use http::HttpHandler;
 pub use service::KeyValueService;
 
 pub mod grpc {
-    pub use crate::keyvalue::keyvalue_proto::PutRequest;
     pub use crate::keyvalue::keyvalue_proto::key_value_client::KeyValueClient;
     pub use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
+    pub use crate::keyvalue::keyvalue_proto::PutRequest;
 }
 
 pub(in crate::keyvalue) mod http;

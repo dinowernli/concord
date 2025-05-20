@@ -4,8 +4,8 @@ use async_std::sync::Mutex;
 use async_trait::async_trait;
 use futures::Future;
 use tokio::time::sleep;
-use tonic::Request;
 use tonic::transport::{Channel, Error};
+use tonic::Request;
 use tracing::debug;
 
 use raft_proto::{CommitRequest, EntryId, Server, Status, StepDownRequest};
