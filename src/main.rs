@@ -5,16 +5,16 @@ use async_std::sync::{Arc, Mutex};
 use axum::routing::Router;
 use axum_tonic::NestTonic;
 use axum_tonic::RestGrpcService;
-use futures::future::join_all;
 use futures::future::join5;
+use futures::future::join_all;
 use rand::seq::SliceRandom;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::time::Duration;
 use structopt::StructOpt;
 use tokio::net::TcpListener;
-use tokio::time::{Instant, sleep};
-use tracing::{Instrument, debug, error, info, info_span};
+use tokio::time::{sleep, Instant};
+use tracing::{debug, error, info, info_span, Instrument};
 use tracing_subscriber::EnvFilter;
 
 use crate::keyvalue::grpc::KeyValueClient;
@@ -23,8 +23,8 @@ use crate::keyvalue::grpc::PutRequest;
 use crate::keyvalue::{KeyValueService, MapStore};
 use crate::raft::raft_proto;
 use crate::raft::{Diagnostics, FailureOptions, Options, RaftImpl};
-use crate::raft_proto::Server;
 use crate::raft_proto::raft_server::RaftServer;
+use crate::raft_proto::Server;
 
 mod keyvalue;
 mod raft;
@@ -105,9 +105,7 @@ async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<
     let grpc = Router::new().nest_tonic(raft_grpc).nest_tonic(kv_grpc);
 
     let rest_grpc = RestGrpcService::new(web, grpc).into_make_service();
-    let listener = TcpListener::bind(&make_address(&address))
-        .await
-        .expect("bind");
+    let listener = TcpListener::bind(&make_address(&address)).await.expect("bind");
 
     info!("Started server (http, grpc) on port {}", address.port);
 

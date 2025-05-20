@@ -13,7 +13,7 @@ use crate::keyvalue::keyvalue_proto::{
 };
 use crate::keyvalue::store::Store;
 use crate::raft::raft_proto::Server;
-use crate::raft::{Client, new_client};
+use crate::raft::{new_client, Client};
 
 pub struct KeyValueService {
     // A name for this service, used for debugging, log messages, etc.
@@ -140,8 +140,8 @@ mod tests {
     use crate::keyvalue::keyvalue_proto::key_value_client::KeyValueClient;
     use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
     use crate::keyvalue::store::MapStore;
-    use crate::raft::StateMachine;
     use crate::raft::raft_proto::EntryId;
+    use crate::raft::StateMachine;
     use crate::testing::TestRpcServer;
 
     use super::*;
