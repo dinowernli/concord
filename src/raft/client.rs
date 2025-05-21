@@ -9,9 +9,7 @@ use tonic::transport::{Channel, Error};
 use tracing::debug;
 
 use crate::raft::client::Outcome::{Failure, NewLeader, Success};
-use crate::raft::raft_common_proto;
 use crate::raft::raft_common_proto::{EntryId, Server};
-use crate::raft::raft_service_proto;
 use crate::raft::raft_service_proto::raft_client::RaftClient;
 use crate::raft::raft_service_proto::{
     ChangeConfigRequest, ChangeConfigResponse, CommitRequest, CommitResponse, Status,

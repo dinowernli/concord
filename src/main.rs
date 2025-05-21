@@ -53,6 +53,9 @@ struct Arguments {
 
     #[structopt(short = "r", long = "disable_reconfigure")]
     disable_reconfigure: bool,
+
+    #[structopt(short = "w", long = "wipe_persistence")]
+    wipe_persistence: bool,
 }
 
 fn server(host: &str, port: i32, name: &str) -> Server {
@@ -69,7 +72,12 @@ fn make_address(address: &Server) -> SocketAddr {
         .unwrap()
 }
 
-async fn create_sever(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<Diagnostics>>) -> Shared<RestGrpcService> {
+async fn create_sever(
+    address: &Server,
+    all: &Vec<Server>,
+    diagnostics: Arc<Mutex<Diagnostics>>,
+    arguments: &Arguments,
+) -> Shared<RestGrpcService> {
     let server = address.name.to_string();
     let kv_store = Arc::new(Mutex::new(MapStore::new()));
 
@@ -91,7 +99,11 @@ async fn create_sever(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mute
         .join("concord")
         .join(CLUSTER_NAME)
         .join(&server);
-    let options = Options::new(persistence_path.to_str().unwrap().as_ref());
+
+    let options = Options::new(
+        persistence_path.to_str().unwrap().as_ref(),
+        arguments.wipe_persistence,
+    );
 
     // Set up the grpc service for the raft participant.
     let raft = RaftImpl::new(
@@ -102,7 +114,7 @@ async fn create_sever(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mute
         options,
         Some(DEFAULT_FAILURE_OPTIONS),
     )
-        .await;
+    .await;
 
     // TODO(dino): note that this causes instances to start trying to talk to other instances. So
     // if initialization takes a sufficiently long time, some of the participants may not be able
@@ -276,7 +288,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut services: Vec<(Server, Shared<RestGrpcService>)> = Vec::new();
     for address in &addresses {
-        let service = create_sever(&address.clone(), &addresses, diag.clone()).await;
+        let service = create_sever(&address.clone(), &addresses, diag.clone(), &arguments).await;
         services.push((address.clone(), service));
     }
 

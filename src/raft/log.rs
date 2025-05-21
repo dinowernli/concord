@@ -37,7 +37,7 @@ impl LogSlice {
         LogSlice {
             entries: Vec::new(),
             size_bytes: 0,
-            previous_id: previous_id,
+            previous_id,
         }
     }
 
@@ -48,6 +48,11 @@ impl LogSlice {
             term: -1,
             index: -1,
         })
+    }
+
+    // Returns a reference to all entries present in this slice.
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
     }
 
     // Adds a new entry to the end of the slice. Returns the id of the
