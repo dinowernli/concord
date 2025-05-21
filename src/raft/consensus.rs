@@ -17,8 +17,6 @@ use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
 use diagnostics::ServerDiagnostics;
 use raft::StateMachine;
-use raft::log::ContainsResult;
-
 use raft::raft_common_proto::EntryId;
 use raft::raft_service_proto::{AppendRequest, AppendResponse, VoteRequest, VoteResponse};
 use raft::raft_service_proto::{CommitRequest, CommitResponse, StepDownRequest, StepDownResponse};
@@ -31,13 +29,13 @@ use crate::raft::consensus::CommitError::{Internal, NotLeader};
 use crate::raft::consensus::RaftRole::Leader;
 use crate::raft::error::{RaftError, RaftResult};
 use crate::raft::failure_injection::FailureOptions;
-use crate::raft::persistence::PersistenceOptions;
+use crate::raft::persistence::{FilePersistenceOptions, PersistenceOptions};
 use crate::raft::raft_common_proto::Server;
 use crate::raft::raft_common_proto::entry::Data;
 use crate::raft::raft_common_proto::entry::Data::{Config, Payload};
 use crate::raft::raft_service_proto::raft_server::Raft;
 use crate::raft::raft_service_proto::{ChangeConfigRequest, ChangeConfigResponse};
-use crate::raft::store::{LogSnapshot, Store};
+use crate::raft::store::Store;
 use crate::raft::{diagnostics, raft_service_proto};
 
 const RPC_TIMEOUT_MS: u64 = 100;
@@ -70,15 +68,17 @@ pub struct Options {
 }
 
 impl Options {
-    pub fn new(persistence_directory: &str) -> Self {
-        let persistence = PersistenceOptions::Directory(persistence_directory.to_string());
+    pub fn new(persistence_directory: &str, wipe_persistence: bool) -> Self {
         Options {
             follower_timeout_ms: 200,
             candidate_timeouts_ms: 300,
             leader_replicate_ms: 50,
             compaction_threshold_bytes: 10 * 1000 * 1000,
             compaction_check_periods_ms: 5000,
-            persistence_options: persistence,
+            persistence_options: PersistenceOptions::FilePersistence(FilePersistenceOptions {
+                directory: persistence_directory.to_string(),
+                wipe: wipe_persistence,
+            }),
         }
     }
 }
@@ -99,24 +99,15 @@ impl RaftImpl {
         options: Options,
         failures: Arc<Mutex<FailureOptions>>,
     ) -> RaftImpl {
-        let snapshot_bytes = state_machine.lock().await.create_snapshot();
-        let snapshot = LogSnapshot {
-            snapshot: snapshot_bytes,
-            last: EntryId {
-                term: -1,
-                index: -1,
-            },
-        };
-
         let persistence_options = options.persistence_options.clone();
         let store = Store::new(
+            persistence_options,
             state_machine,
-            snapshot,
             diagnostics.clone(),
             options.compaction_threshold_bytes,
             server.name.as_str(),
-            persistence_options
-        ).await;
+        )
+        .await;
 
         let cluster = Cluster::new_with_failures(server.clone(), all.as_slice(), failures.clone());
 
@@ -141,7 +132,7 @@ impl RaftImpl {
         let mut state = self.state.lock().await;
         let term = state.term();
         debug!(term, "starting");
-        state.become_follower(arc_state.clone(), term);
+        state.become_follower(arc_state.clone(), term).await;
 
         tokio::spawn(async move {
             RaftImpl::compaction_loop(arc_state.clone()).await;
@@ -209,7 +200,7 @@ impl RaftImpl {
             debug!(term, "starting election");
             let voted_for = state.cluster.me(); // We vote for ourselves.
             state.role = RaftRole::Candidate;
-            state.store.update_term_info(term, &Some(voted_for));
+            state.store.update_term_info(term, &Some(voted_for)).await;
 
             // Take a snapshot of the cluster so we can release the state lock.
             let request = state.create_vote_request();
@@ -254,7 +245,7 @@ impl RaftImpl {
                         }
 
                         info!(term=term, other_term=other_term, role=?state.role, "detected higher term");
-                        state.become_follower(arc_state.clone(), other_term);
+                        state.become_follower(arc_state.clone(), other_term).await;
                         return true;
                     }
                     if response.granted {
@@ -334,7 +325,7 @@ impl RaftImpl {
                 if !state.cluster.am_voting_member() {
                     info!("no longer voting member, stepping down");
                     let t = state.term();
-                    state.become_follower(arc_state_copy, t);
+                    state.become_follower(arc_state_copy, t).await;
                     return;
                 }
                 match &state.diagnostics {
@@ -456,7 +447,7 @@ impl RaftImpl {
         let other_term = result.into_inner().term;
         if other_term > state.term() {
             info!(other_term, peer=%follower.name, role=?state.role, "detected higher term");
-            state.become_follower(arc_state.clone(), other_term);
+            state.become_follower(arc_state.clone(), other_term).await;
             return Ok(());
         }
 
@@ -491,7 +482,7 @@ impl RaftImpl {
         let other_term = message.term;
         if other_term > state.term() {
             debug!(other_term, term=state.term(), role=?state.role, "detected higher term");
-            state.become_follower(arc_state.clone(), other_term);
+            state.become_follower(arc_state.clone(), other_term).await;
             return Ok(());
         }
 
@@ -694,11 +685,13 @@ impl RaftState {
         }
     }
 
-    fn become_follower(&mut self, arc_state: Arc<Mutex<RaftState>>, term: i64) {
+    async fn become_follower(&mut self, arc_state: Arc<Mutex<RaftState>>, term: i64) {
         debug!(term, "becoming follower");
         assert!(term >= self.term(), "Term should never decrease");
 
-        self.store.update_term_info(term, &None /* voted_for */);
+        self.store
+            .update_term_info(term, &None /* voted_for */)
+            .await;
         self.role = RaftRole::Follower;
         self.reset_follower_timer(arc_state.clone(), term + 1);
     }
@@ -795,19 +788,19 @@ impl RaftState {
         self.store.commit_to(new_commit_index).await;
 
         // The committing may have changed the latest configs. Update the cluster.
-        self.update_cluster(arc_state);
+        self.update_cluster(arc_state).await;
     }
 
     // Feeds the latest state of stored config info into the cluster, giving the
     // cluster a chance to update itself.
-    fn update_cluster(&mut self, arc_state: Arc<Mutex<RaftState>>) {
+    async fn update_cluster(&mut self, arc_state: Arc<Mutex<RaftState>>) {
         let config_info = self.store.get_config_info();
         self.cluster.update(config_info);
 
         if self.role == Leader && !self.cluster.am_voting_member() {
             debug!(role=?self.role, me=?self.cluster.me().name, "not voting member, stepping down");
             let term = self.term();
-            self.become_follower(arc_state, term);
+            self.become_follower(arc_state, term).await;
         }
     }
 
@@ -898,7 +891,9 @@ impl Raft for RaftImpl {
         // If we're in an outdated term, we revert to follower in the new later
         // term and may still grant the requesting candidate our vote.
         if request.term > state.term() {
-            state.become_follower(self.state.clone(), request.term);
+            state
+                .become_follower(self.state.clone(), request.term)
+                .await;
         }
 
         let candidate = request
@@ -912,7 +907,7 @@ impl Raft for RaftImpl {
         if state.voted_for().is_none() || &Some(candidate.clone()) == &state.voted_for() {
             let candidate_name = candidate.name.clone();
             if state.store.log_entry_is_up_to_date(&last_log_id) {
-                state.store.update_voted_for(&Some(candidate.clone()));
+                state.store.update_voted_for(&Some(candidate.clone())).await;
                 granted = true;
                 debug!(term, candidate=?candidate_name, "granted vote");
             } else {
@@ -954,7 +949,9 @@ impl Raft for RaftImpl {
         // by resetting to a "clean" follower state for the leader's (greater)
         // term. Note that we then handle the leader's append afterwards.
         if request.term > state.term() {
-            state.become_follower(self.state.clone(), request.term);
+            state
+                .become_follower(self.state.clone(), request.term)
+                .await;
         }
         let term = state.term();
 
@@ -975,9 +972,9 @@ impl Raft for RaftImpl {
         // a snapshot install).
         let previous = &request.previous.ok_or(RaftError::missing("previous"))?;
         let next_index = state.store.next_index();
-        if state.store.log_contains(previous) == ContainsResult::ABSENT {
+        if previous.index >= next_index {
             // Let the leader know that this entry is too far in the future, so
-            // it can try again from with earlier index.
+            // it can try again from an earlier index.
             return Ok(Response::new(AppendResponse {
                 term,
                 success: false,
@@ -987,7 +984,7 @@ impl Raft for RaftImpl {
 
         // Store all the entries received.
         if !request.entries.is_empty() {
-            state.store.append_all(request.entries.as_slice());
+            state.store.append_all(request.entries.as_slice()).await;
         }
 
         // If the leader considers an entry committed, it is guaranteed that
@@ -997,7 +994,7 @@ impl Raft for RaftImpl {
         state.store.commit_to(leader_commit_index).await;
 
         // The appending and committing may have changed the latest configs. Update the cluster.
-        state.update_cluster(self.state.clone());
+        state.update_cluster(self.state.clone()).await;
 
         debug!("handled request");
         Ok(Response::new(AppendResponse {
@@ -1050,7 +1047,7 @@ impl Raft for RaftImpl {
         }
 
         let term = state.term();
-        state.become_follower(self.state.clone(), term);
+        state.become_follower(self.state.clone(), term).await;
 
         Ok(Response::new(StepDownResponse {
             status: raft_service_proto::Status::Success as i32,
@@ -1312,7 +1309,7 @@ mod tests {
     fn entry(id: EntryId, payload: Vec<u8>) -> Entry {
         Entry {
             id: Some(id),
-            data: Some(Data::Payload(payload)),
+            data: Some(Payload(payload)),
         }
     }
 
