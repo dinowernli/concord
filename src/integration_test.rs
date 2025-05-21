@@ -3,8 +3,8 @@ use crate::raft::FailureOptions;
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
-
 const NAMES: [&str; 3] = ["A", "B", "C"];
+const CLUSTER_NAME: &str = "test-cluster";
 
 #[tokio::test]
 async fn test_start_and_elect_leader() {
@@ -19,10 +19,15 @@ async fn test_start_and_elect_leader() {
 }
 
 async fn make_harness() -> Harness {
+    let wipe_persistence = true;
     let (harness, serving) = Harness::builder(NAMES.to_vec())
         .await
         .expect("builder")
-        .build(FailureOptions::no_failures())
+        .build(
+            CLUSTER_NAME,
+            FailureOptions::no_failures(),
+            wipe_persistence,
+        )
         .await
         .expect("harness");
     harness.start().await;
