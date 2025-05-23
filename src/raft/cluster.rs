@@ -1,7 +1,7 @@
 use crate::raft::failure_injection::{ChannelInfo, FailureInjectionMiddleware, FailureOptions};
-use crate::raft::raft_proto::entry::Data::Config;
-use crate::raft::raft_proto::raft_client::RaftClient;
-use crate::raft::raft_proto::{ClusterConfig, Server};
+use crate::raft::raft_common_proto::entry::Data::Config;
+use crate::raft::raft_common_proto::{ClusterConfig, Server};
+use crate::raft::raft_service_proto::raft_client::RaftClient;
 use crate::raft::store::ConfigInfo;
 
 use std::collections::{HashMap, HashSet};
@@ -325,7 +325,7 @@ pub mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::raft_proto::{Entry, EntryId};
+    use crate::raft::raft_common_proto::{Entry, EntryId};
 
     fn create_cluster() -> Cluster {
         let s1 = server("foo", 1234, "name1");

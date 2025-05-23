@@ -8,14 +8,13 @@ use tonic::Request;
 use tonic::transport::{Channel, Error};
 use tracing::debug;
 
-use raft_proto::{CommitRequest, EntryId, Server, Status, StepDownRequest};
-
 use crate::raft::client::Outcome::{Failure, NewLeader, Success};
-use crate::raft::raft_proto;
-use crate::raft::raft_proto::{
-    ChangeConfigRequest, ChangeConfigResponse, CommitResponse, StepDownResponse,
+use crate::raft::raft_common_proto::{EntryId, Server};
+use crate::raft::raft_service_proto::raft_client::RaftClient;
+use crate::raft::raft_service_proto::{
+    ChangeConfigRequest, ChangeConfigResponse, CommitRequest, CommitResponse, Status,
+    StepDownRequest, StepDownResponse,
 };
-use crate::raft_proto::raft_client::RaftClient;
 
 // How long to wait if the server points us to a new leader.
 const NEW_LEADER_WAIT_MS: u64 = 5;

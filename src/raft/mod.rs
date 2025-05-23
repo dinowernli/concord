@@ -14,8 +14,11 @@ pub use diagnostics::Diagnostics;
 pub use failure_injection::FailureOptions;
 pub use state_machine::{StateMachine, StateMachineResult};
 
-#[path = "generated/raft_proto.rs"]
-pub mod raft_proto;
+#[path = "generated/raft_common_proto.rs"]
+pub mod raft_common_proto;
+
+#[path = "generated/raft_service_proto.rs"]
+pub mod raft_service_proto;
 
 mod client;
 mod cluster;

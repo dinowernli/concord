@@ -11,7 +11,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .out_dir(raft_gen_dir)
-        .compile_protos(&["src/raft/raft_proto.proto"], &["src/raft"])?;
+        .compile_protos(
+            &[
+                "src/raft/proto/service.proto",
+                "src/raft/proto/common.proto",
+            ],
+            &["src/raft/proto"],
+        )?;
 
     let keyvalue_gen_dir = "src/keyvalue/generated";
     std::fs::create_dir_all(keyvalue_gen_dir).expect("create-dir");

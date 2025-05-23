@@ -1,8 +1,6 @@
-use raft_proto::{Entry, EntryId};
-
-use crate::raft::raft_proto;
-use crate::raft::raft_proto::entry::Data;
-use crate::raft::raft_proto::entry::Data::{Config, Payload};
+use crate::raft::raft_common_proto::entry::Data;
+use crate::raft::raft_common_proto::entry::Data::{Config, Payload};
+use crate::raft::raft_common_proto::{Entry, EntryId};
 
 // Represents a contiguous slice of a raft log.
 pub struct LogSlice {
@@ -275,7 +273,7 @@ fn size_bytes(entry: &Entry) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::raft_proto::ClusterConfig;
+    use crate::raft::raft_common_proto::ClusterConfig;
 
     #[test]
     fn test_initial() {
