@@ -19,10 +19,10 @@ use tracing::{Instrument, debug, info, info_span, instrument, warn};
 use diagnostics::ServerDiagnostics;
 use raft::StateMachine;
 use raft::log::ContainsResult;
-use raft::raft_proto;
-use raft_proto::{AppendRequest, AppendResponse, EntryId, Server, VoteRequest, VoteResponse};
-use raft_proto::{CommitRequest, CommitResponse, StepDownRequest, StepDownResponse};
-use raft_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
+use raft::raft_common_proto::EntryId;
+use raft::raft_service_proto::{AppendRequest, AppendResponse, VoteRequest, VoteResponse};
+use raft::raft_service_proto::{CommitRequest, CommitResponse, StepDownRequest, StepDownResponse};
+use raft::raft_service_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 
 use crate::raft;
 use crate::raft::cluster::Cluster;
@@ -30,15 +30,18 @@ use crate::raft::cluster::{RaftClientType, key};
 use crate::raft::consensus::RaftRole::Leader;
 use crate::raft::diagnostics;
 use crate::raft::failure_injection::FailureOptions;
-use crate::raft::raft_proto::entry::Data;
-use crate::raft::raft_proto::entry::Data::{Config, Payload};
-use crate::raft::raft_proto::{ChangeConfigRequest, ChangeConfigResponse};
+use crate::raft::raft_common_proto::Server;
+use crate::raft::raft_common_proto::entry::Data;
+use crate::raft::raft_common_proto::entry::Data::{Config, Payload};
+use crate::raft::raft_service_proto;
+use crate::raft::raft_service_proto::raft_server::Raft;
+use crate::raft::raft_service_proto::{ChangeConfigRequest, ChangeConfigResponse};
 use crate::raft::store::{LogSnapshot, Store};
-use crate::raft_proto::raft_server::Raft;
 
 const RPC_TIMEOUT_MS: u64 = 100;
 
 // Parameters used to configure the behavior of a cluster participant.
+#[derive(Debug, Clone)]
 pub struct Options {
     // Timeout after which a server in follower state starts a new election.
     follower_timeout_ms: i64,
@@ -466,14 +469,14 @@ impl RaftImpl {
     async fn commit_internal(
         arc_state: Arc<Mutex<RaftState>>,
         data: Data,
-    ) -> Result<EntryId, raft_proto::Status> {
+    ) -> Result<EntryId, raft_service_proto::Status> {
         let term;
         let entry_id;
         let receiver;
         {
             let mut state = arc_state.lock().await;
             if state.role != RaftRole::Leader {
-                return Err(raft_proto::Status::NotLeader);
+                return Err(raft_service_proto::Status::NotLeader);
             }
 
             term = state.term();
@@ -506,14 +509,14 @@ impl RaftImpl {
                 } else {
                     // A different entry got committed to this index. This means
                     // the leader must have changed, let the caller know.
-                    Err(raft_proto::Status::NotLeader)
+                    Err(raft_service_proto::Status::NotLeader)
                 }
             }
             Err(_) => {
                 // The sender went out of scope without ever being resolved. This can
                 // happen in rare cases where the index we're interested in got compacted.
                 // In this case we don't know whether the entry was committed.
-                Err(raft_proto::Status::NotLeader)
+                Err(raft_service_proto::Status::NotLeader)
             }
         }
     }
@@ -937,7 +940,7 @@ impl Raft for RaftImpl {
         let proto = match result {
             Ok(entry_id) => CommitResponse {
                 entry_id: Some(entry_id),
-                status: raft_proto::Status::Success as i32,
+                status: raft_service_proto::Status::Success as i32,
                 leader,
             },
             Err(status) => CommitResponse {
@@ -960,7 +963,7 @@ impl Raft for RaftImpl {
         let mut state = self.state.lock().await;
         if state.role != RaftRole::Leader {
             return Ok(Response::new(StepDownResponse {
-                status: raft_proto::Status::NotLeader as i32,
+                status: raft_service_proto::Status::NotLeader as i32,
                 leader: state.cluster.leader(),
             }));
         }
@@ -969,7 +972,7 @@ impl Raft for RaftImpl {
         state.become_follower(self.state.clone(), term);
 
         Ok(Response::new(StepDownResponse {
-            status: raft_proto::Status::Success as i32,
+            status: raft_service_proto::Status::Success as i32,
             leader: Some(state.cluster.me()),
         }))
     }
@@ -1009,7 +1012,7 @@ impl Raft for RaftImpl {
             let state = self.state.lock().await;
             if state.role != RaftRole::Leader {
                 return Ok(Response::new(ChangeConfigResponse {
-                    status: raft_proto::Status::NotLeader as i32,
+                    status: raft_service_proto::Status::NotLeader as i32,
                     leader: state.cluster.leader(),
                 }));
             }
@@ -1028,7 +1031,7 @@ impl Raft for RaftImpl {
 
         let leader = self.state.lock().await.cluster.leader().clone();
         let status = match result {
-            Ok(_) => raft_proto::Status::Success,
+            Ok(_) => raft_service_proto::Status::Success,
             Err(status) => status,
         };
 
@@ -1049,10 +1052,10 @@ fn add_jitter(lower: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use crate::raft::cluster::testing::create_local_client_for_testing;
-    use crate::raft::raft_proto::entry::Data;
-    use crate::raft::raft_proto::raft_server::RaftServer;
+    use crate::raft::raft_common_proto::Entry;
+    use crate::raft::raft_common_proto::entry::Data;
+    use crate::raft::raft_service_proto::raft_server::RaftServer;
     use crate::raft::testing::FakeStateMachine;
-    use crate::raft_proto::Entry;
     use crate::testing::TestRpcServer;
 
     use super::*;

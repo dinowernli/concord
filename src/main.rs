@@ -21,10 +21,9 @@ use crate::keyvalue::grpc::KeyValueClient;
 use crate::keyvalue::grpc::KeyValueServer;
 use crate::keyvalue::grpc::PutRequest;
 use crate::keyvalue::{KeyValueService, MapStore};
-use crate::raft::raft_proto;
+use crate::raft::raft_common_proto::Server;
+use crate::raft::raft_service_proto::raft_server::RaftServer;
 use crate::raft::{Diagnostics, FailureOptions, Options, RaftImpl};
-use crate::raft_proto::Server;
-use crate::raft_proto::raft_server::RaftServer;
 
 mod keyvalue;
 mod raft;

@@ -1,8 +1,8 @@
 use crate::raft::StateMachine;
 use crate::raft::log::{ContainsResult, LogSlice};
-use crate::raft::raft_proto::entry::Data;
-use crate::raft::raft_proto::entry::Data::Config;
-use crate::raft::raft_proto::{Entry, EntryId, Server};
+use crate::raft::raft_common_proto::entry::Data;
+use crate::raft::raft_common_proto::entry::Data::Config;
+use crate::raft::raft_common_proto::{Entry, EntryId, Server};
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::channel::oneshot::{Receiver, Sender, channel};
@@ -412,8 +412,8 @@ fn entry_id_key(entry_id: &EntryId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::raft_proto::entry::Data::Payload;
-    use crate::raft::raft_proto::{ClusterConfig, Server};
+    use crate::raft::raft_common_proto::entry::Data::Payload;
+    use crate::raft::raft_common_proto::{ClusterConfig, Server};
     use crate::raft::testing::FakeStateMachine;
     use futures::FutureExt;
 
