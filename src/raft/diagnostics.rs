@@ -14,7 +14,7 @@ pub struct Diagnostics {
 }
 
 impl Diagnostics {
-    // Returns a new instance which, initially, know about no servers.
+    // Returns a new instance which, initially, knows about no servers.
     pub fn new() -> Self {
         Diagnostics {
             servers: HashMap::new(),
