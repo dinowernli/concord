@@ -1,4 +1,5 @@
 use crate::raft::{StateMachine, StateMachineResult};
+use async_trait::async_trait;
 use bytes::Bytes;
 
 // A fake implementation of the StateMachine trait for testing
@@ -17,8 +18,9 @@ impl FakeStateMachine {
     }
 }
 
+#[async_trait]
 impl StateMachine for FakeStateMachine {
-    fn apply(&mut self, _operation: &Bytes) -> StateMachineResult {
+    async fn apply(&mut self, _operation: &Bytes) -> StateMachineResult {
         self.committed += 1;
         Ok(())
     }
