@@ -22,6 +22,8 @@ mod keyvalue;
 mod raft;
 #[cfg(test)]
 mod testing;
+#[cfg(test)]
+mod integration_test;
 
 // We deliberately inject some RPC failures by default.
 const DEFAULT_FAILURE_OPTIONS: FailureOptions = FailureOptions {

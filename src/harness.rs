@@ -38,7 +38,7 @@ impl HarnessBuilder {
     pub async fn build(
         self,
         failure_options: FailureOptions,
-    ) -> Result<(Harness, Pin<Box<dyn Future<Output = ()>>>), Box<dyn Error>> {
+    ) -> Result<(Harness, Pin<Box<dyn Future<Output = ()> + Send>>), Box<dyn Error>> {
         let diag = Arc::new(Mutex::new(Diagnostics::new()));
         let all = self.addresses();
 
@@ -127,7 +127,7 @@ impl Instance {
         all: &Vec<Server>,
         diagnostics: Arc<Mutex<Diagnostics>>,
         failure_options: FailureOptions,
-    ) -> Result<(Self, Pin<Box<dyn Future<Output = ()>>>), Box<dyn Error>> {
+    ) -> Result<(Self, Pin<Box<dyn Future<Output = ()> + Send>>), Box<dyn Error>> {
         let name = address.name.to_string();
         let port = listener.local_addr()?.port();
         assert_eq!(port as i32, address.port);
