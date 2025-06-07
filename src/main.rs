@@ -2,31 +2,25 @@ extern crate structopt;
 extern crate tracing;
 
 use async_std::sync::{Arc, Mutex};
-use axum::routing::Router;
-use axum_tonic::NestTonic;
-use axum_tonic::RestGrpcService;
-use futures::future::join_all;
 use futures::future::join5;
 use rand::seq::SliceRandom;
 use std::error::Error;
-use std::net::SocketAddr;
 use std::time::Duration;
 use structopt::StructOpt;
-use tokio::net::TcpListener;
 use tokio::time::{Instant, sleep};
 use tracing::{Instrument, debug, error, info, info_span};
 use tracing_subscriber::EnvFilter;
 
+use crate::harness::Harness;
 use crate::keyvalue::grpc::KeyValueClient;
-use crate::keyvalue::grpc::KeyValueServer;
 use crate::keyvalue::grpc::PutRequest;
-use crate::keyvalue::{KeyValueService, MapStore};
 use crate::raft::raft_common_proto::Server;
-use crate::raft::raft_service_proto::raft_server::RaftServer;
-use crate::raft::{Diagnostics, FailureOptions, Options, RaftImpl};
+use crate::raft::{Diagnostics, FailureOptions};
 
+mod harness;
 mod keyvalue;
 mod raft;
+#[cfg(test)]
 mod testing;
 
 // We deliberately inject some RPC failures by default.
@@ -49,71 +43,6 @@ struct Arguments {
 
     #[structopt(short = "r", long = "disable_reconfigure")]
     disable_reconfigure: bool,
-}
-
-fn server(host: &str, port: i32, name: &str) -> Server {
-    Server {
-        host: host.into(),
-        port,
-        name: name.into(),
-    }
-}
-
-fn make_address(address: &Server) -> SocketAddr {
-    format!("[{}]:{}", address.host, address.port)
-        .parse()
-        .unwrap()
-}
-
-//#[instrument(skip(all,diagnostics))]
-async fn run_server(address: &Server, all: &Vec<Server>, diagnostics: Arc<Mutex<Diagnostics>>) {
-    let server = address.name.to_string();
-    let kv_store = Arc::new(Mutex::new(MapStore::new()));
-
-    // The initial Raft cluster consists of only the first 3 entries, the other 2 remain
-    // idle.
-    assert!(all.len() >= 3);
-    let raft_cluster = vec![all[0].clone(), all[1].clone(), all[2].clone()];
-
-    // A service used by the Raft cluster.
-    let server_diagnostics = diagnostics.lock().await.get_server(&address);
-
-    // Set up the grpc service for the key-value store.
-    let kv1 = KeyValueService::new(server.as_str(), &address, kv_store.clone());
-    let kv_grpc = KeyValueServer::new(kv1);
-
-    // Set up the grpc service for the raft participant.
-    let raft = RaftImpl::new(
-        address,
-        &raft_cluster,
-        kv_store.clone(), // The raft cluster participant is the one applying the KV writes.
-        Some(server_diagnostics),
-        Options::default(),
-        Some(DEFAULT_FAILURE_OPTIONS),
-    )
-    .await;
-
-    raft.start().await;
-    let raft_grpc = RaftServer::new(raft);
-
-    // Set up the webservice serving the contents of the kvstore.
-    // TODO(dino): See if we can reuse/share the "kv1" instance above.
-    let kv2 = KeyValueService::new(server.as_str(), &address, kv_store.clone());
-    let kv_http = Arc::new(keyvalue::HttpHandler::new(Arc::new(kv2)));
-    let web = Router::new().nest("/keyvalue", kv_http.routes());
-    let grpc = Router::new().nest_tonic(raft_grpc).nest_tonic(kv_grpc);
-
-    let rest_grpc = RestGrpcService::new(web, grpc).into_make_service();
-    let listener = TcpListener::bind(&make_address(&address))
-        .await
-        .expect("bind");
-
-    info!("Started server (http, grpc) on port {}", address.port);
-
-    match axum::serve(listener, rest_grpc).await {
-        Ok(()) => info!("Serving terminated successfully"),
-        Err(message) => error!("Serving terminated unsuccessfully: {}", message),
-    }
 }
 
 // Starts a loop which periodically preempts the cluster leader, forcing the
@@ -243,31 +172,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
     let arguments = Arc::new(Arguments::from_args());
 
-    // Note that we use the port as the name because we're running all these servers
-    // locally and so the port is sufficient to identify the server.
-    let addresses = vec![
-        server("::1", 12345, "12345"), // Stays part of the cluster no matter what.
-        server("::1", 12346, "12346"),
-        server("::1", 12347, "12347"),
-        server("::1", 12348, "12348"),
-        server("::1", 12349, "12349"),
-    ];
-    info!("Starting {} servers", addresses.len());
+    let (harness, serving) = Harness::builder(vec!["A", "B", "C", "D", "E"])
+        .await
+        .expect("builder")
+        .build(DEFAULT_FAILURE_OPTIONS.clone())
+        .await
+        .expect("harness");
 
-    let diag = Arc::new(Mutex::new(Diagnostics::new()));
-    let mut servers = Vec::new();
-    for address in &addresses {
-        let span = info_span!("serve", server=%address.name);
-        let running = run_server(&address, &addresses, diag.clone());
-        servers.push(running.instrument(span));
-    }
+    let addresses = harness.addresses();
+    let diagnostics = harness.diagnostics();
 
-    let serving = join_all(servers);
+    harness.start().await;
+    info!("Started {} servers", addresses.len());
+
     let all = join5(
         serving,
         run_put_loop(arguments.clone(), &addresses).instrument(info_span!("put")),
         run_preempt_loop(arguments.clone(), &addresses).instrument(info_span!("preempt")),
-        run_validate_loop(arguments.clone(), diag.clone()).instrument(info_span!("validate")),
+        run_validate_loop(arguments.clone(), diagnostics).instrument(info_span!("validate")),
         run_reconfigure_loop(arguments.clone(), &addresses).instrument(info_span!("reconfigure")),
     );
 
