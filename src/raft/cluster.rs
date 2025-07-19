@@ -207,7 +207,7 @@ impl Cluster {
         }
 
         // Cache miss, create a new channel.
-        let dst = format!("http://[::1]:{}", address.port);
+        let dst = format!("http://127.0.0.1:{}", address.port);
         let timeout = Duration::from_secs(1);
         let channel = Endpoint::new(dst)?
             .connect_timeout(timeout.clone())
@@ -303,7 +303,7 @@ pub mod testing {
     use super::*;
 
     pub async fn create_local_client_for_testing(port: i32) -> RaftClientType {
-        let dst = format!("http://[::1]:{}", port);
+        let dst = format!("http://127.0.0.1:{}", port);
         let timeout = Duration::from_secs(1);
         let channel = Endpoint::new(dst.clone())
             .expect("endpoint")

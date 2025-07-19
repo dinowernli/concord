@@ -83,9 +83,9 @@ impl Harness {
     pub async fn builder(names: Vec<&str>) -> Result<HarnessBuilder, Box<dyn Error>> {
         let mut bound = Vec::new();
         for name in names {
-            let listener = TcpListener::bind("[::1]:0").await?;
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
             let port = listener.local_addr()?.port();
-            let server = server("::1", port as i32, name);
+            let server = server(port as i32, name);
             bound.push(BoundAddress { listener, server })
         }
         Ok(HarnessBuilder { bound })
@@ -195,9 +195,9 @@ struct BoundAddress {
     listener: TcpListener,
 }
 
-fn server(host: &str, port: i32, name: &str) -> Server {
+fn server(port: i32, name: &str) -> Server {
     Server {
-        host: host.into(),
+        host: "127.0.0.1".into(),
         port,
         name: name.into(),
     }

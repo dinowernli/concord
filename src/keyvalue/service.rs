@@ -239,7 +239,7 @@ mod tests {
     }
 
     async fn create_grpc_client(port: i32) -> KeyValueClient<Channel> {
-        KeyValueClient::connect(format!("http://[::1]:{}", port))
+        KeyValueClient::connect(format!("http://127.0.0.1:{}", port))
             .await
             .expect("client")
     }

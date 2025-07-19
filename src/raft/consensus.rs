@@ -1264,7 +1264,7 @@ mod tests {
 
     fn create_server(port: i32) -> Server {
         Server {
-            host: "::1".to_string(),
+            host: "127.0.0.1".to_string(),
             port,
             name: port.to_string(),
         }

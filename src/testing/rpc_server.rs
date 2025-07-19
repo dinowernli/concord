@@ -52,7 +52,7 @@ impl TestRpcServer {
         S::Error: std::error::Error + Send + Sync,
     {
         // Manually created the TCP listener so we can store the port.
-        let listener = TcpListener::bind("[::1]:0").await.expect("bind");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         self.port = Some(listener.local_addr().expect("address").port());
 
         // Create the shutdown channel for the server.
