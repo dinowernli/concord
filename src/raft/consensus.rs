@@ -264,7 +264,7 @@ impl RaftImpl {
             let supporters: Vec<String> = votes.iter().map(|s| s.name.to_string()).collect();
             return if state.cluster.is_quorum(&votes) {
                 debug!(term, votes=?supporters, "won election");
-                state.role = RaftRole::Leader;
+                state.role = Leader;
                 state.create_follower_positions(true /* clear_existing */);
                 state.timer_guard = None;
 

@@ -18,6 +18,8 @@ use crate::raft::raft_common_proto::Server;
 use crate::raft::{Diagnostics, FailureOptions};
 
 mod harness;
+#[cfg(test)]
+mod integration_test;
 mod keyvalue;
 mod raft;
 #[cfg(test)]

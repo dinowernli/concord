@@ -33,6 +33,10 @@ impl Diagnostics {
         self.servers.get(key.as_str()).unwrap().clone()
     }
 
+    pub fn get_leader(&self, term: i64) -> Option<Server> {
+        self.leaders.get(&term).map(|i| i.clone())
+    }
+
     // Performs a set of a sequence of checks on the data recorded by the
     // individual servers. Returns an error if any of the checks fail.
     pub async fn validate(&mut self) -> Result<(), String> {
