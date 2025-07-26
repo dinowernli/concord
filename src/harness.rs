@@ -6,7 +6,9 @@ use futures::future::join_all;
 use std::error::Error;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::time::sleep;
 use tracing::{Instrument, error, info, info_span};
 
 use crate::keyvalue;
@@ -108,6 +110,36 @@ impl Harness {
             instance.start().await;
         }
     }
+
+    pub async fn wait_for_leader<M>(&self, timeout_duration: Duration, matcher: M)
+    where
+        M: Fn(&(i64, Server)) -> bool,
+    {
+        let diag = self.diagnostics.clone();
+        wait_for(timeout_duration, || async {
+            let mut locked_diagnostics = diag.lock().await;
+
+            // Make sure we've collected the latest information.
+            locked_diagnostics.collect().await;
+
+            let (term, leader) = match locked_diagnostics.latest_leader() {
+                Some((term, leader)) => (term, leader),
+                None => return false,
+            };
+
+            assert!(self.valid_server_name(&leader.name));
+            matcher(&(term, leader))
+        })
+        .await
+        .expect("wait_for_leader");
+    }
+
+    fn valid_server_name(&self, name: &String) -> bool {
+        self.instances
+            .iter()
+            .find(|i| i.address.name == *name)
+            .is_some()
+    }
 }
 
 // Holds the state of a single server instance, listening on a port. This includes multiple
@@ -201,4 +233,21 @@ fn server(host: &str, port: i32, name: &str) -> Server {
         port,
         name: name.into(),
     }
+}
+
+/// Waits for a condition to become true, up to the given `timeout_duration`.
+/// Returns `Ok(())` if the condition is met in time, or `Err(())` on timeout.
+async fn wait_for<F, Fut>(timeout_duration: Duration, mut condition: F) -> Result<(), ()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let start = tokio::time::Instant::now();
+    while start.elapsed() < timeout_duration {
+        if condition().await {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(300)).await;
+    }
+    Err(())
 }
