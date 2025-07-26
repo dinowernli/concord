@@ -1,3 +1,4 @@
+use async_std::channel;
 use async_std::sync::Mutex;
 use axum::Router;
 use axum_tonic::NestTonic;
@@ -111,6 +112,14 @@ impl Harness {
         }
     }
 
+    // Stops all the instances of this harness.
+    pub async fn stop(&self) {
+        for instance in &self.instances {
+            instance.stop().await;
+        }
+    }
+
+    #[cfg(test)]
     pub async fn wait_for_leader<M>(&self, timeout_duration: Duration, matcher: M)
     where
         M: Fn(&(i64, Server)) -> bool,
@@ -134,6 +143,7 @@ impl Harness {
         .expect("wait_for_leader");
     }
 
+    #[cfg(test)]
     fn valid_server_name(&self, name: &String) -> bool {
         self.instances
             .iter()
@@ -147,6 +157,7 @@ impl Harness {
 struct Instance {
     address: Server,
     raft: Arc<RaftImpl>,
+    shutdown: channel::Sender<()>,
 }
 
 impl Instance {
@@ -197,16 +208,24 @@ impl Instance {
         let grpc = Router::new().nest_tonic(raft_grpc).nest_tonic(kv_grpc);
         let rest_grpc = RestGrpcService::new(web, grpc).into_make_service();
 
+        // Wire up the shutdown
+        let (sender, receiver) = channel::unbounded::<()>();
+        let signal = async move { receiver.recv().await.unwrap_or(()) };
+
         // Start serving
         let future = Box::pin(async {
-            match axum::serve(listener, rest_grpc).await {
-                Ok(()) => info!("Serving terminated successfully"),
+            match axum::serve(listener, rest_grpc)
+                .with_graceful_shutdown(signal)
+                .await
+            {
+                Ok(()) => info!("Serving terminated"),
                 Err(message) => error!("Serving terminated unsuccessfully: {}", message),
             }
         });
         let result = Instance {
             address: address.clone(),
             raft,
+            shutdown: sender,
         };
         info!(
             "Started http and grpc server [name={},port={}] ",
@@ -219,6 +238,11 @@ impl Instance {
     // Starts the background logic in service implementations (e.g., raft election loop).
     async fn start(&self) {
         self.raft.start().await;
+    }
+
+    // Sends the signal to shut down the server. Must only be called once.
+    async fn stop(&self) {
+        self.shutdown.send(()).await.expect("shutdown")
     }
 }
 
