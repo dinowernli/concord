@@ -2,11 +2,13 @@ extern crate structopt;
 extern crate tracing;
 
 use async_std::sync::{Arc, Mutex};
-use futures::future::join5;
+use futures::FutureExt;
+use futures::future::{join3, join4};
 use rand::seq::SliceRandom;
 use std::error::Error;
 use std::time::Duration;
 use structopt::StructOpt;
+use tokio::select;
 use tokio::time::{Instant, sleep};
 use tracing::{Instrument, debug, error, info, info_span};
 use tracing_subscriber::EnvFilter;
@@ -49,7 +51,11 @@ struct Arguments {
 
 // Starts a loop which periodically preempts the cluster leader, forcing the
 // cluster to recover by electing a new one.
-async fn run_preempt_loop(args: Arc<Arguments>, all: &Vec<Server>) {
+async fn run_preempt_loop(
+    args: Arc<Arguments>,
+    all: &Vec<Server>,
+    shutdown: impl Future<Output = ()> + Clone,
+) {
     if args.disable_preempt {
         info!("running without the preempt loop");
         return;
@@ -60,40 +66,64 @@ async fn run_preempt_loop(args: Arc<Arguments>, all: &Vec<Server>) {
     let name = "main-preempt";
     let client = raft::new_client(name, &member);
     loop {
-        sleep(Duration::from_secs(4)).await;
+        let body = async {
+            sleep(Duration::from_secs(4)).await;
 
-        let start = Instant::now();
-        match client.preempt_leader().await {
-            Ok(leader) => {
-                info!(leader = %leader.name, latency_ms = %start.elapsed().as_millis(), "success")
+            let start = Instant::now();
+            match client.preempt_leader().await {
+                Ok(leader) => {
+                    info!(leader = %leader.name, latency_ms = %start.elapsed().as_millis(), "success")
+                }
+                Err(message) => error!("failed: {}", message),
             }
-            Err(message) => error!("failed: {}", message),
+            sleep(Duration::from_secs(10)).await;
+        };
+
+        select! {
+          _ = shutdown.clone() => {break;}
+          _ = body => {}
         }
-        sleep(Duration::from_secs(10)).await;
     }
+    info!("Finished")
 }
 
 // Starts a loop which periodically asks the diagnostics object to validate the
 // execution history of the cluster. If this fails, this indicates a bug in the
 // raft implementation.
-async fn run_validate_loop(args: Arc<Arguments>, diag: Arc<Mutex<Diagnostics>>) {
+async fn run_validate_loop(
+    args: Arc<Arguments>,
+    diag: Arc<Mutex<Diagnostics>>,
+    shutdown: impl Future<Output = ()> + Clone,
+) {
     if args.disable_validate {
         info!("running without the validate loop");
         return;
     }
 
     loop {
-        diag.lock()
-            .await
-            .validate()
-            .await
-            .expect("Cluster execution validation");
-        sleep(Duration::from_secs(5)).await;
+        let body = async {
+            diag.lock()
+                .await
+                .validate()
+                .await
+                .expect("Cluster execution validation");
+            sleep(Duration::from_secs(5)).await;
+        };
+
+        select! {
+          _ = shutdown.clone() => {break;}
+          _ = body => {}
+        }
     }
+    info!("Finished");
 }
 
 // Repeatedly picks a random server in the cluster and sends a put request.
-async fn run_put_loop(args: Arc<Arguments>, all: &Vec<Server>) {
+async fn run_put_loop(
+    args: Arc<Arguments>,
+    all: &Vec<Server>,
+    shutdown: impl Future<Output = ()> + Clone,
+) {
     if args.disable_commit {
         info!("running without the put loop");
         return;
@@ -105,25 +135,37 @@ async fn run_put_loop(args: Arc<Arguments>, all: &Vec<Server>) {
     };
     let mut i = 0;
     loop {
-        // First server guaranteed to always be part of the cluster.
-        let target = all.first().unwrap().clone();
-        let address = format!("http://[{}]:{}", target.host, target.port);
-        let mut client = KeyValueClient::connect(address).await.expect("connect");
-        let start = Instant::now();
-        match client.put(request.clone()).await {
-            Ok(_) => {
-                if i % 10 == 1 {
-                    info!(i, latency_ms=%start.elapsed().as_millis(), "success")
+        let body = async {
+            // First server guaranteed to always be part of the cluster.
+            let target = all.first().unwrap().clone();
+            let address = format!("http://[{}]:{}", target.host, target.port);
+            let mut client = KeyValueClient::connect(address).await.expect("connect");
+            let start = Instant::now();
+            match client.put(request.clone()).await {
+                Ok(_) => {
+                    if i % 10 == 1 {
+                        info!(i, latency_ms=%start.elapsed().as_millis(), "success")
+                    }
                 }
+                Err(msg) => info!(i, latency_ms=%start.elapsed().as_millis(), "failure: {}", msg),
             }
-            Err(msg) => info!(i, latency_ms=%start.elapsed().as_millis(), "failure: {}", msg),
+            i += 1;
+            sleep(Duration::from_millis(1000)).await;
+        };
+
+        select! {
+          _ = shutdown.clone() => {break;}
+          _ = body => {}
         }
-        i += 1;
-        sleep(Duration::from_millis(1000)).await;
     }
+    info!("Finished")
 }
 
-async fn run_reconfigure_loop(args: Arc<Arguments>, all: &Vec<Server>) {
+async fn run_reconfigure_loop(
+    args: Arc<Arguments>,
+    all: &Vec<Server>,
+    shutdown: impl Future<Output = ()> + Clone,
+) {
     if args.disable_reconfigure {
         info!("running without the reconfigure loop");
         return;
@@ -131,34 +173,42 @@ async fn run_reconfigure_loop(args: Arc<Arguments>, all: &Vec<Server>) {
 
     let first = all.first().unwrap().clone();
     loop {
-        sleep(Duration::from_secs(15)).await;
+        let body = async {
+            sleep(Duration::from_secs(15)).await;
 
-        // The new members are the first entry (always) and 2 out of the 4 others.
-        let mut new = vec![first.clone()];
-        assert!(all.len() >= 5);
-        let candidates = vec![
-            all[1].clone(),
-            all[2].clone(),
-            all[3].clone(),
-            all[4].clone(),
-        ];
-        for s in candidates.choose_multiple(&mut rand::thread_rng(), 2) {
-            new.push(s.clone());
-        }
-
-        let new_members: Vec<String> = new.iter().map(|s| s.name.to_string()).collect();
-        debug!(?new_members, "reconfiguring");
-
-        // First server guaranteed to always be part of the cluster.
-        let client = raft::new_client("main-reconfigure", &first);
-        let start = Instant::now();
-        match client.change_config(new.clone()).await {
-            Ok(_) => {
-                info!(latency_ms = %start.elapsed().as_millis(), ?new_members, "success")
+            // The new members are the first entry (always) and 2 out of the 4 others.
+            let mut new = vec![first.clone()];
+            assert!(all.len() >= 5);
+            let candidates = vec![
+                all[1].clone(),
+                all[2].clone(),
+                all[3].clone(),
+                all[4].clone(),
+            ];
+            for s in candidates.choose_multiple(&mut rand::thread_rng(), 2) {
+                new.push(s.clone());
             }
-            Err(message) => error!("reconfigure failed: {}", message),
+
+            let new_members: Vec<String> = new.iter().map(|s| s.name.to_string()).collect();
+            debug!(?new_members, "reconfiguring");
+
+            // First server guaranteed to always be part of the cluster.
+            let client = raft::new_client("main-reconfigure", &first);
+            let start = Instant::now();
+            match client.change_config(new.clone()).await {
+                Ok(_) => {
+                    info!(latency_ms = %start.elapsed().as_millis(), ?new_members, "success")
+                }
+                Err(message) => error!("reconfigure failed: {}", message),
+            }
+        };
+
+        select! {
+          _ = shutdown.clone() => {break;}
+          _ = body => {}
         }
     }
+    info!("Finished")
 }
 
 #[tokio::main]
@@ -187,14 +237,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
     harness.start().await;
     info!("Started {} servers", addresses.len());
 
-    let all = join5(
-        serving,
-        run_put_loop(arguments.clone(), &addresses).instrument(info_span!("put")),
-        run_preempt_loop(arguments.clone(), &addresses).instrument(info_span!("preempt")),
-        run_validate_loop(arguments.clone(), diagnostics).instrument(info_span!("validate")),
-        run_reconfigure_loop(arguments.clone(), &addresses).instrument(info_span!("reconfigure")),
-    );
+    // Set up a shutdown broadcast by turning the channel receiver into a shared future.
+    let (shutdown, rx) = async_std::channel::unbounded::<()>();
+    let sx = async { rx.recv().await.expect("shutdown-recv") }.shared();
 
-    all.await;
+    // Bundle the clients into a single future that can be awaited.
+    let all = addresses.clone();
+    let args = arguments.clone();
+    let clients = join4(
+        run_put_loop(args.clone(), &all, sx.clone()).instrument(info_span!("put")),
+        run_preempt_loop(args.clone(), &all, sx.clone()).instrument(info_span!("preempt")),
+        run_validate_loop(args.clone(), diagnostics, sx.clone()).instrument(info_span!("validate")),
+        run_reconfigure_loop(args.clone(), &all, sx.clone()).instrument(info_span!("reconfigure")),
+    )
+    .shared();
+
+    // Set up a signal handler that stops the clients and then harness.
+    let signal_harness = Arc::new(harness);
+    let signal_clients = clients.clone();
+    let signal_handler = async move {
+        tokio::signal::ctrl_c().await.unwrap();
+        info!("Got SIGINT, shutting down");
+
+        // First tell all the client loops to shut down and wait for them.
+        shutdown.send(()).await.expect("shutdown-send");
+        signal_clients.await;
+
+        // Now shut down the servers and wait for them to stop serving.
+        signal_harness.stop().await;
+    };
+
+    join3(serving, signal_handler, clients).await;
+    info!("All done, exiting");
     Ok(())
 }
