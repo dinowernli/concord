@@ -1,8 +1,8 @@
+use crate::raft::diagnostics::LeaderInfo::NoLeader;
+use crate::raft::raft_common_proto::Server;
 use async_std::sync::{Arc, Mutex};
 use std::collections::{BTreeMap, HashMap};
 use tracing::info;
-
-use crate::raft::raft_common_proto::Server;
 
 // Holds information about the execution of a cluster over time. Can be used
 // to perform various integrity checks based on the recorded data. For
@@ -10,8 +10,35 @@ use crate::raft::raft_common_proto::Server;
 // disagree on who is the leader.
 pub struct Diagnostics {
     servers: HashMap<String, Arc<Mutex<ServerDiagnostics>>>,
-    leaders: BTreeMap<i64, Server>,
+
+    leaders: BTreeMap<i64, LeaderInfo>,
+
+    latest_valid_term: i64,
 }
+
+#[derive(Clone, Debug)]
+pub enum LeaderInfo {
+    // Indicates that there is agreement on the leader.
+    Leader(Server),
+
+    // Indicates that there was no leader. In some terms there is no leader.
+    NoLeader,
+
+    // Indicates that at least two different servers were believed to be leaders
+    // in the same term. Contains the two alleged leaders.
+    Conflict(Vec<ConflictEntry>),
+}
+
+// The prost generated messages implement Debug, but via a macro rather than explicitly
+// annotating "derive(Debug)" on the generated type. This means the "derive" macro above
+// isn't able to figure out that Server actually implements Debug. This intermediate
+// wrapper struct works around this.
+//
+// Apparently prost 0.14+ explicitly adds Debug, so we may be able to remove this once
+// we upgrade.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct ConflictEntry(Server);
 
 impl Diagnostics {
     // Returns a new instance which, initially, know about no servers.
@@ -19,6 +46,7 @@ impl Diagnostics {
         Diagnostics {
             servers: HashMap::new(),
             leaders: BTreeMap::new(),
+            latest_valid_term: -1,
         }
     }
 
@@ -33,25 +61,19 @@ impl Diagnostics {
         self.servers.get(key.as_str()).unwrap().clone()
     }
 
-    pub fn get_leader(&self, term: i64) -> Option<Server> {
-        self.leaders.get(&term).map(|i| i.clone())
+    // Returns the latest leader of a term that has been recognized as leader by all
+    // the participants. Returns None if there is no such term and leader.
+    pub fn latest_leader(&self) -> Option<(i64, Server)> {
+        for (term, info) in self.leaders.iter().rev() {
+            if let LeaderInfo::Leader(leader) = info {
+                return Some((*term, leader.clone()));
+            }
+        }
+        None
     }
 
-    // Performs a set of a sequence of checks on the data recorded by the
-    // individual servers. Returns an error if any of the checks fail.
-    pub async fn validate(&mut self) -> Result<(), String> {
-        self.validate_leaders().await?;
-
-        // TODO(dino): Also collect (term, index, fprint) triples and validate.
-
-        Ok(())
-    }
-
-    // Validates that across the execution history, all servers have a
-    // compatible view of who was the leader for every term. Specifically,
-    // there should be no term for which two servers recognize different peers
-    // as the leader of the cluster.
-    async fn validate_leaders(&mut self) -> Result<(), String> {
+    // Collects information from the individual diagnostics objects of the participants.
+    pub async fn collect(&mut self) {
         let latest = match self.leaders.last_entry() {
             Some(e) => *e.key(),
             None => -1,
@@ -60,13 +82,13 @@ impl Diagnostics {
         let mut term = latest;
         loop {
             term = term + 1;
+            let mut result = NoLeader;
 
-            let mut candidate: Option<Server> = None;
             for (_, server) in &self.servers {
                 let s = server.lock().await;
                 if s.latest_term().unwrap_or(-1) < term {
                     // This server hasn't seen a leader for this term yet. Stop.
-                    return Ok(());
+                    return;
                 }
 
                 let leader_opt = s.leaders.get(&term).clone();
@@ -76,21 +98,61 @@ impl Diagnostics {
                 }
 
                 let leader = leader_opt.unwrap();
-                match candidate.clone() {
-                    None => candidate = Some(leader.clone()),
-                    Some(c) => {
-                        if &c != leader {
-                            return Err(format!("Incompatible leader for term: {}", term));
+                result = match result.clone() {
+                    NoLeader => LeaderInfo::Leader(leader.clone()),
+                    LeaderInfo::Leader(other) => {
+                        if &other == leader {
+                            LeaderInfo::Leader(leader.clone())
+                        } else {
+                            LeaderInfo::Conflict(vec![
+                                ConflictEntry(leader.clone()),
+                                ConflictEntry(other.clone()),
+                            ])
                         }
+                    }
+                    LeaderInfo::Conflict(leaders) => {
+                        LeaderInfo::Conflict(append(leaders, ConflictEntry(leader.clone())))
                     }
                 }
             }
 
             // At this point, all servers have moved on to seeing leaders for a future
             // term. Note that we may or may not have an actual leader.
-            let leader = candidate.clone().map(|x| x.name);
-            info!(term, ?leader, "consensus on leader");
-            candidate.map(|c| self.leaders.insert(term, c.clone()));
+            info!(term, ?result, "consensus on leader");
+            self.leaders.insert(term, result);
+        }
+    }
+
+    // Performs a set of a sequence of checks on the data recorded by the
+    // individual servers. Returns an error if any of the checks fail.
+    pub async fn validate(&mut self) -> Result<(), String> {
+        self.collect().await;
+        self.validate_leaders().await?;
+
+        // TODO(dino): Also validate (term, index, fprint) triples and validate.
+
+        Ok(())
+    }
+
+    // Validates that across the execution history, all servers have a
+    // compatible view of who was the leader for every term. Specifically,
+    // there should be no term for which two servers recognize different peers
+    // as the leader of the cluster.
+    async fn validate_leaders(&mut self) -> Result<(), String> {
+        loop {
+            let next = self.latest_valid_term + 1;
+            match self.leaders.get(&next) {
+                // Valid. Move onto next term.
+                Some(LeaderInfo::Leader(_)) | Some(NoLeader) => self.latest_valid_term = next,
+
+                // Not enough info yet. Abort.
+                None => return Ok(()),
+
+                // Found a conflict. Don't look further.
+                Some(LeaderInfo::Conflict(_)) => {
+                    return Err(format!("Found multiple leaders for term: {}", next));
+                }
+            }
         }
     }
 }
@@ -123,6 +185,11 @@ impl ServerDiagnostics {
 
 fn address_key(address: &Server) -> String {
     format!("{}:{}", address.host, address.port)
+}
+
+fn append<T>(mut vec: Vec<T>, entry: T) -> Vec<T> {
+    vec.push(entry);
+    vec
 }
 
 #[cfg(test)]
