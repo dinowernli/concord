@@ -4,6 +4,7 @@ use axum::Router;
 use axum_tonic::NestTonic;
 use axum_tonic::RestGrpcService;
 use futures::future::join_all;
+use std::env;
 use std::error::Error;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -40,7 +41,9 @@ impl HarnessBuilder {
     // of the serving process for all instances managed by the harness.
     pub async fn build(
         self,
+        cluster_name: &str,
         failure_options: FailureOptions,
+        wipe_persistence: bool,
     ) -> Result<(Harness, Pin<Box<dyn Future<Output = ()> + Send>>), Box<dyn Error>> {
         let diag = Arc::new(Mutex::new(Diagnostics::new()));
         let all = self.addresses();
@@ -50,11 +53,25 @@ impl HarnessBuilder {
 
         for bound in self.bound {
             let (address, listener) = (bound.server, bound.listener);
+
+            // Use something like /tmp/concord/<cluster>/<server> for persistence
+            let persistence_path = env::temp_dir()
+                .as_path()
+                .join("concord")
+                .join(cluster_name)
+                .join(&address.name);
+
+            let options = Options::new(
+                persistence_path.to_str().unwrap().as_ref(),
+                wipe_persistence,
+            );
+
             let (instance, future) = Instance::new(
                 &address,
                 listener,
                 &all,
                 diag.clone(),
+                options,
                 failure_options.clone(),
             )
             .await?;
@@ -169,6 +186,7 @@ impl Instance {
         listener: TcpListener,
         all: &Vec<Server>,
         diagnostics: Arc<Mutex<Diagnostics>>,
+        options: Options,
         failure_options: FailureOptions,
     ) -> Result<(Self, Pin<Box<dyn Future<Output = ()> + Send>>), Box<dyn Error>> {
         let name = address.name.to_string();
@@ -197,7 +215,7 @@ impl Instance {
                 &initial_cluster,
                 kv_store.clone(), // The raft cluster participant is the one applying the KV writes.
                 Some(server_diagnostics),
-                Options::default(),
+                options,
                 Some(failure_options),
             )
             .await,
