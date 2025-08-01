@@ -1,9 +1,9 @@
-use crate::raft::diagnostics::LeaderInfo::NoLeader;
-use crate::raft::raft_common_proto::Server;
 use async_std::sync::{Arc, Mutex};
 use std::cmp::PartialEq;
+use std::collections::btree_map::Entry::{Occupied, Vacant};
 use std::collections::{BTreeMap, HashMap};
-use tracing::info;
+
+use crate::raft::raft_common_proto::Server;
 
 // Holds information about the execution of a cluster over time. Can be used
 // to perform various integrity checks based on the recorded data. For
@@ -13,29 +13,22 @@ pub struct Diagnostics {
     servers: HashMap<String, Arc<Mutex<ServerDiagnostics>>>,
 
     // Maps a term number to information about the leader for that term.
-    //
-    // TODO(dino): Currently the "applied commit" mechanism drains the commits from
-    // the individual ServerDiagnostics instances, but the leader collection
-    // mechanism does not. These should be unified (and perhaps use a channel).
     leaders: BTreeMap<i64, LeaderInfo>,
 
     // Historical record of validated commits, keyed by entry index.
     applied: BTreeMap<i64, CommitInfo>,
 
-    // Used as a checkpoint for leader validation.
-    latest_valid_term: i64,
+    // Holds the index of the first conflict in leader, if any.
+    first_leader_conflict_index: Option<i64>,
 
     // Holds the index of the first conflict in applied entries, if any.
-    first_applied_conflict_index: Option<i64>,
+    first_applied_conflict_term: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
 pub enum LeaderInfo {
     // Indicates that there is agreement on the leader.
     Leader(Server),
-
-    // Indicates that there was no leader. In some terms there is no leader.
-    NoLeader,
 
     // Indicates that at least two different servers were believed to be leaders
     // in the same term. Contains the two alleged leaders.
@@ -67,8 +60,8 @@ impl Diagnostics {
             leaders: BTreeMap::new(),
             applied: BTreeMap::new(),
 
-            latest_valid_term: -1,
-            first_applied_conflict_index: None,
+            first_leader_conflict_index: None,
+            first_applied_conflict_term: None,
         }
     }
 
@@ -112,52 +105,41 @@ impl Diagnostics {
     }
 
     async fn collect_leaders(&mut self) {
-        let latest = match self.leaders.last_entry() {
-            Some(e) => *e.key(),
-            None => -1,
-        };
+        for (_, server_arc) in &self.servers {
+            let mut s = server_arc.lock().await;
+            while let Some((term, leader)) = s.leaders.pop_first() {
+                match self.leaders.entry(term) {
+                    // We've seen this term before. Check for conflicts.
+                    Occupied(mut occupied) => {
+                        let existing = occupied.get().clone();
+                        let updated = match existing {
+                            LeaderInfo::Leader(other) => {
+                                if &other == &leader {
+                                    LeaderInfo::Leader(leader.clone())
+                                } else {
+                                    LeaderInfo::Conflict(vec![
+                                        ConflictEntry(leader.clone()),
+                                        ConflictEntry(other.clone()),
+                                    ])
+                                }
+                            }
+                            LeaderInfo::Conflict(c) => {
+                                LeaderInfo::Conflict(append(c, ConflictEntry(leader.clone())))
+                            }
+                        };
 
-        let mut term = latest;
-        loop {
-            term = term + 1;
-            let mut result = NoLeader;
-
-            for (_, server) in &self.servers {
-                let s = server.lock().await;
-                if s.latest_leader_term().unwrap_or(-1) < term {
-                    // This server hasn't seen a leader for this term yet. Stop.
-                    return;
-                }
-
-                let leader_opt = s.leaders.get(&term).clone();
-                if leader_opt.is_none() {
-                    // This server has seen a leader for a later term, but not this one.
-                    continue;
-                }
-
-                let leader = leader_opt.unwrap();
-                result = match result.clone() {
-                    NoLeader => LeaderInfo::Leader(leader.clone()),
-                    LeaderInfo::Leader(other) => {
-                        if &other == leader {
-                            LeaderInfo::Leader(leader.clone())
-                        } else {
-                            LeaderInfo::Conflict(vec![
-                                ConflictEntry(leader.clone()),
-                                ConflictEntry(other.clone()),
-                            ])
+                        if let LeaderInfo::Conflict(_) = &updated {
+                            self.first_leader_conflict_index.get_or_insert(term);
                         }
+                        occupied.insert(updated);
                     }
-                    LeaderInfo::Conflict(leaders) => {
-                        LeaderInfo::Conflict(append(leaders, ConflictEntry(leader.clone())))
+
+                    // First time seeing this term.
+                    Vacant(vacant) => {
+                        vacant.insert(LeaderInfo::Leader(leader));
                     }
                 }
             }
-
-            // At this point, all servers have moved on to seeing leaders for a future
-            // term. Note that we may or may not have an actual leader.
-            info!(term, ?result, "consensus on leader");
-            self.leaders.insert(term, result);
         }
     }
 
@@ -178,7 +160,7 @@ impl Diagnostics {
                 };
 
                 if &new_entry == &CommitInfo::Conflict() {
-                    self.first_applied_conflict_index.get_or_insert(index);
+                    self.first_applied_conflict_term.get_or_insert(index);
                 }
 
                 self.applied.insert(index, new_entry);
@@ -186,32 +168,17 @@ impl Diagnostics {
         }
     }
 
-    // Validates that across the execution history, all servers have a
-    // compatible view of who was the leader for every term. Specifically,
-    // there should be no term for which two servers recognize different peers
-    // as the leader of the cluster.
+    // Returns whether any conflicts have been found for applied entries.
     async fn validate_leaders(&mut self) -> Result<(), String> {
-        loop {
-            let next = self.latest_valid_term + 1;
-            match self.leaders.get(&next) {
-                // Valid. Move onto next term.
-                Some(LeaderInfo::Leader(_)) | Some(NoLeader) => self.latest_valid_term = next,
-
-                // Not enough info yet. Abort.
-                None => return Ok(()),
-
-                // Found a conflict. Don't look further.
-                Some(LeaderInfo::Conflict(_)) => {
-                    return Err(format!("Found multiple leaders for term: {}", next));
-                }
-            }
+        match self.first_leader_conflict_index {
+            Some(term) => Err(format!("Found multiple leaders for term: {}", term)),
+            None => Ok(()),
         }
     }
 
-    // Processes any new information from the individual servers since the last call
-    // and validates that no two servers disagree on any commits in the log.
+    // Returns whether any conflicts have been found for leaders.
     async fn validate_applied(&mut self) -> Result<(), String> {
-        match self.first_applied_conflict_index {
+        match self.first_applied_conflict_term {
             Some(index) => Err(format!("Found conflict for index: {}", index)),
             None => Ok(()),
         }
@@ -260,14 +227,10 @@ impl ServerDiagnostics {
             },
         );
     }
-
-    fn latest_leader_term(&self) -> Option<i64> {
-        self.leaders.last_key_value().map(|(k, _)| k.clone())
-    }
 }
 
 fn address_key(address: &Server) -> String {
-    format!("{}:{}", address.host, address.port)
+    format!("{}", &address.name)
 }
 
 fn append<T>(mut vec: Vec<T>, entry: T) -> Vec<T> {
@@ -295,6 +258,12 @@ mod tests {
                 diag: Diagnostics::new(),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_validate_empty() {
+        let mut f = Fixture::new();
+        f.diag.validate().await.expect("validation should succeed");
     }
 
     #[tokio::test]
@@ -484,7 +453,7 @@ mod tests {
         Server {
             host: host.to_string(),
             port: port as i32,
-            name: port.to_string(),
+            name: host.to_string(),
         }
     }
 }
