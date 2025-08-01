@@ -1,5 +1,6 @@
 extern crate tokio_stream;
 
+use crate::raft::raft_common_proto::Server;
 use std::convert::Infallible;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -76,6 +77,18 @@ impl TestRpcServer {
     // Returns the port the server is listening on.
     pub fn port(&self) -> Option<u16> {
         self.port
+    }
+
+    // Returns the proto representation of the server address.
+    pub fn address(&self) -> Option<Server> {
+        match self.port {
+            None => None,
+            Some(port) => Some(Server {
+                host: "::1".to_string(),
+                port: port as i32,
+                name: "fake-rpc-server".to_string(),
+            }),
+        }
     }
 
     fn stop(&mut self) {

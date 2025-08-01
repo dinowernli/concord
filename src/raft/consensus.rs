@@ -90,7 +90,7 @@ impl RaftImpl {
         state_machine: Arc<Mutex<dyn StateMachine + Send>>,
         diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
         options: Options,
-        failure_injection: Option<FailureOptions>,
+        failures: Arc<Mutex<FailureOptions>>,
     ) -> RaftImpl {
         let snapshot_bytes = state_machine.lock().await.create_snapshot();
         let snapshot = LogSnapshot {
@@ -108,10 +108,8 @@ impl RaftImpl {
             options.compaction_threshold_bytes,
             server.name.as_str(),
         );
-        let cluster = match failure_injection {
-            Some(f) => Cluster::new_with_failures(server.clone(), all.as_slice(), f),
-            None => Cluster::new(server.clone(), all.as_slice()),
-        };
+
+        let cluster = Cluster::new_with_failures(server.clone(), all.as_slice(), failures.clone());
         RaftImpl {
             address: server.clone(),
             state: Arc::new(Mutex::new(RaftState {
@@ -1093,7 +1091,8 @@ mod tests {
             committed: 0,
         };
 
-        let mut client = create_local_client_for_testing(server.port().unwrap() as i32).await;
+        let dst = server.address().expect("server");
+        let mut client = create_local_client_for_testing(dst).await;
         let append_response_1 = client
             .append(Request::new(append_request.clone()))
             .await
@@ -1157,7 +1156,8 @@ mod tests {
             committed: 0,
         };
 
-        let mut client = create_local_client_for_testing(server.port().unwrap() as i32).await;
+        let dst = server.address().expect("server");
+        let mut client = create_local_client_for_testing(dst).await;
         let append_response_1 = client
             .append(append_request)
             .await
@@ -1242,7 +1242,7 @@ mod tests {
             Arc::new(Mutex::new(FakeStateMachine::new())),
             None, /* diagnostics */
             create_config_for_testing(),
-            None, /* failure injection */
+            Arc::new(Mutex::new(FailureOptions::no_failures())),
         )
         .await
     }

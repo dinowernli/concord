@@ -28,11 +28,14 @@ mod raft;
 mod testing;
 
 // We deliberately inject some RPC failures by default.
-const DEFAULT_FAILURE_OPTIONS: FailureOptions = FailureOptions {
-    failure_probability: 0.01,
-    latency_probability: 0.05,
-    latency_ms: 50,
-};
+fn make_default_failure_options() -> FailureOptions {
+    FailureOptions {
+        failure_probability: 0.01,
+        latency_probability: 0.05,
+        latency_ms: 50,
+        disconnected: std::collections::hash_set::HashSet::new(),
+    }
+}
 
 #[derive(Debug, StructOpt, Copy, Clone)]
 struct Arguments {
@@ -227,7 +230,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (harness, serving) = Harness::builder(vec!["A", "B", "C", "D", "E"])
         .await
         .expect("builder")
-        .build(DEFAULT_FAILURE_OPTIONS.clone())
+        .with_failure(make_default_failure_options())
+        .build()
         .await
         .expect("harness");
 

@@ -3,6 +3,7 @@ use async_std::sync::Mutex;
 use axum::Router;
 use axum_tonic::NestTonic;
 use axum_tonic::RestGrpcService;
+use futures::Future;
 use futures::future::join_all;
 use std::error::Error;
 use std::pin::Pin;
@@ -25,6 +26,7 @@ use crate::raft::{Diagnostics, FailureOptions, Options, RaftImpl};
 pub struct Harness {
     instances: Vec<Instance>,
     diagnostics: Arc<Mutex<Diagnostics>>,
+    failures: Arc<Mutex<FailureOptions>>,
 }
 
 // Used to capture the intermediate state while building a harness. This is necessary
@@ -33,6 +35,7 @@ pub struct Harness {
 // ports for the other participants).
 pub struct HarnessBuilder {
     bound: Vec<BoundAddress>,
+    failure: FailureOptions,
 }
 
 impl HarnessBuilder {
@@ -40,9 +43,9 @@ impl HarnessBuilder {
     // of the serving process for all instances managed by the harness.
     pub async fn build(
         self,
-        failure_options: FailureOptions,
     ) -> Result<(Harness, Pin<Box<dyn Future<Output = ()> + Send>>), Box<dyn Error>> {
         let diag = Arc::new(Mutex::new(Diagnostics::new()));
+        let failures = Arc::new(Mutex::new(self.failure.clone()));
         let all = self.addresses();
 
         let mut serving = Vec::new();
@@ -50,14 +53,8 @@ impl HarnessBuilder {
 
         for bound in self.bound {
             let (address, listener) = (bound.server, bound.listener);
-            let (instance, future) = Instance::new(
-                &address,
-                listener,
-                &all,
-                diag.clone(),
-                failure_options.clone(),
-            )
-            .await?;
+            let (instance, future) =
+                Instance::new(&address, listener, &all, diag.clone(), failures.clone()).await?;
             let span = info_span!("serve", server=%address.name);
 
             instances.push(instance);
@@ -70,8 +67,17 @@ impl HarnessBuilder {
         let harness = Harness {
             instances,
             diagnostics: diag,
+            failures,
         };
         Ok((harness, future))
+    }
+
+    // Consumes this instance and returns an instance with the failure options set.
+    pub fn with_failure(self: Self, failure_options: FailureOptions) -> Self {
+        Self {
+            bound: self.bound,
+            failure: failure_options,
+        }
     }
 
     // Returns the addresses of all bound ports in this builder.
@@ -91,7 +97,10 @@ impl Harness {
             let server = server("::1", port as i32, name);
             bound.push(BoundAddress { listener, server })
         }
-        Ok(HarnessBuilder { bound })
+        Ok(HarnessBuilder {
+            bound,
+            failure: FailureOptions::no_failures(),
+        })
     }
 
     // Returns all the addresses managed by this harness. Note that this can include
@@ -103,6 +112,21 @@ impl Harness {
     // Returns the diagnostics object used for this harness.
     pub fn diagnostics(&self) -> Arc<Mutex<Diagnostics>> {
         self.diagnostics.clone()
+    }
+
+    // Returns the failure options object used for this harness.
+    pub fn failures(&self) -> Arc<Mutex<FailureOptions>> {
+        self.failures.clone()
+    }
+
+    // Validates all available diagnostics and panics on failure.
+    pub async fn validate(&self) {
+        self.diagnostics
+            .lock()
+            .await
+            .validate()
+            .await
+            .expect("validate");
     }
 
     // Starts the logic for this harness.
@@ -120,7 +144,7 @@ impl Harness {
     }
 
     #[cfg(test)]
-    pub async fn wait_for_leader<M>(&self, timeout_duration: Duration, matcher: M)
+    pub async fn wait_for_leader<M>(&self, timeout_duration: Duration, matcher: M) -> (i64, Server)
     where
         M: Fn(&(i64, Server)) -> bool,
     {
@@ -133,14 +157,21 @@ impl Harness {
 
             let (term, leader) = match locked_diagnostics.latest_leader() {
                 Some((term, leader)) => (term, leader),
-                None => return false,
+                None => return None, // Return None if no leader is found
             };
 
-            assert!(self.valid_server_name(&leader.name));
-            matcher(&(term, leader))
+            if !self.valid_server_name(&leader.name) {
+                return None;
+            }
+
+            if matcher(&(term, leader.clone())) {
+                Some((term, leader)) // Return the leader info if matcher passes
+            } else {
+                None
+            }
         })
         .await
-        .expect("wait_for_leader");
+        .expect("wait_for_leader")
     }
 
     #[cfg(test)]
@@ -169,7 +200,7 @@ impl Instance {
         listener: TcpListener,
         all: &Vec<Server>,
         diagnostics: Arc<Mutex<Diagnostics>>,
-        failure_options: FailureOptions,
+        failure_options: Arc<Mutex<FailureOptions>>,
     ) -> Result<(Self, Pin<Box<dyn Future<Output = ()> + Send>>), Box<dyn Error>> {
         let name = address.name.to_string();
         let port = listener.local_addr()?.port();
@@ -190,15 +221,15 @@ impl Instance {
 
         // Set up the grpc service for the raft participant. The first 3 server entries are active initially.
         assert!(all.len() >= 3);
-        let initial_cluster = vec![all[0].clone(), all[1].clone(), all[2].clone()];
+        let cluster = vec![all[0].clone(), all[1].clone(), all[2].clone()];
         let raft = Arc::new(
             RaftImpl::new(
                 address,
-                &initial_cluster,
+                &cluster,
                 kv_store.clone(), // The raft cluster participant is the one applying the KV writes.
                 Some(server_diagnostics),
                 Options::default(),
-                Some(failure_options),
+                failure_options,
             )
             .await,
         );
@@ -260,16 +291,16 @@ fn server(host: &str, port: i32, name: &str) -> Server {
 }
 
 /// Waits for a condition to become true, up to the given `timeout_duration`.
-/// Returns `Ok(())` if the condition is met in time, or `Err(())` on timeout.
-async fn wait_for<F, Fut>(timeout_duration: Duration, mut condition: F) -> Result<(), ()>
+/// Returns `Ok(T)` if the condition is met in time, or `Err(())` on timeout.
+async fn wait_for<F, Fut, T>(timeout_duration: Duration, mut condition: F) -> Result<T, ()>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = bool>,
+    Fut: Future<Output = Option<T>>,
 {
     let start = tokio::time::Instant::now();
     while start.elapsed() < timeout_duration {
-        if condition().await {
-            return Ok(());
+        if let Some(result) = condition().await {
+            return Ok(result);
         }
         sleep(Duration::from_millis(300)).await;
     }
