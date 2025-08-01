@@ -471,7 +471,6 @@ dependencies = [
  "rand",
  "reqwest",
  "structopt",
- "timer",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -2091,15 +2090,6 @@ checksum = "8b9ef9bad013ada3808854ceac7b46812a6465ba368859a37e2100283d2d719c"
 dependencies = [
  "cfg-if",
  "once_cell",
-]
-
-[[package]]
-name = "timer"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31d42176308937165701f50638db1c31586f183f1aab416268216577aec7306b"
-dependencies = [
- "chrono",
 ]
 
 [[package]]
