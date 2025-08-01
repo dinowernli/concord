@@ -25,6 +25,7 @@ use crate::raft::{Diagnostics, FailureOptions, Options, RaftImpl};
 pub struct Harness {
     instances: Vec<Instance>,
     diagnostics: Arc<Mutex<Diagnostics>>,
+    failures: Arc<Mutex<FailureOptions>>,
 }
 
 // Used to capture the intermediate state while building a harness. This is necessary
@@ -33,6 +34,7 @@ pub struct Harness {
 // ports for the other participants).
 pub struct HarnessBuilder {
     bound: Vec<BoundAddress>,
+    failure: FailureOptions,
 }
 
 impl HarnessBuilder {
@@ -40,9 +42,9 @@ impl HarnessBuilder {
     // of the serving process for all instances managed by the harness.
     pub async fn build(
         self,
-        failure_options: FailureOptions,
     ) -> Result<(Harness, Pin<Box<dyn Future<Output = ()> + Send>>), Box<dyn Error>> {
         let diag = Arc::new(Mutex::new(Diagnostics::new()));
+        let failures = Arc::new(Mutex::new(self.failure.clone()));
         let all = self.addresses();
 
         let mut serving = Vec::new();
@@ -50,14 +52,8 @@ impl HarnessBuilder {
 
         for bound in self.bound {
             let (address, listener) = (bound.server, bound.listener);
-            let (instance, future) = Instance::new(
-                &address,
-                listener,
-                &all,
-                diag.clone(),
-                failure_options.clone(),
-            )
-            .await?;
+            let (instance, future) =
+                Instance::new(&address, listener, &all, diag.clone(), failures.clone()).await?;
             let span = info_span!("serve", server=%address.name);
 
             instances.push(instance);
@@ -70,8 +66,17 @@ impl HarnessBuilder {
         let harness = Harness {
             instances,
             diagnostics: diag,
+            failures,
         };
         Ok((harness, future))
+    }
+
+    // Consumes this instance and returns an instance with the failure options set.
+    pub fn with_failure(self: Self, failure_options: FailureOptions) -> Self {
+        Self {
+            bound: self.bound,
+            failure: failure_options,
+        }
     }
 
     // Returns the addresses of all bound ports in this builder.
@@ -91,7 +96,10 @@ impl Harness {
             let server = server("::1", port as i32, name);
             bound.push(BoundAddress { listener, server })
         }
-        Ok(HarnessBuilder { bound })
+        Ok(HarnessBuilder {
+            bound,
+            failure: FailureOptions::no_failures(),
+        })
     }
 
     // Returns all the addresses managed by this harness. Note that this can include
@@ -103,6 +111,11 @@ impl Harness {
     // Returns the diagnostics object used for this harness.
     pub fn diagnostics(&self) -> Arc<Mutex<Diagnostics>> {
         self.diagnostics.clone()
+    }
+
+    // Returns the failure options object used for this harness.
+    pub fn failures(&self) -> Arc<Mutex<FailureOptions>> {
+        self.failures.clone()
     }
 
     // Starts the logic for this harness.
@@ -169,7 +182,7 @@ impl Instance {
         listener: TcpListener,
         all: &Vec<Server>,
         diagnostics: Arc<Mutex<Diagnostics>>,
-        failure_options: FailureOptions,
+        failure_options: Arc<Mutex<FailureOptions>>,
     ) -> Result<(Self, Pin<Box<dyn Future<Output = ()> + Send>>), Box<dyn Error>> {
         let name = address.name.to_string();
         let port = listener.local_addr()?.port();
@@ -190,15 +203,15 @@ impl Instance {
 
         // Set up the grpc service for the raft participant. The first 3 server entries are active initially.
         assert!(all.len() >= 3);
-        let initial_cluster = vec![all[0].clone(), all[1].clone(), all[2].clone()];
+        let cluster = vec![all[0].clone(), all[1].clone(), all[2].clone()];
         let raft = Arc::new(
             RaftImpl::new(
                 address,
-                &initial_cluster,
+                &cluster,
                 kv_store.clone(), // The raft cluster participant is the one applying the KV writes.
                 Some(server_diagnostics),
                 Options::default(),
-                Some(failure_options),
+                failure_options,
             )
             .await,
         );
