@@ -17,7 +17,6 @@ prost = "0.13.5"
 rand = "0.8"
 reqwest = "0.12"
 structopt = "0.3"
-timer = "0.2"
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.12.3"
