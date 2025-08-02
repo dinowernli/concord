@@ -1,5 +1,5 @@
 use crate::harness::Harness;
-use crate::raft::FailureOptions;
+
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
@@ -22,7 +22,7 @@ async fn make_harness() -> Harness {
     let (harness, serving) = Harness::builder(NAMES.to_vec())
         .await
         .expect("builder")
-        .build(FailureOptions::no_failures())
+        .build()
         .await
         .expect("harness");
     harness.start().await;

@@ -14,6 +14,6 @@ pub mod grpc {
 
 pub(in crate::keyvalue) mod http;
 #[path = "generated/keyvalue_proto.rs"]
-pub(in crate::keyvalue) mod keyvalue_proto;
+pub(crate) mod keyvalue_proto;
 pub(in crate::keyvalue) mod service;
 pub(in crate::keyvalue) mod store;
