@@ -4,11 +4,12 @@ use crate::raft::raft_common_proto::{ClusterConfig, Server};
 use crate::raft::raft_service_proto::raft_client::RaftClient;
 use crate::raft::store::ConfigInfo;
 
+use crate::raft::error::{RaftError, RaftResult};
 use async_std::sync::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tonic::transport::{Channel, Endpoint, Error};
+use tonic::transport::{Channel, Endpoint};
 use tracing::debug;
 
 pub type RaftClientType = RaftClient<FailureInjectionMiddleware<Channel>>;
@@ -184,9 +185,10 @@ impl Cluster {
         true
     }
 
-    // Returns an rpc client which can be used to contact the supplied peer.
-    pub async fn new_client(&mut self, address: &Server) -> Result<RaftClientType, Error> {
+    // Returns an RPC client which can be used to contact the supplied peer.
+    pub async fn new_client(&mut self, address: &Server) -> RaftResult<RaftClientType> {
         let channel_info = ChannelInfo::from_server(self.me.clone(), address.clone());
+        let other = address.name.clone();
 
         let k = key(address);
         let cached = self.channels.get_mut(&k);
@@ -202,13 +204,22 @@ impl Cluster {
         }
 
         // Cache miss, create a new channel.
-        let dst = format!("http://[::1]:{}", address.port);
+        let dst = format!("http://[{}]:{}", address.host, address.port);
         let timeout = Duration::from_secs(1);
-        let channel = Endpoint::new(dst)?
+
+        let endpoint = Endpoint::new(dst).map_err(|e| RaftError::ConnectionFailed {
+            peer: other.clone(),
+            source: e.into(),
+        })?;
+        let channel = endpoint
             .connect_timeout(timeout.clone())
             .timeout(timeout.clone())
             .connect()
-            .await?;
+            .await
+            .map_err(|e| RaftError::ConnectionFailed {
+                peer: other.clone(),
+                source: e.into(),
+            })?;
         self.channels.insert(k, channel.clone());
 
         Ok(RaftClient::new(wrap_channel(
