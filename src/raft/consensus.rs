@@ -1,18 +1,19 @@
 extern crate rand;
 
-use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
-use std::time::Duration;
-
+use async_std::stream::StreamExt;
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::{Either, join_all};
+use futures::stream::FuturesUnordered;
 use rand::Rng;
+use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
+use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tonic::{Request, Response, Status};
-use tracing::{Instrument, debug, info, info_span, instrument, warn};
+use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
 use diagnostics::ServerDiagnostics;
 use raft::StateMachine;
@@ -23,7 +24,7 @@ use raft::raft_service_proto::{CommitRequest, CommitResponse, StepDownRequest, S
 use raft::raft_service_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 
 use crate::raft;
-use crate::raft::cluster::Cluster;
+use crate::raft::cluster::{Cluster, QuorumResult};
 use crate::raft::cluster::{RaftClientType, key};
 use crate::raft::consensus::RaftRole::Leader;
 use crate::raft::diagnostics;
@@ -178,11 +179,11 @@ impl RaftImpl {
         }
     }
 
-    // Returns whether or not the election process is deemed complete. If complete,
-    // there is no need to run any further elections.
+    // Returns whether the election process has completed, either because we've
+    // won the election or because we've detected a higher term. In particular,
+    // if we return true, no further elections are required for this term.
     async fn run_election(arc_state: Arc<Mutex<RaftState>>, term: i64) -> bool {
-        let futures: Vec<_>;
-        {
+        let (request, cluster) = {
             let mut state = arc_state.lock().await;
 
             if state.term() > term {
@@ -196,83 +197,109 @@ impl RaftImpl {
             // Prepare the election. Note that we don't reset the timer because this
             // would lead to cancelling our own ongoing execution.
             debug!(term, "starting election");
-            let me = state.cluster.me();
+            let voted_for = state.cluster.me(); // We vote for ourselves.
             state.role = RaftRole::Candidate;
-            state.store.update_term_info(term, &Some(me));
+            state.store.update_term_info(term, &Some(voted_for));
 
-            // Request votes from all peers.
+            // Take a snapshot of the cluster so we can release the state lock.
             let request = state.create_vote_request();
-            futures = state
-                .cluster
-                .others()
-                .iter()
-                .map(|o| {
-                    let other = o.clone();
-                    let request_clone = request.clone();
-                    let arc_state_clone = arc_state.clone(); // Clone for the async block
+            let cluster = state.cluster.clone();
+            (request, cluster)
+        };
 
-                    async move {
-                        let client = {
-                            let mut state = arc_state_clone.lock().await;
-                            state.cluster.new_client(&other).await?
-                        };
-                        RaftState::request_vote(client, other.clone(), request_clone).await
-                    }
-                })
-                .collect();
-        }
+        // Request votes from all peers.
+        let futs: Vec<_> = cluster
+            .others()
+            .iter()
+            .map(|o| {
+                let other = o.clone();
+                let request = request.clone();
+                let mut cluster = cluster.clone();
 
-        let results = join_all(futures).await;
+                async move {
+                    let client = match cluster.new_client(&other).await {
+                        Ok(client) => client,
+                        Err(error) => return (other, Err(error)),
+                    };
+                    RaftState::request_vote(client, other.clone(), request).await
+                }
+            })
+            .collect();
 
-        {
-            let mut state = arc_state.lock().await;
+        // Process the results one-by-one as they arrive.
+        let mut unordered: FuturesUnordered<_> = futs.into_iter().map(Box::pin).collect();
+        let mut aye = vec![cluster.me().clone()];
+        let mut nay = Vec::new();
 
-            // The world has moved on or someone else has won in this term.
-            if state.term() > term || state.role != RaftRole::Candidate {
-                return true;
-            }
-
-            let mut votes = Vec::new();
-
-            // We always vote for ourselves.
-            votes.push(state.cluster.me());
-            for response in results {
-                match response {
-                    Ok((peer, message)) => {
-                        if message.term > term {
-                            info!(term=state.term(), other_term=message.term, role=?state.role, "detected higher term");
-                            state.become_follower(arc_state.clone(), message.term);
+        let mut won = false;
+        while let Some((server, result)) = unordered.next().await {
+            match result {
+                Ok(response) => {
+                    let other_term = response.term;
+                    if other_term > term {
+                        let mut state = arc_state.lock().await;
+                        if state.term() > other_term {
+                            // The world has moved on. Stop.
                             return true;
                         }
-                        if message.granted {
-                            votes.push(peer);
-                        }
+
+                        info!(term=term, other_term=other_term, role=?state.role, "detected higher term");
+                        state.become_follower(arc_state.clone(), other_term);
+                        return true;
                     }
-                    Err(e) => warn!("vote request error: {}", e),
+                    if response.granted {
+                        aye.push(server)
+                    } else {
+                        nay.push(server)
+                    }
+                }
+                Err(error) => {
+                    // TODO(dino): we could wrap the future in something that retries a few times
+                    // before giving up. Right now, if the RPC fails, we assume no vote.
+                    warn!("vote request failed: {}", error);
+                    nay.push(server)
                 }
             }
 
-            let arc_state_copy = arc_state.clone();
-            let supporters: Vec<String> = votes.iter().map(|s| s.name.to_string()).collect();
-            return if state.cluster.is_quorum(&votes) {
-                debug!(term, votes=?supporters, "won election");
-                state.role = Leader;
-                state.create_follower_positions(true /* clear_existing */);
-                state.timer_guard = None;
-
-                let me = state.name();
-                tokio::spawn(async move {
-                    let span = info_span!("replicate", server=%me);
-                    RaftImpl::replicate_loop(arc_state_copy, term)
-                        .instrument(span)
-                        .await;
-                });
-                true
-            } else {
-                debug!(term, votes=?supporters, "lost election");
-                false
-            };
+            match cluster.has_quorum(&aye, &nay) {
+                QuorumResult::Unknown => continue,
+                QuorumResult::No => {
+                    debug!(term, yes=?aye, no=?nay, "lost election");
+                    return false;
+                }
+                QuorumResult::Yes => {
+                    debug!(term, yes=?aye, no=?nay, "won election");
+                    won = true;
+                    break;
+                }
+            }
         }
+
+        let arc_state_copy = arc_state.clone();
+        if won {
+            let mut state = arc_state.lock().await;
+            if state.term() > term {
+                // The world has moved on. Stop.
+                return true;
+            }
+
+            state.role = Leader;
+            state.create_follower_positions(true /* clear_existing */);
+            state.timer_guard = None;
+
+            let me = state.name();
+            tokio::spawn(async move {
+                let span = info_span!("replicate", server=%me);
+                RaftImpl::replicate_loop(arc_state_copy, term)
+                    .instrument(span)
+                    .await;
+            });
+            return true;
+        }
+
+        // We should never get here. If we lost the election, we return above.
+        error!(term, yes=?aye, no=?nay, "bug in election logic, should not reach here");
+        false
     }
 
     // Starts the main leader replication loop. The loop stops once the term has
@@ -779,14 +806,16 @@ impl RaftState {
         mut client: RaftClientType,
         other: Server,
         req: VoteRequest,
-    ) -> RaftResult<(Server, VoteResponse)> {
+    ) -> (Server, RaftResult<VoteResponse>) {
         let mut request = Request::new(req.clone());
         request.set_timeout(Duration::from_millis(RPC_TIMEOUT_MS));
-        let result = client.vote(request).await;
-        let name = other.clone().name;
-        result
-            .map(|response| (other, response.into_inner()))
-            .map_err(|status| RaftError::Rpc { peer: name, status })
+        let name = other.name.clone();
+        let result = client
+            .vote(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| RaftError::Rpc { peer: name, status });
+        (other, result)
     }
 }
 

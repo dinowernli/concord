@@ -14,6 +14,20 @@ use tracing::debug;
 
 pub type RaftClientType = RaftClient<FailureInjectionMiddleware<Channel>>;
 
+// The outcome of an assessment of whether we have quorum based on a set of "aye" votes
+// and a set of "nay" votes.
+#[derive(PartialEq, PartialOrd, Clone, Debug)]
+pub enum QuorumResult {
+    // Indicates that a set of votes has achieved quorum.
+    Yes,
+
+    // Indicates that, based on votes, we cannot achieve quorum.
+    No,
+
+    // Indicates that we need more votes in order to decide whether we have quorum.
+    Unknown,
+}
+
 // Returns a string key for the supplied server. Two server structs
 // map to the same key if they are reachable at the same address. For
 // instance, two servers differing only in name will share a key.
@@ -22,6 +36,7 @@ pub fn key(server: &Server) -> String {
 }
 
 // Holds information about a Raft cluster.
+#[derive(Clone)]
 pub struct Cluster {
     me: Server,
     voters: HashMap<String, Server>,
@@ -107,24 +122,23 @@ impl Cluster {
         !self.voters_next.is_empty()
     }
 
-    // Returns whether or not the supplied votes constitute a quorum, given the
-    // current cluster configuration.
-    pub fn is_quorum(&self, votes: &Vec<Server>) -> bool {
-        // First, get all the unique keys from the votes.
-        let mut uniques = HashSet::new();
-        for server in votes {
-            uniques.insert(key(&server));
-        }
+    // Returns whether the current votes constitute quorum for the current cluster config.
+    pub fn has_quorum(&self, aye: &Vec<Server>, nay: &Vec<Server>) -> QuorumResult {
+        let ayes: HashSet<_> = aye.iter().map(|s| key(s)).collect();
+        let nays: HashSet<_> = nay.iter().map(|s| key(s)).collect();
 
-        // Joint consensus means we must have quorum individually among both
-        // sets of members if present (trivially true if voters_next is empty).
-        if !is_quorum_among(&uniques, &self.voters) {
-            return false;
+        let voters_current = &self.voters.keys().cloned().collect();
+        let voters_next = &self.voters_next.keys().cloned().collect();
+
+        let quorum_current = has_quorum_among(&voters_current, &ayes, &nays);
+        let quorum_next = has_quorum_among(&voters_next, &ayes, &nays);
+
+        match (quorum_current, quorum_next) {
+            (QuorumResult::Yes, QuorumResult::Yes) => QuorumResult::Yes,
+            (QuorumResult::No, _) => QuorumResult::No,
+            (_, QuorumResult::No) => QuorumResult::No,
+            _ => QuorumResult::Unknown,
         }
-        if !is_quorum_among(&uniques, &self.voters_next) {
-            return false;
-        }
-        true
     }
 
     // Returns the highest index which has been replicated to a sufficient quorum of
@@ -248,6 +262,14 @@ impl Cluster {
         result.extend(self.voters_next.clone());
         result
     }
+
+    // Convenience method for testing, indicates whether a set of votes is
+    // sufficient for a quorum given the current configuration.
+    #[cfg(test)]
+    fn is_quorum(&self, votes: &Vec<Server>) -> bool {
+        let nay = Vec::new();
+        self.has_quorum(votes, &nay) == QuorumResult::Yes
+    }
 }
 
 fn wrap_channel(
@@ -262,19 +284,34 @@ fn server_map(servers: Vec<Server>) -> HashMap<String, Server> {
     servers.into_iter().map(|s| (key(&s), s.clone())).collect()
 }
 
-fn is_quorum_among(votes: &HashSet<String>, members: &HashMap<String, Server>) -> bool {
+// Returns whether the supplied votes constitute a quorum (i.e. majority) among the supplied
+// members. Callers mustn't pass the same string in both "aye" and "nay".
+fn has_quorum_among(
+    members: &HashSet<String>,
+    aye: &HashSet<String>,
+    nay: &HashSet<String>,
+) -> QuorumResult {
     if members.is_empty() {
-        return true;
+        return QuorumResult::Yes;
     }
 
-    // Count the number present in the members.
-    let mut count = 0;
-    for key in votes {
-        if members.contains_key(key.as_str()) {
-            count = count + 1;
-        }
+    let member_count = members.len();
+    let aye_count = aye.iter().filter(|&s| members.contains(s.as_str())).count();
+    let nay_count = nay.iter().filter(|&s| members.contains(s.as_str())).count();
+    let remaining = member_count - (aye_count + nay_count);
+
+    // Check for majority.
+    if 2 * aye_count > member_count {
+        return QuorumResult::Yes;
     }
-    2 * count > members.len()
+
+    // Even if all remaining votes are "aye", we don't get a majority. So a quorum
+    // is no longer possible.
+    if 2 * (aye_count + remaining) <= member_count {
+        return QuorumResult::No;
+    }
+
+    QuorumResult::Unknown
 }
 
 fn highest_replicated_index_among(
@@ -499,6 +536,76 @@ mod tests {
 
         assert!(cluster.is_quorum(&vec![s1.clone(), s2.clone(), s3.clone()]));
         assert!(!cluster.is_quorum(&vec![s1.clone(), s2.clone(), s6.clone()]));
+    }
+
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_empty_membership_always_yes() {
+        let members = set(&[]);
+        assert_eq!(
+            has_quorum_among(&members, &set(&["a"]), &set(&["b"])),
+            QuorumResult::Yes
+        );
+    }
+
+    #[test]
+    fn test_single_member_aye_wins() {
+        let members = set(&["a"]);
+        let aye = &set(&["a"]);
+        assert_eq!(
+            has_quorum_among(&members, &aye, &set(&[])),
+            QuorumResult::Yes
+        );
+    }
+
+    #[test]
+    fn test_single_member_nay_wins() {
+        let members = set(&["a"]);
+        assert_eq!(
+            has_quorum_among(&members, &set(&[]), &set(&["a"])),
+            QuorumResult::No
+        );
+    }
+
+    #[test]
+    fn test_majority_aye() {
+        let members = set(&["a", "b", "c"]);
+        let aye = set(&["a", "b"]);
+        let nay = set(&[]);
+        assert_eq!(has_quorum_among(&members, &aye, &nay), QuorumResult::Yes);
+    }
+
+    #[test]
+    fn test_majority_nay() {
+        let members = set(&["a", "b", "c"]);
+        let aye = set(&[]);
+        let nay = set(&["a", "b"]);
+        assert_eq!(has_quorum_among(&members, &aye, &nay), QuorumResult::No);
+    }
+
+    #[test]
+    fn test_not_enough_votes_yet_unknown() {
+        let members = set(&["a", "b", "c"]);
+        let aye = set(&["a"]);
+        let nay = set(&[]);
+        // With 1 aye, 0 nay, and 2 undecided, either side could still win.
+        assert_eq!(
+            has_quorum_among(&members, &aye, &nay),
+            QuorumResult::Unknown
+        );
+    }
+
+    #[test]
+    fn test_invalid_votes_are_ignored() {
+        let members = set(&["a", "b"]);
+        let aye = set(&["c"]); // not in members
+        let nay = set(&["b"]);
+        // "c" is ignored, so aye=0, nay=1, remaining=1.
+        // Nay is guaranteed to win → No.
+        assert_eq!(has_quorum_among(&members, &aye, &nay), QuorumResult::No);
     }
 
     #[test]
