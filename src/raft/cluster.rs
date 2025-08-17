@@ -1,10 +1,10 @@
+use crate::raft::error::{RaftError, RaftResult};
 use crate::raft::failure_injection::{ChannelInfo, FailureInjectionMiddleware, FailureOptions};
 use crate::raft::raft_common_proto::entry::Data::Config;
 use crate::raft::raft_common_proto::{ClusterConfig, Server};
 use crate::raft::raft_service_proto::raft_client::RaftClient;
 use crate::raft::store::ConfigInfo;
 
-use crate::raft::error::{RaftError, RaftResult};
 use async_std::sync::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -41,10 +41,12 @@ pub struct Cluster {
     me: Server,
     voters: HashMap<String, Server>,
     voters_next: HashMap<String, Server>,
-    channels: HashMap<String, Channel>,
     last_known_leader: Option<Server>,
     config_info: Option<ConfigInfo>,
-    failure: Arc<Mutex<FailureOptions>>,
+
+    // Has its own locking setup so that it can be shared among all clones
+    // of this cluster object.
+    channels: Arc<Mutex<ChannelCache>>,
 }
 
 impl Cluster {
@@ -59,14 +61,18 @@ impl Cluster {
         all: &[Server],
         failure: Arc<Mutex<FailureOptions>>,
     ) -> Self {
+        let channels = Arc::new(Mutex::new(ChannelCache {
+            me: me.clone(),
+            channels: HashMap::new(),
+            failure,
+        }));
         Cluster {
             me,
             voters: server_map(all.to_vec()),
             voters_next: HashMap::new(),
-            channels: HashMap::new(),
+            channels,
             last_known_leader: None,
             config_info: None,
-            failure,
         }
     }
 
@@ -192,55 +198,15 @@ impl Cluster {
             self.voters = server_map(config.voters);
             self.voters_next = server_map(config.voters_next);
         }
-        // We could probably reuse some of these. Clear them all for now.
-        self.channels.drain();
 
         debug!(committed = info.committed, index, "new cluster config");
         true
     }
 
     // Returns an RPC client which can be used to contact the supplied peer.
-    pub async fn new_client(&mut self, address: &Server) -> RaftResult<RaftClientType> {
-        let channel_info = ChannelInfo::from_server(self.me.clone(), address.clone());
-        let other = address.name.clone();
-
-        let k = key(address);
-        let cached = self.channels.get_mut(&k);
-        let failure_options = self.failure.clone();
-        if let Some(channel) = cached {
-            // The "clone()" operation on channels is advertized as cheap and is the
-            // recommended way to reuse channels.
-            return Ok(RaftClient::new(wrap_channel(
-                channel.clone(),
-                failure_options,
-                channel_info,
-            )));
-        }
-
-        // Cache miss, create a new channel.
-        let dst = format!("http://[{}]:{}", address.host, address.port);
-        let timeout = Duration::from_secs(1);
-
-        let endpoint = Endpoint::new(dst).map_err(|e| RaftError::ConnectionFailed {
-            peer: other.clone(),
-            source: e.into(),
-        })?;
-        let channel = endpoint
-            .connect_timeout(timeout.clone())
-            .timeout(timeout.clone())
-            .connect()
-            .await
-            .map_err(|e| RaftError::ConnectionFailed {
-                peer: other.clone(),
-                source: e.into(),
-            })?;
-        self.channels.insert(k, channel.clone());
-
-        Ok(RaftClient::new(wrap_channel(
-            channel,
-            failure_options.clone(),
-            channel_info,
-        )))
+    pub async fn new_client(&self, address: &Server) -> RaftResult<RaftClientType> {
+        let mut cache = self.channels.lock().await;
+        cache.new_client(address).await
     }
 
     // Returns a cluster configuration that represents joint consensus between the
@@ -339,6 +305,58 @@ fn highest_replicated_index_among(
     let mid = indexes.len() / 2;
 
     indexes[mid]
+}
+
+struct ChannelCache {
+    me: Server,
+    channels: HashMap<String, Channel>,
+    failure: Arc<Mutex<FailureOptions>>,
+}
+
+impl ChannelCache {
+    // Returns an RPC client which can be used to contact the supplied peer.
+    pub async fn new_client(&mut self, address: &Server) -> RaftResult<RaftClientType> {
+        let channel_info = ChannelInfo::from_server(self.me.clone(), address.clone());
+        let other = address.name.clone();
+
+        let k = key(address);
+        let cached = self.channels.get_mut(&k);
+        let failure_options = self.failure.clone();
+        if let Some(channel) = cached {
+            // The "clone()" operation on channels is advertized as cheap and is the
+            // recommended way to reuse channels.
+            return Ok(RaftClient::new(wrap_channel(
+                channel.clone(),
+                failure_options,
+                channel_info,
+            )));
+        }
+
+        // Cache miss, create a new channel.
+        let dst = format!("http://[{}]:{}", address.host, address.port);
+        let timeout = Duration::from_secs(1);
+
+        let endpoint = Endpoint::new(dst).map_err(|e| RaftError::ConnectionFailed {
+            peer: other.clone(),
+            source: e.into(),
+        })?;
+        let channel = endpoint
+            .connect_timeout(timeout.clone())
+            .timeout(timeout.clone())
+            .connect()
+            .await
+            .map_err(|e| RaftError::ConnectionFailed {
+                peer: other.clone(),
+                source: e.into(),
+            })?;
+        self.channels.insert(k, channel.clone());
+
+        Ok(RaftClient::new(wrap_channel(
+            channel,
+            failure_options.clone(),
+            channel_info,
+        )))
+    }
 }
 
 #[cfg(test)]

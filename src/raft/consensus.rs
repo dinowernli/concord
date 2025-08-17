@@ -214,7 +214,7 @@ impl RaftImpl {
             .map(|o| {
                 let other = o.clone();
                 let request = request.clone();
-                let mut cluster = cluster.clone();
+                let cluster = cluster.clone();
 
                 async move {
                     let client = match cluster.new_client(&other).await {
@@ -384,8 +384,8 @@ impl RaftImpl {
         arc_state: Arc<Mutex<RaftState>>,
         follower: Server,
     ) -> RaftResult<()> {
-        let (client, request) = {
-            let mut state = arc_state.lock().await;
+        let (cluster, request) = {
+            let state = arc_state.lock().await;
             if state.role != Leader {
                 return Err(RaftError::StaleState);
             }
@@ -399,19 +399,21 @@ impl RaftImpl {
                 )))?
                 .next_index;
 
-            let client = state.cluster.new_client(&follower).await?;
+            // Snapshot the cluster so that we can drop the state lock.
+            let cluster = state.cluster.clone();
 
             // Decide whether to send entries or a snapshot.
             if state.store.is_index_compacted(next_index) {
                 let snapshot_request = state.create_snapshot_request();
-                (client, Either::Left(snapshot_request))
+                (cluster, Either::Left(snapshot_request))
             } else {
                 let append_request = state.create_append_request(next_index);
-                (client, Either::Right(append_request))
+                (cluster, Either::Right(append_request))
             }
         };
 
-        // Perform the RPC outside of the main state lock.
+        // Perform the RPC outside the main state lock.
+        let client = cluster.new_client(&follower).await?;
         match request {
             Either::Left(req) => Self::replicate_snapshot(client, arc_state, follower, req).await?,
             Either::Right(req) => Self::replicate_append(client, arc_state, follower, req).await?,
