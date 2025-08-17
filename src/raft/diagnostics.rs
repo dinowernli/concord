@@ -76,8 +76,8 @@ impl Diagnostics {
         self.servers.get(key.as_str()).unwrap().clone()
     }
 
-    // Returns the latest leader of a term that has been recognized as leader by all
-    // the participants. Returns None if there is no such term and leader.
+    // Returns the latest leader of a term that has been recognized as leader by some
+    // participant. Returns None if there is no such term and leader.
     pub fn latest_leader(&self) -> Option<(i64, Server)> {
         for (term, info) in self.leaders.iter().rev() {
             if let LeaderInfo::Leader(leader) = info {

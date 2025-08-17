@@ -107,8 +107,10 @@ impl ClientImpl {
     {
         let mut leader = self.leader.lock().await.clone();
         let attempts = self.max_leader_follow_attempts;
+
         for _ in 0..attempts {
-            let retry_wait_ms = match operation(leader.clone()).await {
+            let outcome = operation(leader.clone()).await;
+            let retry_wait_ms = match outcome {
                 Failure(status) => return Err(status),
                 Success(result) => return Ok(result),
                 NewLeader(Some(new_leader)) => {
@@ -122,6 +124,7 @@ impl ClientImpl {
             };
             sleep(Duration::from_millis(retry_wait_ms)).await;
         }
+
         Err(tonic::Status::internal(format!(
             "Failed to contact leader after {} attempts",
             attempts
