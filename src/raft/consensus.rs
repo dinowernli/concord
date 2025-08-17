@@ -26,6 +26,7 @@ use raft::raft_service_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
 use crate::raft;
 use crate::raft::cluster::{Cluster, QuorumResult};
 use crate::raft::cluster::{RaftClientType, key};
+use crate::raft::consensus::CommitError::{Internal, NotLeader};
 use crate::raft::consensus::RaftRole::Leader;
 use crate::raft::diagnostics;
 use crate::raft::error::{RaftError, RaftResult};
@@ -283,13 +284,15 @@ impl RaftImpl {
                 return true;
             }
 
+            let me = state.cluster.me();
+
             state.role = Leader;
             state.create_follower_positions(true /* clear_existing */);
             state.timer_guard = None;
+            state.cluster.record_leader(&me, term);
 
-            let me = state.name();
             tokio::spawn(async move {
-                let span = info_span!("replicate", server=%me);
+                let span = info_span!("replicate", server=%me.name);
                 RaftImpl::replicate_loop(arc_state_copy, term)
                     .instrument(span)
                     .await;
@@ -493,14 +496,14 @@ impl RaftImpl {
     async fn commit_internal(
         arc_state: Arc<Mutex<RaftState>>,
         data: Data,
-    ) -> Result<EntryId, raft_service_proto::Status> {
+    ) -> Result<EntryId, CommitError> {
         let term;
         let entry_id;
         let receiver;
         {
             let mut state = arc_state.lock().await;
             if state.role != Leader {
-                return Err(raft_service_proto::Status::NotLeader);
+                return Err(NotLeader);
             }
 
             term = state.term();
@@ -533,17 +536,23 @@ impl RaftImpl {
                 } else {
                     // A different entry got committed to this index. This means
                     // the leader must have changed, let the caller know.
-                    Err(raft_service_proto::Status::NotLeader)
+                    Err(NotLeader)
                 }
             }
             Err(_) => {
                 // The sender went out of scope without ever being resolved. This can
                 // happen in rare cases where the index we're interested in got compacted.
                 // In this case we don't know whether the entry was committed.
-                Err(raft_service_proto::Status::NotLeader)
+                Err(Internal)
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CommitError {
+    NotLeader,
+    Internal,
 }
 
 // Holds the state a cluster leader tracks about its followers. Used to decide
@@ -581,7 +590,7 @@ impl Drop for TimerGuard {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 enum RaftRole {
     Follower,
     Candidate,
@@ -793,6 +802,34 @@ impl RaftState {
         }
     }
 
+    // Returns which server is currently believed to be the leader. Returns absent if we don't
+    // know who the leader is. Returns a pointer to this instance if we are leader.
+    fn current_leader(&self) -> Option<Server> {
+        let role = self.role.clone();
+        let me = self.cluster.me();
+        let member = self.cluster.am_voting_member();
+        if role == Leader {
+            return Some(me);
+        }
+
+        let record = self.cluster.last_known_leader();
+        let term = self.term();
+
+        record
+            .map(|r| {
+                if r.term != term {
+                    None
+                } else if r.leader == me && (role != Leader || !member) {
+                    // Don't return ourselves as leader if we've just stepped down, or are not
+                    // a voting member of the cluster.
+                    None
+                } else {
+                    Some(r.leader)
+                }
+            })
+            .flatten()
+    }
+
     // Returns a request which a candidate can send in order to request the vote
     // of peer servers in an election.
     fn create_vote_request(&self) -> VoteRequest {
@@ -910,18 +947,19 @@ impl Raft for RaftImpl {
         if request.term > state.term() {
             state.become_follower(self.state.clone(), request.term);
         }
+        let term = state.term();
 
         // Record the latest leader.
         let leader = request.leader.clone().ok_or(RaftError::missing("leader"))?;
-        state.cluster.record_leader(&leader);
+        state.cluster.record_leader(&leader, term);
         match &state.diagnostics {
-            Some(d) => d.lock().await.report_leader(state.term(), &leader),
+            Some(d) => d.lock().await.report_leader(term, &leader),
             _ => (),
         }
 
         // Reset the election timer
-        let term = state.term();
-        state.reset_follower_timer(self.state.clone(), term + 1);
+        let next_term = term + 1;
+        state.reset_follower_timer(self.state.clone(), next_term);
 
         // Make sure we have the previous log index sent. Note that COMPACTED
         // can happen whenever we have no entries (e.g.,initially or just after
@@ -969,20 +1007,20 @@ impl Raft for RaftImpl {
         debug!(?request, "handling request");
 
         let result = RaftImpl::commit_internal(self.state.clone(), Payload(request.payload)).await;
-        let leader = self.state.lock().await.cluster.leader().clone();
-        let proto = match result {
-            Ok(entry_id) => CommitResponse {
+        let leader = self.state.lock().await.current_leader();
+        match result {
+            Ok(entry_id) => Ok(Response::new(CommitResponse {
                 entry_id: Some(entry_id),
                 status: raft_service_proto::Status::Success as i32,
                 leader,
-            },
-            Err(status) => CommitResponse {
+            })),
+            Err(NotLeader) => Ok(Response::new(CommitResponse {
                 entry_id: None,
-                status: status as i32,
+                status: raft_service_proto::Status::NotLeader as i32,
                 leader,
-            },
-        };
-        Ok(Response::new(proto))
+            })),
+            Err(Internal) => Err(Status::internal("internal error while committing")),
+        }
     }
 
     #[instrument(fields(server=%self.address.name),skip(self,request))]
@@ -994,10 +1032,11 @@ impl Raft for RaftImpl {
         debug!(?request, "handling request");
 
         let mut state = self.state.lock().await;
+        let leader = state.current_leader();
         if state.role != RaftRole::Leader {
             return Ok(Response::new(StepDownResponse {
                 status: raft_service_proto::Status::NotLeader as i32,
-                leader: state.cluster.leader(),
+                leader,
             }));
         }
 
@@ -1044,10 +1083,11 @@ impl Raft for RaftImpl {
         let joint_config;
         {
             let state = self.state.lock().await;
+            let leader = state.current_leader();
             if state.role != RaftRole::Leader {
                 return Ok(Response::new(ChangeConfigResponse {
                     status: raft_service_proto::Status::NotLeader as i32,
-                    leader: state.cluster.leader(),
+                    leader,
                 }));
             }
             if state.cluster.has_ongoing_mutation() {
@@ -1063,16 +1103,18 @@ impl Raft for RaftImpl {
 
         debug!(?joint, "committed config");
 
-        let leader = self.state.lock().await.cluster.leader().clone();
-        let status = match result {
-            Ok(_) => raft_service_proto::Status::Success,
-            Err(status) => status,
-        };
-
-        Ok(Response::new(ChangeConfigResponse {
-            status: status as i32,
-            leader,
-        }))
+        let leader = self.state.lock().await.current_leader();
+        match result {
+            Ok(_) => Ok(Response::new(ChangeConfigResponse {
+                status: raft_service_proto::Status::Success as i32,
+                leader,
+            })),
+            Err(NotLeader) => Ok(Response::new(ChangeConfigResponse {
+                status: raft_service_proto::Status::NotLeader as i32,
+                leader,
+            })),
+            Err(Internal) => Err(Status::internal("failed to commit config")),
+        }
     }
 }
 
@@ -1141,9 +1183,10 @@ mod tests {
         assert!(!append_response_1.success);
 
         // The raft server should acknowledge the new leader.
-        let state = raft_state.lock().await;
-        assert_eq!(state.cluster.leader(), Some(leader.clone()));
-        drop(state);
+        {
+            let state = raft_state.lock().await;
+            assert_eq!(state.current_leader(), Some(leader.clone()));
+        }
 
         // Now install a snapshot which should make the original append request
         // valid.
@@ -1204,7 +1247,7 @@ mod tests {
         assert!(append_response_1.success);
         {
             let state = raft_state.lock().await;
-            assert_eq!(state.cluster.leader(), Some(leader.clone()));
+            assert_eq!(state.current_leader(), Some(leader.clone()));
             assert_eq!(state.term(), 12);
             assert!(!state.store.is_index_compacted(0)); // Not compacted
             assert_eq!(state.store.next_index(), 3);

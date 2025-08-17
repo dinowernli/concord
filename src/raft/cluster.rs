@@ -4,6 +4,7 @@ use crate::raft::raft_common_proto::entry::Data::Config;
 use crate::raft::raft_common_proto::{ClusterConfig, Server};
 use crate::raft::raft_service_proto::raft_client::RaftClient;
 use crate::raft::store::ConfigInfo;
+use std::cmp::PartialEq;
 
 use async_std::sync::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -41,12 +42,18 @@ pub struct Cluster {
     me: Server,
     voters: HashMap<String, Server>,
     voters_next: HashMap<String, Server>,
-    last_known_leader: Option<Server>,
+    last_known_leader: Option<RecordedLeader>,
     config_info: Option<ConfigInfo>,
 
     // Has its own locking setup so that it can be shared among all clones
     // of this cluster object.
     channels: Arc<Mutex<ChannelCache>>,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct RecordedLeader {
+    pub term: i64,
+    pub leader: Server,
 }
 
 impl Cluster {
@@ -78,13 +85,22 @@ impl Cluster {
 
     // Returns the last known leader of this cluster, if any. This information could
     // be stale.
-    pub fn leader(&self) -> Option<Server> {
+    pub fn last_known_leader(&self) -> Option<RecordedLeader> {
         self.last_known_leader.clone()
     }
 
     // Stores the fact that we have observed a new leader.
-    pub fn record_leader(&mut self, leader: &Server) {
-        self.last_known_leader = Some(leader.clone());
+    pub fn record_leader(&mut self, leader: &Server, term: i64) {
+        let record = RecordedLeader {
+            term,
+            leader: leader.clone(),
+        };
+        if Some(record.clone()) != self.last_known_leader {
+            let me = self.me.name.clone();
+            let leader = leader.name.clone();
+            debug!(me, leader, term, "recorded new leader");
+            self.last_known_leader = Some(record);
+        }
     }
 
     // Returns the address we are running on.
@@ -429,22 +445,23 @@ mod tests {
         let cluster = create_cluster();
         assert_eq!(cluster.voters.len(), 3);
         assert_eq!(cluster.others().len(), 2);
-        assert!(cluster.leader().is_none());
+        assert!(cluster.last_known_leader().is_none());
     }
 
     #[test]
     fn test_leader() {
         let mut cluster = create_cluster();
-        assert!(cluster.leader().is_none());
+        assert!(cluster.last_known_leader().is_none());
 
+        let term = 17;
         let other = cluster.others()[0].clone();
-        cluster.record_leader(&other);
+        cluster.record_leader(&other, term);
 
-        let leader = cluster.leader();
+        let leader = cluster.last_known_leader();
         assert!(leader.is_some());
-        let leader = leader.unwrap();
-        assert_eq!(other.host, leader.host);
-        assert_eq!(other.port, leader.port);
+        let record = leader.unwrap();
+        assert_eq!(other.host, record.leader.host);
+        assert_eq!(other.port, record.leader.port);
     }
 
     #[test]
