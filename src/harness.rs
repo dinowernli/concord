@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::time::sleep;
+use tonic::Status;
 use tracing::{Instrument, error, info, info_span};
 
 use crate::keyvalue;
@@ -18,7 +19,7 @@ use crate::keyvalue::grpc::KeyValueServer;
 use crate::keyvalue::{KeyValueService, MapStore};
 use crate::raft::raft_common_proto::Server;
 use crate::raft::raft_service_proto::raft_server::RaftServer;
-use crate::raft::{Diagnostics, FailureOptions, Options, RaftImpl};
+use crate::raft::{Client, Diagnostics, FailureOptions, Options, RaftImpl, new_client};
 
 // Represents a collection of participants that interact with each other. In a real
 // production deployment, these participants might be on different actual machines,
@@ -117,6 +118,30 @@ impl Harness {
     // Returns the failure options object used for this harness.
     pub fn failures(&self) -> Arc<Mutex<FailureOptions>> {
         self.failures.clone()
+    }
+
+    // Returns a client that can be used to interact with the cluster.
+    pub fn make_client(&self) -> Box<dyn Client + Send + Sync> {
+        let server = self.addresses()[0].clone();
+        new_client("harness-client", &server)
+    }
+
+    // Update the cluster membership to contain only the supplied members. The supplied
+    // members must all be valid servers as defined at harness creation time.
+    pub async fn update_members(&self, members: Vec<&str>) -> Result<(), Status> {
+        let client = self.make_client();
+
+        let addresses = self.addresses().clone();
+        let mut new_members: Vec<Server> = Vec::new();
+        for m in members {
+            let server = addresses.iter().find(|&a| &a.name == m);
+            match server {
+                None => return Err(Status::invalid_argument(format!("unknown server: {}", &m))),
+                Some(s) => new_members.push(s.clone()),
+            }
+        }
+
+        client.change_config(new_members).await
     }
 
     // Validates all available diagnostics and panics on failure.

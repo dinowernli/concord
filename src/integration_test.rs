@@ -61,6 +61,47 @@ async fn test_disconnect_leader() {
     harness.stop().await;
 }
 
+#[tokio::test]
+async fn test_commit() {
+    let harness = make_harness(NAMES.to_vec()).await;
+    harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
+    let client = harness.make_client();
+
+    let payload: &[u8] = "some-payload".as_bytes();
+    let result = client.commit(payload).await;
+    assert!(result.is_ok());
+
+    harness.validate().await;
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn test_reconfigure_cluster() {
+    let names = vec!["A", "B", "C", "D", "E"];
+    let harness = make_harness(names.clone()).await;
+
+    let (t1, leader1) = harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
+    let without_leader: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|s| *s != leader1.name)
+        .collect();
+    assert_eq!(without_leader.len(), 4);
+
+    // Change cluster to contain only 3 members, and not including the current leader.
+    let new_members: Vec<&str> = without_leader.iter().copied().take(3).collect();
+    let result = harness.update_members(new_members.clone()).await;
+    assert!(result.is_ok());
+
+    // Wait for a new leader and verify.
+    let (_, leader2) = harness.wait_for_leader(TIMEOUT, term_greater(t1)).await;
+    assert_ne!(&leader2.name, &leader1.name);
+    assert!(new_members.contains(&leader2.name.as_str()));
+
+    harness.validate().await;
+    harness.stop().await;
+}
+
 // Convenience method that returns a matcher for terms greater than a value.
 fn term_greater(n: i64) -> Box<dyn Fn(&(i64, Server)) -> bool> {
     Box::new(move |(term, _)| *term > n)
