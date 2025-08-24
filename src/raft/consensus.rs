@@ -75,6 +75,16 @@ impl Options {
             compaction_check_periods_ms: 5000,
         }
     }
+
+    pub fn with_compaction(self: Self, threshold_bytes: i64, check_period_ms: i64) -> Self {
+        Self {
+            follower_timeout_ms: self.follower_timeout_ms,
+            candidate_timeouts_ms: self.candidate_timeouts_ms,
+            leader_replicate_ms: self.leader_replicate_ms,
+            compaction_threshold_bytes: threshold_bytes,
+            compaction_check_periods_ms: check_period_ms,
+        }
+    }
 }
 
 // Canonical implementation of the raft service. Acts as one server among peers
@@ -1062,9 +1072,16 @@ impl Raft for RaftImpl {
         let mut state = self.state.lock().await;
         if request.term >= state.term() && !request.snapshot.is_empty() {
             let snapshot = Bytes::from(request.snapshot.to_vec());
-            let status = state.store.install_snapshot(snapshot, last).await;
+            let status = state.store.install_snapshot(snapshot.clone(), last).await;
             if status.code() != tonic::Code::Ok {
                 return Err(status);
+            }
+            if let Some(diagnostics) = &state.diagnostics {
+                diagnostics.lock().await.report_snapshot_install(
+                    request.term,
+                    request.last.as_ref().unwrap().index,
+                    snapshot.len() as i64,
+                );
             }
         }
         Ok(Response::new(InstallSnapshotResponse {
