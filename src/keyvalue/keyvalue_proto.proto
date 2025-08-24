@@ -53,17 +53,19 @@ message GetResponse {
   int64 version = 2;
 }
 
-// A request to set the value for a supplied key.
 message PutRequest {
-  // They key for which we are setting the value.
-  bytes key = 1;
-
-  // The value to write.
-  bytes value = 2;
+    bytes key = 1;
+    bytes value = 2;
 }
 
-// A response returned for a put request.
 message PutResponse {
+    // Debug information about the raft commit.
+    optional DebugInfo debug_info = 1;
+}
+
+// A request to set the value for a supplied key.
+message DebugInfo {
+    int64 raft_index = 1;
 }
 
 // An rpc service providing access to a key-value store.

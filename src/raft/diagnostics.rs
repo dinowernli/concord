@@ -18,6 +18,9 @@ pub struct Diagnostics {
     // Historical record of validated commits, keyed by entry index.
     applied: BTreeMap<i64, CommitInfo>,
 
+    // Maps a server name to a map of term to (index, size) for snapshot installs.
+    snapshot_installs: BTreeMap<String, BTreeMap<i64, SnapshotInfo>>,
+
     // Holds the index of the first conflict in leader, if any.
     first_leader_conflict_index: Option<i64>,
 
@@ -52,6 +55,12 @@ enum CommitInfo {
     Conflict(),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotInfo {
+    pub size_bytes: usize,
+    pub index: i64,
+}
+
 impl Diagnostics {
     // Returns a new instance which, initially, know about no servers.
     pub fn new() -> Self {
@@ -59,6 +68,7 @@ impl Diagnostics {
             servers: HashMap::new(),
             leaders: BTreeMap::new(),
             applied: BTreeMap::new(),
+            snapshot_installs: BTreeMap::new(),
 
             first_leader_conflict_index: None,
             first_applied_conflict_term: None,
@@ -87,6 +97,10 @@ impl Diagnostics {
         None
     }
 
+    pub fn get_snapshot_installs(&self, server_name: &str) -> Option<&BTreeMap<i64, SnapshotInfo>> {
+        self.snapshot_installs.get(server_name)
+    }
+
     // Processes new information collected by the individual servers and runs sanity checks
     // on the cluster consensus, e.g., making sure that no servers disagree on the leader
     // of terms, on the contents of log entries, etc.
@@ -102,6 +116,20 @@ impl Diagnostics {
     pub async fn collect(&mut self) {
         self.collect_leaders().await;
         self.collect_applied().await;
+        self.collect_snapshot_installs().await;
+    }
+
+    async fn collect_snapshot_installs(&mut self) {
+        for (name, server_arc) in &self.servers {
+            let mut s = server_arc.lock().await;
+            if !s.snapshot_installs.is_empty() {
+                let server_installs = self.snapshot_installs.entry(name.clone()).or_default();
+                for (term, info) in s.snapshot_installs.iter() {
+                    server_installs.insert(*term, info.clone());
+                }
+                s.snapshot_installs.clear();
+            }
+        }
     }
 
     async fn collect_leaders(&mut self) {
@@ -200,6 +228,9 @@ pub struct ServerDiagnostics {
 
     // Keeps track of all applied commits, in order.
     applied: BTreeMap<i64, AppliedCommit>,
+
+    // Keeps track of all snapshot installs, mapping term to SnapshotInfo.
+    snapshot_installs: BTreeMap<i64, SnapshotInfo>,
 }
 
 impl ServerDiagnostics {
@@ -207,6 +238,7 @@ impl ServerDiagnostics {
         ServerDiagnostics {
             leaders: BTreeMap::new(),
             applied: BTreeMap::new(),
+            snapshot_installs: BTreeMap::new(),
         }
     }
 
@@ -215,6 +247,18 @@ impl ServerDiagnostics {
         let existing = self.leaders.get(&term);
         assert!(existing.is_none() || existing.unwrap() == leader);
         self.leaders.insert(term, leader.clone());
+    }
+
+    // Called when the server installs a snapshot. The term and index refer to the last
+    // entry included in the snapshot.
+    pub fn report_snapshot_install(&mut self, term: i64, index: i64, size_bytes: i64) {
+        self.snapshot_installs.insert(
+            term,
+            SnapshotInfo {
+                index,
+                size_bytes: size_bytes as usize,
+            },
+        );
     }
 
     pub fn report_apply(&mut self, term: i64, index: i64, digest: u64) {
@@ -447,6 +491,29 @@ mod tests {
         // The latest validated leader should still be the one from term 1, as the conflict in term 2
         // prevented it from being validated.
         assert_eq!(f.diag.latest_leader(), Some((1, f.s1.clone())));
+    }
+
+    #[tokio::test]
+    async fn test_report_and_collect_snapshot_install() {
+        let mut f = Fixture::new();
+        let d1 = f.diag.get_server(&f.s1);
+
+        // Report a snapshot install.
+        d1.lock().await.report_snapshot_install(1, 10, 1024);
+
+        // Collect diagnostics.
+        f.diag.collect().await;
+
+        // Verify that the snapshot install is recorded.
+        let installs = f.diag.get_snapshot_installs("foo").expect("installs");
+        assert_eq!(installs.len(), 1);
+        assert_eq!(
+            installs.get(&1),
+            Some(&SnapshotInfo {
+                index: 10,
+                size_bytes: 1024
+            })
+        );
     }
 
     fn make_server(host: &str, port: i16) -> Server {

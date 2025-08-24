@@ -11,6 +11,7 @@
 pub use client::{Client, new_client};
 pub use consensus::{Options, RaftImpl};
 pub use diagnostics::Diagnostics;
+pub use diagnostics::SnapshotInfo;
 pub use failure_injection::FailureOptions;
 pub use state_machine::{StateMachine, StateMachineResult};
 
