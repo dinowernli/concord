@@ -1,22 +1,23 @@
 use axum::Router;
+use axum::body::Body;
+use axum::http::Request as HttpRequest;
+use axum::http::StatusCode;
 use axum::routing::get;
 use std::sync::Arc;
 use tonic::Request;
 
+use crate::keyvalue::KeyValueService;
 use crate::keyvalue::keyvalue_proto::GetRequest;
 use crate::keyvalue::keyvalue_proto::key_value_server::KeyValue;
-use axum::body::Body;
-use axum::http::Request as HttpRequest;
-use axum::http::StatusCode;
 
-// Provides an HTTP interface for the supplied KeyValue instance.
+// Provides an HTTP interface for the supplied keyvalue store.
 #[derive(Clone)]
 pub struct HttpHandler {
-    service: Arc<dyn KeyValue>,
+    service: Arc<KeyValueService>,
 }
 
 impl HttpHandler {
-    pub fn new(service: Arc<dyn KeyValue>) -> Self {
+    pub fn new(service: Arc<KeyValueService>) -> Self {
         Self { service }
     }
 
@@ -25,12 +26,28 @@ impl HttpHandler {
      * include /get?key=foo.
      */
     pub fn routes(self: Arc<Self>) -> Router {
-        let handler = move |request| async move { self.handle_get(request).await };
-        Router::new().route("/get", get(handler))
+        let get_self = self.clone();
+        let get_handler = move |request| async move { get_self.handle_get(request).await };
+
+        let root_self = self.clone();
+        let root_handler = move |request| async move { root_self.handle_root(request).await };
+
+        Router::new()
+            .route("/", get(root_handler))
+            .route("/get", get(get_handler))
     }
 
     fn invalid(message: String) -> (StatusCode, String) {
         (StatusCode::BAD_REQUEST, message)
+    }
+
+    async fn handle_root(self: Arc<Self>, _: HttpRequest<Body>) -> (StatusCode, String) {
+        let kv = self.service.clone();
+        let latest = kv.store().lock().await.latest_version();
+        (
+            StatusCode::OK,
+            format!("KeyValue store with latest version: {}", latest),
+        )
     }
 
     async fn handle_get(self: Arc<Self>, request: HttpRequest<Body>) -> (StatusCode, String) {
@@ -83,42 +100,25 @@ impl HttpHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keyvalue::grpc::PutRequest;
-    use crate::keyvalue::keyvalue_proto::{Entry, GetResponse, PutResponse};
+    use crate::keyvalue::MapStore;
+    use crate::raft::raft_common_proto::Server;
     use crate::testing::TestHttpServer;
-    use async_trait::async_trait;
-    use tonic::{Response, Status};
-
-    struct FakeKeyValue {}
-
-    #[async_trait]
-    impl KeyValue for FakeKeyValue {
-        async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
-            let key = request.into_inner().key.clone();
-            let key_string = String::from_utf8(key.clone());
-            let entry = match key_string.expect("utf8").as_str() {
-                "foo" => Some(Entry {
-                    key: key.clone(),
-                    value: "foo-value".to_string().into_bytes(),
-                }),
-                "bar" => Some(Entry {
-                    key: key.clone(),
-                    value: "bar-value".to_string().into_bytes(),
-                }),
-                _ => None,
-            };
-
-            Ok(Response::new(GetResponse { entry, version: 0 }))
-        }
-
-        async fn put(&self, _: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
-            // We don't need any writes for now.
-            panic!("Not implemented");
-        }
-    }
+    use async_std::sync::Mutex;
+    use bytes::Bytes;
 
     async fn make_server() -> TestHttpServer {
-        let kv = Arc::new(FakeKeyValue {});
+        let store = Arc::new(Mutex::new(MapStore::new()));
+        let raft_member = Server {
+            name: "kv-raft-for-testing".to_string(),
+            host: "[::1]".to_string(),
+            port: 12345,
+        };
+        let kv = Arc::new(KeyValueService::new("kv-for-testing", &raft_member, store));
+        kv.store()
+            .lock()
+            .await
+            .set(Bytes::from("foo"), Bytes::from("foo-value"));
+
         let http = Arc::new(HttpHandler {
             service: kv.clone(),
         });
@@ -144,7 +144,7 @@ mod tests {
         let text = response.text().await.expect("text");
 
         assert_eq!(reqwest::StatusCode::OK, status);
-        assert_eq!("foo=foo-value, version=0", text.trim());
+        assert_eq!("foo=foo-value, version=1", text.trim());
     }
 
     #[tokio::test]
