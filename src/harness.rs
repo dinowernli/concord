@@ -246,7 +246,10 @@ impl Instance {
             kv_store.clone(),
         ));
         let kv_grpc = KeyValueServer::from_arc(kv_service.clone());
-        let kv_http = Arc::new(keyvalue::HttpHandler::new(kv_service.clone()));
+        let kv_http = Arc::new(keyvalue::HttpHandler::new(
+            path.to_string(),
+            kv_service.clone(),
+        ));
         let web = Router::new().nest(path, kv_http.routes());
 
         // Set up the grpc service for the raft participant. The first 3 server entries are active initially.

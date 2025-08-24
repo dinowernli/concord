@@ -18,6 +18,7 @@ prost = "0.13.5"
 querystring = "1.1"
 rand = "0.8"
 reqwest = "0.12"
+serde = { version = "1.0.219", features = ["derive"] }
 structopt = "0.3"
 thiserror = "2"
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal"] }
