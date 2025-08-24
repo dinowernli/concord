@@ -35,7 +35,11 @@ async fn test_disconnect_leader() {
     // Wait for the initial leader and capture its term and server.
     let (initial_term, first_leader) = harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
 
-    harness.failures().lock().await.disconnect(&first_leader);
+    harness
+        .failures()
+        .lock()
+        .await
+        .disconnect(first_leader.name.as_str());
 
     // Wait for a new leader (i.e, for a higher term).
     let (second_term, second_leader) = harness
@@ -46,8 +50,16 @@ async fn test_disconnect_leader() {
     assert_ne!(second_leader.name, first_leader.name);
 
     // Now reconnect the original leader, and disconnect the second one.
-    harness.failures().lock().await.reconnect(&first_leader);
-    harness.failures().lock().await.disconnect(&second_leader);
+    harness
+        .failures()
+        .lock()
+        .await
+        .reconnect(first_leader.name.as_str());
+    harness
+        .failures()
+        .lock()
+        .await
+        .disconnect(second_leader.name.as_str());
 
     // Wait for another new leader (i.e, for a higher term).
     let (_, third_leader) = harness
@@ -100,6 +112,25 @@ async fn test_reconfigure_cluster() {
 
     harness.validate().await;
     harness.stop().await;
+}
+
+#[tokio::test]
+async fn test_snapshotting() {
+    let harness = make_harness(NAMES.to_vec()).await;
+
+    // Disconnect a node that will later have to catch up.
+    harness.failures().lock().await.disconnect("B");
+
+    let client = harness.make_client();
+    for _ in 0..1000 {
+        let large_payload: Vec<u8> = vec![0; 10000];
+        client
+            .commit(large_payload.as_slice())
+            .await
+            .expect("commit");
+    }
+
+    panic!("TODO - make this a keyvalue payload so that we get snapshot compaction")
 }
 
 // Convenience method that returns a matcher for terms greater than a value.
