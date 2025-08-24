@@ -469,6 +469,7 @@ dependencies = [
  "querystring",
  "rand",
  "reqwest",
+ "serde",
  "structopt",
  "thiserror",
  "tokio",
