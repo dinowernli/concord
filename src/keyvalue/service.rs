@@ -45,6 +45,10 @@ impl KeyValueService {
         }
     }
 
+    pub fn store(&self) -> Arc<Mutex<dyn Store + Send>> {
+        self.store.clone()
+    }
+
     fn make_set_operation(key: &[u8], value: &[u8]) -> Operation {
         Operation {
             op: Some(Op::Set(SetOperation {

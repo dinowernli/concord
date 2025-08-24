@@ -229,24 +229,28 @@ impl Instance {
     ) -> Result<(Self, Pin<Box<dyn Future<Output = ()> + Send>>), Box<dyn Error>> {
         let name = address.name.to_string();
         let port = listener.local_addr()?.port();
-        assert_eq!(port as i32, address.port);
+        let path = "/keyvalue";
+        if port as i32 != address.port {
+            return Err("Listener port must match address port".into());
+        }
+        if all.len() < 3 {
+            return Err(format!("Need at least 3 participants, but got {}", all.len()).into());
+        }
+        let cluster = vec![all[0].clone(), all[1].clone(), all[2].clone()];
 
+        // Set up the keyvalue store, along with the web and grpc serving objects
         let kv_store = Arc::new(Mutex::new(MapStore::new()));
-        let server_diagnostics = diagnostics.lock().await.get_server(&address);
-
-        // Set up the grpc service for the key-value store.
-        let kv1 = KeyValueService::new(name.as_str(), &address, kv_store.clone());
-        let kv_grpc = KeyValueServer::new(kv1);
-
-        // Set up the webservice serving the contents of the kvstore.
-        // TODO(dino): See if we can reuse/share the "kv1" instance above.
-        let kv2 = KeyValueService::new(name.as_str(), &address, kv_store.clone());
-        let kv_http = Arc::new(keyvalue::HttpHandler::new(Arc::new(kv2)));
-        let web = Router::new().nest("/keyvalue", kv_http.routes());
+        let kv_service = Arc::new(KeyValueService::new(
+            name.as_str(),
+            &address,
+            kv_store.clone(),
+        ));
+        let kv_grpc = KeyValueServer::from_arc(kv_service.clone());
+        let kv_http = Arc::new(keyvalue::HttpHandler::new(kv_service.clone()));
+        let web = Router::new().nest(path, kv_http.routes());
 
         // Set up the grpc service for the raft participant. The first 3 server entries are active initially.
-        assert!(all.len() >= 3);
-        let cluster = vec![all[0].clone(), all[1].clone(), all[2].clone()];
+        let server_diagnostics = diagnostics.lock().await.get_server(&address);
         let raft = Arc::new(
             RaftImpl::new(
                 address,
@@ -269,7 +273,7 @@ impl Instance {
         let signal = async move { receiver.recv().await.unwrap_or(()) };
 
         // Start serving
-        let future = Box::pin(async {
+        let serving_future = Box::pin(async {
             match axum::serve(listener, rest_grpc)
                 .with_graceful_shutdown(signal)
                 .await
@@ -278,17 +282,19 @@ impl Instance {
                 Err(message) => error!("Serving terminated unsuccessfully: {}", message),
             }
         });
+
+        // Package up the result in a serving instance for the harness
         let result = Instance {
             address: address.clone(),
             raft,
             shutdown: sender,
         };
-        info!(
-            "Started http and grpc server [name={},port={}] ",
-            address.name, address.port
-        );
 
-        Ok((result, future))
+        info!(
+            "Started http and grpc server [name={},port={}]. Open at http://[{}]:{}{}",
+            address.name, address.port, address.host, address.port, path
+        );
+        Ok((result, serving_future))
     }
 
     // Starts the background logic in service implementations (e.g., raft election loop).
