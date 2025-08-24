@@ -4,6 +4,7 @@ use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 const NAMES: [&str; 3] = ["A", "B", "C"];
+const CLUSTER_NAME: &str = "test-cluster";
 
 #[tokio::test]
 async fn test_start_and_elect_leader() {
@@ -108,10 +109,11 @@ fn term_greater(n: i64) -> Box<dyn Fn(&(i64, Server)) -> bool> {
 }
 
 async fn make_harness(nodes: Vec<&str>) -> Harness {
+    let wipe_persistence = true;
     let (harness, serving) = Harness::builder(nodes)
         .await
         .expect("builder")
-        .build()
+        .build(CLUSTER_NAME, wipe_persistence)
         .await
         .expect("harness");
     harness.start().await;

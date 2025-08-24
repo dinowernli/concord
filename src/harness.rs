@@ -5,6 +5,7 @@ use axum_tonic::NestTonic;
 use axum_tonic::RestGrpcService;
 use futures::Future;
 use futures::future::join_all;
+use std::env;
 use std::error::Error;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -44,6 +45,8 @@ impl HarnessBuilder {
     // of the serving process for all instances managed by the harness.
     pub async fn build(
         self,
+        cluster_name: &str,
+        wipe_persistence: bool,
     ) -> Result<(Harness, Pin<Box<dyn Future<Output = ()> + Send>>), Box<dyn Error>> {
         let diag = Arc::new(Mutex::new(Diagnostics::new()));
         let failures = Arc::new(Mutex::new(self.failure.clone()));
@@ -54,8 +57,29 @@ impl HarnessBuilder {
 
         for bound in self.bound {
             let (address, listener) = (bound.server, bound.listener);
-            let (instance, future) =
-                Instance::new(&address, listener, &all, diag.clone(), failures.clone()).await?;
+
+            // Use something like /tmp/concord/<cluster>/<server> for persistence
+            let persistence_path = env::temp_dir()
+                .as_path()
+                .join("concord")
+                .join(cluster_name)
+                .join(&address.name);
+
+            let options = Options::new(
+                persistence_path.to_str().unwrap().as_ref(),
+                wipe_persistence,
+            );
+
+            let (instance, future) = Instance::new(
+                &address,
+                listener,
+                &all,
+                diag.clone(),
+                options,
+                failures.clone(),
+            )
+            .await?;
+
             let span = info_span!("serve", server=%address.name);
 
             instances.push(instance);
@@ -225,7 +249,8 @@ impl Instance {
         listener: TcpListener,
         all: &Vec<Server>,
         diagnostics: Arc<Mutex<Diagnostics>>,
-        failure_options: Arc<Mutex<FailureOptions>>,
+        options: Options,
+        failures: Arc<Mutex<FailureOptions>>,
     ) -> Result<(Self, Pin<Box<dyn Future<Output = ()> + Send>>), Box<dyn Error>> {
         let name = address.name.to_string();
         let port = listener.local_addr()?.port();
@@ -257,8 +282,8 @@ impl Instance {
                 &cluster,
                 kv_store.clone(), // The raft cluster participant is the one applying the KV writes.
                 Some(server_diagnostics),
-                Options::default(),
-                failure_options,
+                options,
+                failures,
             )
             .await,
         );

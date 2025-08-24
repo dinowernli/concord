@@ -145,7 +145,7 @@ mod tests {
     use crate::keyvalue::keyvalue_proto::key_value_server::KeyValueServer;
     use crate::keyvalue::store::MapStore;
     use crate::raft::StateMachine;
-    use crate::raft::raft_common_proto::{EntryId, Server};
+    use crate::raft::raft_common_proto::EntryId;
     use crate::testing::TestRpcServer;
 
     use super::*;

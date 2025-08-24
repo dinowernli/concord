@@ -15,6 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 "src/raft/proto/service.proto",
                 "src/raft/proto/common.proto",
+                "src/raft/proto/persistence.proto",
             ],
             &["src/raft/proto"],
         )?;

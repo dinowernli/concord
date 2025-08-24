@@ -19,6 +19,7 @@ querystring = "1.1"
 rand = "0.8"
 reqwest = "0.12"
 structopt = "0.3"
+tempfile = "3.20.0"
 thiserror = "2"
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-stream = { version = "0.1", features = ["net"] }
