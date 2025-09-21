@@ -105,8 +105,18 @@ message StepDownResponse {
   raft_common_proto.Server leader = 2;
 }
 
-// Sent by the leader of the cluster to its peers in order to transmit a
-// snapshot of the underlying state machine to the follower.
+message RaftSnapshot {
+  // The id of the latest entry included in the snapshot. The snapshot replaces
+  // all entries up to and including this one.
+  raft_common_proto.EntryId last_included_entry = 1;
+
+  // The snapshot bytes, as obtained from the state machine.
+  bytes data = 2;
+
+  // The cluster configuration at the time of the snapshot.
+  raft_common_proto.ClusterConfig cluster_config = 3;
+}
+
 message InstallSnapshotRequest {
   // Term of the rpc originator.
   int64 term = 1;
@@ -114,13 +124,8 @@ message InstallSnapshotRequest {
   // Current leader. Always the originator of the rpc.
   raft_common_proto.Server leader = 2;
 
-  // The id of the latest entry included in the snapshot. The snapshot replaces
-  // all entries up to (and including) this one on the receiver.
-  raft_common_proto.EntryId last = 3;
-
-  // The snapshot bytes, as obtained from the state machine.
-  // TODO(dino): send chunks instead of entire snapshots.
-  bytes snapshot = 4;
+  // The snapshot to install.
+  RaftSnapshot snapshot = 3;
 }
 
 message InstallSnapshotResponse {
