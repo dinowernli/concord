@@ -3,7 +3,7 @@ use crate::raft::diagnostics::ServerDiagnostics;
 use crate::raft::log::{ContainsResult, LogSlice};
 use crate::raft::raft_common_proto::entry::Data;
 use crate::raft::raft_common_proto::entry::Data::Config;
-use crate::raft::raft_common_proto::{Entry, EntryId, Server};
+use crate::raft::raft_common_proto::{ClusterConfig, Entry, EntryId, Server};
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::channel::oneshot::{Receiver, Sender, channel};
@@ -45,17 +45,40 @@ pub struct Store {
 #[derive(Clone, PartialEq)]
 pub struct ConfigInfo {
     // The latest appended entry containing a cluster config.
-    pub latest: Option<Entry>,
+    pub latest_appended: Option<Entry>,
 
-    // Whether or not the latest entry has been committed.
-    pub committed: bool,
+    // Whether the latest appended entry has been committed.
+    committed: bool,
+
+    // The latest applied entry containing a cluster config.
+    latest_applied: ClusterConfig,
 }
 
 impl ConfigInfo {
-    fn empty() -> Self {
-        ConfigInfo {
-            latest: None,
-            committed: false,
+    // Returns the latest config, and whether it has been committed.
+    pub fn latest(&self) -> (ClusterConfig, bool) {
+        if let Some(e) = self.latest_appended.clone() {
+            if let Config(config) = e.data.unwrap() {
+                return (config, self.committed);
+            }
+        }
+
+        // Nothing appended since snapshot installation, just return
+        // the applied config.
+        (self.latest_applied.clone(), true)
+    }
+
+    #[cfg(test)]
+    pub fn make_with_appended(entry: Entry, committed: bool) -> Self {
+        Self {
+            latest_appended: Some(entry),
+            committed,
+
+            // Irrelevant if the fields above are set (based on implementation of latest()).
+            latest_applied: ClusterConfig {
+                voters: vec![],
+                voters_next: vec![],
+            },
         }
     }
 }
@@ -69,6 +92,12 @@ impl Store {
         name: &str,
     ) -> Self {
         let index = initial_snapshot.last.index;
+        let latest_applied = initial_snapshot.config.clone();
+        let config_info = ConfigInfo {
+            latest_appended: None,
+            committed: false,
+            latest_applied,
+        };
         Self {
             name: name.to_string(),
             compaction_threshold_bytes,
@@ -83,7 +112,7 @@ impl Store {
             // Non-persistent. Just bookkeeping.
             committed: index,
             applied: index,
-            config_info: ConfigInfo::empty(),
+            config_info,
 
             listener_uid: 0,
             listeners: BTreeSet::new(),
@@ -163,9 +192,11 @@ impl Store {
         if self.log.size_bytes() > self.compaction_threshold_bytes {
             let applied_index = self.applied;
             let latest_id = self.log.id_at(applied_index);
+            let latest_applied_config = self.config_info.latest_applied.clone();
             let snap = LogSnapshot {
-                snapshot: self.state_machine.lock().await.create_snapshot(),
+                data: self.state_machine.lock().await.create_snapshot(),
                 last: latest_id.clone(),
+                config: latest_applied_config,
             };
             self.snapshot = snap;
 
@@ -267,10 +298,10 @@ impl Store {
     }
 
     // Resets the state of this store to the supplied snapshot.
-    pub async fn install_snapshot(&mut self, snapshot: Bytes, last: EntryId) -> Status {
+    pub async fn install_snapshot(&mut self, snapshot: LogSnapshot) -> Status {
         // Update the state machine.
         let mut state_machine = self.state_machine.lock().await;
-        match state_machine.load_snapshot(&snapshot) {
+        match state_machine.load_snapshot(&snapshot.data) {
             Ok(_) => (),
             Err(message) => {
                 return Status::internal(format!(
@@ -281,6 +312,7 @@ impl Store {
         }
 
         // Update the log.
+        let last = snapshot.last.clone();
         let contains = self.log.contains(&last);
         match contains {
             ContainsResult::ABSENT => {
@@ -301,7 +333,12 @@ impl Store {
 
         self.applied = last.index;
         self.committed = last.index;
-        self.snapshot = LogSnapshot { last, snapshot };
+        self.snapshot = snapshot.clone();
+        self.config_info = ConfigInfo {
+            latest_appended: None,
+            committed: false,
+            latest_applied: snapshot.config,
+        };
 
         Status::ok("")
     }
@@ -331,19 +368,26 @@ impl Store {
             let entry = self.log.entry_at(self.applied);
             let entry_id = entry.id.expect("id").clone();
 
-            if let Some(Data::Payload(bytes)) = entry.data {
-                // Report for debugging purposes.
-                self.report_apply(&entry_id, &bytes).await;
+            if let Some(data) = entry.data {
+                match data {
+                    Data::Payload(bytes) => {
+                        // Report for debugging purposes.
+                        self.report_apply(&entry_id, &bytes).await;
 
-                // Apply the entry in the state machine.
-                let result = self.state_machine.lock().await.apply(&Bytes::from(bytes));
+                        // Apply the entry in the state machine.
+                        let result = self.state_machine.lock().await.apply(&Bytes::from(bytes));
 
-                match result {
-                    Ok(()) => {
-                        debug!(entry=%entry_id_key(&entry_id), "applied");
+                        match result {
+                            Ok(()) => {
+                                debug!(entry=%entry_id_key(&entry_id), "applied");
+                            }
+                            Err(msg) => {
+                                warn!(entry=%entry_id_key(&entry_id), "failed to apply: {}", msg);
+                            }
+                        }
                     }
-                    Err(msg) => {
-                        warn!(entry=%entry_id_key(&entry_id), "failed to apply: {}", msg);
+                    Config(config) => {
+                        self.config_info.latest_applied = config;
                     }
                 }
             }
@@ -371,13 +415,13 @@ impl Store {
 
     // Updates our cached information about the latest config entry in the store.
     fn update_config_info(&mut self) {
-        self.config_info.latest = self.log.latest_config_entry();
+        self.config_info.latest_appended = self.log.latest_config_entry();
         self.update_config_info_committed();
     }
 
     // Only updates the committed bit in the latest config info.
     fn update_config_info_committed(&mut self) {
-        let entry = &self.config_info.latest;
+        let entry = &self.config_info.latest_appended;
         if entry.is_none() {
             return;
         }
@@ -393,15 +437,19 @@ impl Store {
     }
 }
 
-// Represents a snapshot of the state machine after applying a complete prefix
+// Represents a snapshot of the store after applying a complete prefix
 // of entries since the beginning of time.
 #[derive(Clone)]
 pub struct LogSnapshot {
     // The id of the latest entry included in the snapshot.
     pub last: EntryId,
 
-    // The snapshot bytes as produced by the state machine.
-    pub snapshot: Bytes,
+    // A snapshot of the state machine.
+    pub data: Bytes,
+
+    // The cluster configuration present in the latest included entry
+    // that contains a cluster configuration.
+    pub config: ClusterConfig,
 }
 
 // Each instance represents an ongoing commit operation waiting for the committed
@@ -452,6 +500,21 @@ mod tests {
 
     const COMPACTION_THRESHOLD_BYTES: i64 = 5000;
 
+    fn server_named(name: &str) -> Server {
+        Server {
+            host: "foo".to_string(),
+            port: 1234,
+            name: name.to_string(),
+        }
+    }
+
+    fn make_cluster_config() -> ClusterConfig {
+        ClusterConfig {
+            voters: vec![server_named("A"), server_named("B"), server_named("C")],
+            voters_next: vec![server_named("A"), server_named("C"), server_named("D")],
+        }
+    }
+
     fn make_store() -> Store {
         let state_machine = FakeStateMachine::new();
         let snapshot = LogSnapshot {
@@ -459,7 +522,8 @@ mod tests {
                 term: -1,
                 index: -1,
             },
-            snapshot: state_machine.create_snapshot(),
+            data: state_machine.create_snapshot(),
+            config: make_cluster_config(),
         };
         Store::new(
             Arc::new(Mutex::new(state_machine)),
@@ -566,49 +630,52 @@ mod tests {
         assert_eq!(store.get_latest_snapshot().last.term, -1);
         assert_eq!(store.get_latest_snapshot().last.index, -1);
 
-        store
-            .install_snapshot(
-                Bytes::from(""),
-                EntryId {
-                    term: 17,
-                    index: 22,
-                },
-            )
-            .await;
+        let cluster_config = make_cluster_config();
+        let snap = LogSnapshot {
+            last: EntryId {
+                term: 17,
+                index: 22,
+            },
+            data: Bytes::from(""),
+            config: cluster_config.clone(),
+        };
+        store.install_snapshot(snap.clone()).await;
         assert_eq!(22, store.committed_index());
+        assert_eq!(store.config_info.latest_applied, cluster_config);
 
-        let snap = store.get_latest_snapshot();
-        assert_eq!(17, snap.last.term);
-        assert_eq!(22, snap.last.index);
+        let new_snap = store.get_latest_snapshot();
+        assert_eq!(new_snap.last, snap.last);
+        assert_eq!(new_snap.data, snap.data);
+        assert_eq!(new_snap.config, snap.config);
     }
 
     #[test]
     fn test_config_info_append() {
         let mut store = make_store();
-        assert!(store.config_info.latest.is_none());
+        assert!(store.config_info.latest_appended.is_none());
 
         store.append(17, Payload(Vec::new()));
-        assert!(store.config_info.latest.is_none());
+        assert!(store.config_info.latest_appended.is_none());
 
         let config = ClusterConfig {
             voters: vec![],
             voters_next: vec![],
         };
         store.append(17, Config(config.clone()));
-        assert!(!store.config_info.latest.is_none());
+        assert!(!store.config_info.latest_appended.is_none());
     }
 
     #[tokio::test]
     async fn test_config_info_append_all() {
         let mut store = make_store();
-        assert!(store.get_config_info().latest.is_none());
+        assert!(store.get_config_info().latest_appended.is_none());
 
         store.append_all(&vec![
             payload_entry(12, 0),
             payload_entry(12, 1),
             payload_entry(12, 2),
         ]);
-        assert!(store.get_config_info().latest.is_none());
+        assert!(store.get_config_info().latest_appended.is_none());
 
         let voters = 7;
         store.append_all(&vec![
@@ -616,8 +683,14 @@ mod tests {
             config_entry(12, 4, voters),
             payload_entry(12, 5),
         ]);
-        assert!(store.get_config_info().latest.is_some());
-        match store.get_config_info().latest.unwrap().data.unwrap() {
+        assert!(store.get_config_info().latest_appended.is_some());
+        match store
+            .get_config_info()
+            .latest_appended
+            .unwrap()
+            .data
+            .unwrap()
+        {
             Config(config) => assert_eq!(voters, config.voters.len()),
             _ => panic!("bad entry contents"),
         }
@@ -628,8 +701,14 @@ mod tests {
             config_entry(12, 7, 3),
             config_entry(12, 8, voters),
         ]);
-        assert!(store.get_config_info().latest.is_some());
-        match store.get_config_info().latest.unwrap().data.unwrap() {
+        assert!(store.get_config_info().latest_appended.is_some());
+        match store
+            .get_config_info()
+            .latest_appended
+            .unwrap()
+            .data
+            .unwrap()
+        {
             Config(config) => assert_eq!(voters, config.voters.len()),
             _ => panic!("bad entry contents"),
         }
@@ -637,6 +716,83 @@ mod tests {
 
         store.commit_to(8).await;
         assert!(store.get_config_info().committed);
+    }
+
+    #[tokio::test]
+    async fn test_config_info_apply() {
+        let mut store = make_store();
+        let initial_config = store.get_config_info().latest_applied;
+
+        // Append and commit a payload, should not change applied config.
+        let entry1 = store.append(1, Payload(Vec::new()));
+        store.commit_to(entry1.index).await;
+        let config_after_payload = store.get_config_info().latest_applied;
+        assert_eq!(initial_config, config_after_payload);
+
+        // Append and commit a new config, should change applied config.
+        let mut new_config = initial_config.clone();
+        new_config.voters = vec![server_named("X")];
+        let entry2 = store.append(1, Config(new_config.clone()));
+        store.commit_to(entry2.index).await;
+        let config_after_config = store.get_config_info().latest_applied;
+        assert_eq!(new_config, config_after_config);
+    }
+
+    #[test]
+    fn test_latest_no_appended() {
+        let applied_config = make_config(3);
+        let info = ConfigInfo {
+            latest_appended: None,
+            committed: false,
+            latest_applied: applied_config.clone(),
+        };
+
+        let (latest, committed) = info.latest();
+        assert_eq!(latest, applied_config);
+        assert!(committed);
+    }
+
+    #[test]
+    fn test_latest_appended_uncommitted() {
+        let appended_config = make_config(5);
+        let entry = Entry {
+            id: Some(EntryId { term: 1, index: 1 }),
+            data: Some(Config(appended_config.clone())),
+        };
+        let info = ConfigInfo::make_with_appended(entry, false);
+
+        let (latest, committed) = info.latest();
+        assert_eq!(latest, appended_config);
+        assert!(!committed);
+    }
+
+    #[test]
+    fn test_latest_appended_committed() {
+        let appended_config = make_config(5);
+        let entry = Entry {
+            id: Some(EntryId { term: 1, index: 1 }),
+            data: Some(Config(appended_config.clone())),
+        };
+        let info = ConfigInfo::make_with_appended(entry, true);
+
+        let (latest, committed) = info.latest();
+        assert_eq!(latest, appended_config);
+        assert!(committed);
+    }
+
+    fn make_config(num_voters: usize) -> ClusterConfig {
+        let mut voters = Vec::new();
+        for i in 0..num_voters {
+            voters.push(Server {
+                host: "localhost".to_string(),
+                port: i as i32,
+                name: format!("server-{}", i),
+            });
+        }
+        ClusterConfig {
+            voters,
+            voters_next: vec![],
+        }
     }
 
     fn payload_entry(term: i64, index: i64) -> Entry {
@@ -647,16 +803,9 @@ mod tests {
     }
 
     fn config_entry(term: i64, index: i64, num_voters: usize) -> Entry {
-        let mut voters = Vec::new();
-        for p in 0..num_voters {
-            voters.push(server("some-host", p as i32));
-        }
         Entry {
             id: Some(EntryId { term, index }),
-            data: Some(Config(ClusterConfig {
-                voters,
-                voters_next: Vec::new(),
-            })),
+            data: Some(Config(make_config(num_voters))),
         }
     }
 
