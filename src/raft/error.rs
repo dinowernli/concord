@@ -29,6 +29,12 @@ pub enum RaftError {
 
     #[error("Stale term state")]
     StaleState,
+
+    #[error("Failed to initialize: {source}")]
+    InitializationFailed {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 impl RaftError {

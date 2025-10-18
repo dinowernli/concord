@@ -5,8 +5,8 @@ use crate::raft::raft_common_proto::{ClusterConfig, Server};
 use crate::raft::raft_service_proto::raft_client::RaftClient;
 use crate::raft::store::ConfigInfo;
 
-use std::cmp::PartialEq;
 use async_std::sync::Mutex;
+use std::cmp::PartialEq;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -190,22 +190,14 @@ impl Cluster {
             }
         }
 
-        // Only keep going if there's an actual config inside.
-        let config;
-        let index;
-        match &info.latest {
-            None => return false,
-            Some(entry) => match &entry.data {
-                Some(Config(c)) => {
-                    index = entry.id.as_ref().expect("id").index;
-                    config = c.clone();
-                }
-                _ => return false,
-            },
-        }
-
         self.config_info = Some(info.clone());
-        if info.committed {
+        let (config, committed) = info.latest();
+        debug!(
+            "new cluster config, committed={}, config={:?}",
+            &committed, &config
+        );
+
+        if committed {
             // Apply the "next voters" part of the latest config.
             self.voters = server_map(config.voters_next);
             self.voters_next = HashMap::new();
@@ -215,7 +207,6 @@ impl Cluster {
             self.voters_next = server_map(config.voters_next);
         }
 
-        debug!(committed = info.committed, index, "new cluster config");
         true
     }
 
@@ -485,10 +476,10 @@ mod tests {
             vec![s1.clone(), s2.clone(), s3.clone()],
             vec![s2.clone(), s4.clone(), s5.clone()],
         );
-        let info_joint = ConfigInfo {
-            latest: Some(config_joint),
-            committed: true,
-        };
+        let info_joint = ConfigInfo::make_with_appended(
+            config_joint,
+            true, /* no joint consensus, just next */
+        );
 
         c.update(info_joint);
 
@@ -513,10 +504,8 @@ mod tests {
             vec![s1.clone(), s2.clone(), s3.clone()],
             vec![s2.clone(), s4.clone(), s5.clone()],
         );
-        let info_joint = ConfigInfo {
-            latest: Some(config_joint),
-            committed: false,
-        };
+        let info_joint =
+            ConfigInfo::make_with_appended(config_joint, false /* for joint consensus */);
 
         c.update(info_joint);
 

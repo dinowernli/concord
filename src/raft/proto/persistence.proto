@@ -28,4 +28,7 @@ message Snapshot {
 
   // The raw snapshot bytes to feed to the state machine.
   bytes data = 2;
+
+  // Information about cluster membership.
+  raft_common_proto.ClusterConfig config = 3;
 }

@@ -52,12 +52,12 @@ impl FailureOptions {
         }
     }
 
-    pub fn disconnect(&mut self, server: &Server) {
-        self.disconnected.insert(server.name.clone());
+    pub fn disconnect(&mut self, name: &str) {
+        self.disconnected.insert(name.to_string());
     }
 
-    pub fn reconnect(&mut self, server: &Server) {
-        self.disconnected.remove(&server.name);
+    pub fn reconnect(&mut self, name: &str) {
+        self.disconnected.remove(name);
     }
 }
 
@@ -400,7 +400,7 @@ mod tests {
             &self,
             _: tonic::Request<PutRequest>,
         ) -> Result<Response<PutResponse>, Status> {
-            Ok(Response::new(PutResponse {}))
+            Ok(Response::new(PutResponse { debug_info: None }))
         }
     }
 }

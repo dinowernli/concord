@@ -20,7 +20,7 @@ use raft::StateMachine;
 use raft::raft_common_proto::EntryId;
 use raft::raft_service_proto::{AppendRequest, AppendResponse, VoteRequest, VoteResponse};
 use raft::raft_service_proto::{CommitRequest, CommitResponse, StepDownRequest, StepDownResponse};
-use raft::raft_service_proto::{InstallSnapshotRequest, InstallSnapshotResponse};
+use raft::raft_service_proto::{InstallSnapshotRequest, InstallSnapshotResponse, RaftSnapshot};
 
 use crate::raft;
 use crate::raft::cluster::{Cluster, QuorumResult};
@@ -30,12 +30,12 @@ use crate::raft::consensus::RaftRole::Leader;
 use crate::raft::error::{RaftError, RaftResult};
 use crate::raft::failure_injection::FailureOptions;
 use crate::raft::persistence::{FilePersistenceOptions, PersistenceOptions};
-use crate::raft::raft_common_proto::Server;
 use crate::raft::raft_common_proto::entry::Data;
 use crate::raft::raft_common_proto::entry::Data::{Config, Payload};
+use crate::raft::raft_common_proto::{ClusterConfig, Server};
 use crate::raft::raft_service_proto::raft_server::Raft;
 use crate::raft::raft_service_proto::{ChangeConfigRequest, ChangeConfigResponse};
-use crate::raft::store::Store;
+use crate::raft::store::{LogSnapshot, Store};
 use crate::raft::{diagnostics, raft_service_proto};
 
 const RPC_TIMEOUT_MS: u64 = 100;
@@ -81,6 +81,39 @@ impl Options {
             }),
         }
     }
+
+    pub fn new_without_persistence_for_testing() -> Self {
+        Options {
+            follower_timeout_ms: 200,
+            candidate_timeouts_ms: 300,
+            leader_replicate_ms: 50,
+            compaction_threshold_bytes: 10 * 1000 * 1000,
+            compaction_check_periods_ms: 5000,
+            persistence_options: PersistenceOptions::NoPersistenceForTesting,
+        }
+    }
+
+    pub fn with_compaction(self: Self, threshold_bytes: i64, check_period_ms: i64) -> Self {
+        Self {
+            compaction_threshold_bytes: threshold_bytes,
+            compaction_check_periods_ms: check_period_ms,
+            ..self
+        }
+    }
+
+    pub fn with_persistence(
+        self: Self,
+        persistence_directory: &str,
+        wipe_persistence: bool,
+    ) -> Self {
+        Self {
+            persistence_options: PersistenceOptions::FilePersistence(FilePersistenceOptions {
+                directory: persistence_directory.to_string(),
+                wipe: wipe_persistence,
+            }),
+            ..self
+        }
+    }
 }
 
 // Canonical implementation of the raft service. Acts as one server among peers
@@ -98,20 +131,35 @@ impl RaftImpl {
         diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
         options: Options,
         failures: Arc<Mutex<FailureOptions>>,
-    ) -> RaftImpl {
+    ) -> RaftResult<RaftImpl> {
+        // A config which gives us (once applied) all the initial members as voters.
+        let initial_cluster_config = ClusterConfig {
+            voters: all.clone().to_vec(),
+            voters_next: all.clone().to_vec(),
+        };
+
         let persistence_options = options.persistence_options.clone();
         let store = Store::new(
             persistence_options,
+            initial_cluster_config,
             state_machine,
             diagnostics.clone(),
             options.compaction_threshold_bytes,
             server.name.as_str(),
         )
-        .await;
+        .await
+        .map_err(|e| RaftError::InitializationFailed {
+            source: Box::new(e),
+        })?;
 
-        let cluster = Cluster::new_with_failures(server.clone(), all.as_slice(), failures.clone());
+        let mut cluster =
+            Cluster::new_with_failures(server.clone(), all.as_slice(), failures.clone());
 
-        RaftImpl {
+        // Make sure we propagate the initial cluster info to the cluster.
+        // TODO(dino): We probably want to just only support initializing with a cluster info.
+        cluster.update(store.get_config_info());
+
+        let result = RaftImpl {
             address: server.clone(),
             state: Arc::new(Mutex::new(RaftState {
                 options,
@@ -123,7 +171,9 @@ impl RaftImpl {
                 followers: HashMap::new(),
                 timer_guard: None,
             })),
-        }
+        };
+
+        Ok(result)
     }
 
     pub async fn start(&self) {
@@ -433,7 +483,14 @@ impl RaftImpl {
         follower: Server,
         install_request: InstallSnapshotRequest,
     ) -> RaftResult<()> {
-        let last = &install_request.last.ok_or(RaftError::missing("last"))?;
+        let last = install_request
+            .snapshot
+            .as_ref()
+            .ok_or(RaftError::missing("snapshot"))?
+            .last_included_entry
+            .as_ref()
+            .ok_or(RaftError::missing("last"))?
+            .clone();
 
         let mut request = Request::new(install_request);
         request.set_timeout(Duration::from_millis(RPC_TIMEOUT_MS));
@@ -674,14 +731,20 @@ impl RaftState {
     // same snapshot currently held on the leader.
     fn create_snapshot_request(&self) -> InstallSnapshotRequest {
         let snap = self.store.get_latest_snapshot();
-        let bytes = snap.snapshot.to_vec();
-        let last = Some(snap.last.clone());
+        let data = snap.data.to_vec();
+        let cluster_config = Some(snap.config);
+        let last_included_entry = Some(snap.last.clone());
+
+        let snapshot = RaftSnapshot {
+            last_included_entry,
+            data,
+            cluster_config,
+        };
 
         InstallSnapshotRequest {
             term: self.term(),
             leader: Some(self.cluster.me()),
-            snapshot: bytes,
-            last,
+            snapshot: Some(snapshot),
         }
     }
 
@@ -1063,14 +1126,44 @@ impl Raft for RaftImpl {
         let request = request.into_inner();
         debug!(?request, "handling request");
 
-        let last = request.last.clone().ok_or(RaftError::missing("last"))?;
+        let snapshot = request.snapshot.ok_or(RaftError::missing("snapshot"))?;
+        let last = snapshot
+            .last_included_entry
+            .clone()
+            .ok_or(RaftError::missing("last"))?;
+        let config = snapshot
+            .cluster_config
+            .clone()
+            .ok_or(RaftError::missing("config"))?;
+        let image = Bytes::from(snapshot.data.to_vec());
+        let image_len_bytes = image.len() as i64;
+
+        let store_snapshot = LogSnapshot {
+            last,
+            data: image,
+            config,
+        };
 
         let mut state = self.state.lock().await;
-        if request.term >= state.term() && !request.snapshot.is_empty() {
-            let snapshot = Bytes::from(request.snapshot.to_vec());
-            let status = state.store.install_snapshot(snapshot, last).await;
+        if request.term >= state.term() && !snapshot.data.is_empty() {
+            // First make sure the store has caught up to the snapshot.
+            let status = state.store.install_snapshot(store_snapshot.clone()).await;
             if status.code() != tonic::Code::Ok {
                 return Err(status);
+            }
+
+            // The config_info is expected to be exactly what's contained in
+            // snapshot.config_info, but we always only update the cluster with config
+            // info instances produced by the store, so let's do that here as well.
+            let config_info = state.store.get_config_info();
+            state.cluster.update(config_info);
+
+            if let Some(diagnostics) = &state.diagnostics {
+                diagnostics.lock().await.report_snapshot_install(
+                    request.term,
+                    last.index,
+                    image_len_bytes,
+                );
             }
         }
         Ok(Response::new(InstallSnapshotResponse {
@@ -1141,12 +1234,33 @@ mod tests {
 
     use super::*;
 
+    fn make_cluster_config() -> ClusterConfig {
+        ClusterConfig {
+            voters: vec![create_server(1), create_server(2), create_server(3)],
+            voters_next: vec![],
+        }
+    }
+
     #[tokio::test]
     async fn test_initial_state() {
         let raft = create_raft().await;
         let state = raft.state.lock().await;
         assert_eq!(state.role, RaftRole::Follower);
         assert_eq!(state.term(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_initial_membership() {
+        let raft = create_raft().await;
+        let state = raft.state.lock().await;
+
+        // Part of initial member list
+        assert!(state.cluster.is_voting_member(&create_server(1)));
+        assert!(state.cluster.is_voting_member(&create_server(2)));
+        assert!(state.cluster.is_voting_member(&create_server(3)));
+
+        // Not part of initial member list
+        assert!(!state.cluster.is_voting_member(&create_server(4)));
     }
 
     // This test verifies that initially, a follower fails to accept entries
@@ -1195,11 +1309,15 @@ mod tests {
 
         // Now install a snapshot which should make the original append request
         // valid.
+        let snapshot = RaftSnapshot {
+            last_included_entry: Some(entry_id(10, 75)),
+            data: vec![1, 2],
+            cluster_config: Some(make_cluster_config()),
+        };
         let snapshot_request = InstallSnapshotRequest {
             leader: Some(leader.clone()),
             term: 12,
-            last: Some(entry_id(10, 75)),
-            snapshot: vec![1, 2],
+            snapshot: Some(snapshot),
         };
         let install_response_1 = client
             .install_snapshot(snapshot_request.clone())
@@ -1215,6 +1333,68 @@ mod tests {
             .expect("append")
             .into_inner();
         assert!(append_response_2.success);
+    }
+
+    #[tokio::test]
+    async fn test_install_snapshot_updates_cluster_config() {
+        let raft = create_raft().await;
+        let raft_state = raft.state.clone();
+        let server = TestRpcServer::run(RaftServer::new(raft)).await;
+        let dst = server.address().expect("server");
+        let mut client = create_local_client_for_testing(dst).await;
+
+        let s1 = create_server(1);
+        let s2 = create_server(2);
+        let s3 = create_server(3);
+        let s4 = create_server(4);
+        let s5 = create_server(5);
+
+        {
+            let state = raft_state.lock().await;
+
+            assert!(state.cluster.is_voting_member(&s1));
+            assert!(state.cluster.is_voting_member(&s2));
+            assert!(state.cluster.is_voting_member(&s3));
+
+            assert!(!state.cluster.is_voting_member(&s4));
+            assert!(!state.cluster.is_voting_member(&s5));
+        }
+
+        let leader = create_server(1);
+        let new_config = ClusterConfig {
+            voters: vec![leader.clone(), s4.clone(), s5.clone()],
+            voters_next: vec![leader.clone(), s4.clone(), s5.clone()],
+        };
+
+        let new_index = 77;
+        let snapshot = RaftSnapshot {
+            last_included_entry: Some(entry_id(10, new_index)),
+            data: vec![1, 2],
+            cluster_config: Some(new_config.clone()),
+        };
+        let snapshot_request = InstallSnapshotRequest {
+            leader: Some(leader.clone()),
+            term: 12,
+            snapshot: Some(snapshot),
+        };
+
+        client
+            .install_snapshot(snapshot_request)
+            .await
+            .expect("install");
+
+        {
+            let state = raft_state.lock().await;
+            assert_eq!(new_index, state.store.last_known_log_entry_id().index);
+            assert_eq!(new_config, state.store.get_config_info().latest().0);
+
+            assert!(state.cluster.is_voting_member(&s1));
+            assert!(!state.cluster.is_voting_member(&s2));
+            assert!(!state.cluster.is_voting_member(&s3));
+
+            assert!(state.cluster.is_voting_member(&s4));
+            assert!(state.cluster.is_voting_member(&s5));
+        }
     }
 
     // This test verifies that we can append entries to a follower and that once the
@@ -1328,6 +1508,7 @@ mod tests {
             Arc::new(Mutex::new(FailureOptions::no_failures())),
         )
         .await
+        .expect("create_raft")
     }
 
     fn create_config_for_testing() -> Options {

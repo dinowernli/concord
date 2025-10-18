@@ -124,7 +124,11 @@ impl KeyValue for KeyValueService {
                     "Committed put operation with raft index {} for key {}",
                     id.index, key_str
                 );
-                Ok(Response::new(PutResponse {}))
+                Ok(Response::new(PutResponse {
+                    debug_info: Some(keyvalue_proto::DebugInfo {
+                        raft_index: id.index,
+                    }),
+                }))
             }
             Err(message) => {
                 warn!(
@@ -216,11 +220,15 @@ mod tests {
             value: "bar".as_bytes().to_vec(),
         };
 
-        create_grpc_client(server.port().unwrap() as i32)
+        let response = create_grpc_client(server.port().unwrap() as i32)
             .await
             .put(Request::new(request.clone()))
             .await
-            .expect("response");
+            .expect("response")
+            .into_inner();
+
+        assert!(response.debug_info.is_some());
+        assert_eq!(response.debug_info.unwrap().raft_index, 0); // FakeRaftClient always returns 0
 
         let value = store
             .lock()

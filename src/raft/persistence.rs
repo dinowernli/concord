@@ -1,4 +1,4 @@
-use crate::raft::raft_common_proto::{Entry, EntryId, Server};
+use crate::raft::raft_common_proto::{ClusterConfig, Entry, EntryId, Server};
 use crate::raft::raft_persistence_proto::{Snapshot, State};
 use crate::raft::store::LogSnapshot;
 use async_std::fs;
@@ -95,6 +95,7 @@ pub trait Persistence {
         &self,
         snapshot: &Bytes,
         last: &EntryId,
+        cluster_config: &ClusterConfig,
     ) -> Result<(), PersistenceError>;
 
     async fn read(&self) -> Result<Option<PersistentState>, PersistenceError>;
@@ -106,14 +107,13 @@ pub trait Persistence {
         entries: &Vec<Entry>,
         snapshot: &Bytes,
         last: &EntryId,
+        cluster_config: &ClusterConfig,
     ) -> Result<(), PersistenceError>;
 }
 
 #[derive(Debug, Clone)]
 pub enum PersistenceOptions {
     FilePersistence(FilePersistenceOptions),
-
-    #[allow(dead_code)] // Only used for testing.
     NoPersistenceForTesting,
 }
 
@@ -166,7 +166,12 @@ impl Persistence for NoopPersistence {
         Ok(())
     }
 
-    async fn write_snapshot(&self, _: &Bytes, _: &EntryId) -> Result<(), PersistenceError> {
+    async fn write_snapshot(
+        &self,
+        _: &Bytes,
+        _: &EntryId,
+        _: &ClusterConfig,
+    ) -> Result<(), PersistenceError> {
         Ok(())
     }
 
@@ -181,6 +186,7 @@ impl Persistence for NoopPersistence {
         _: &Vec<Entry>,
         _: &Bytes,
         _: &EntryId,
+        _: &ClusterConfig,
     ) -> Result<(), PersistenceError> {
         Ok(())
     }
@@ -216,14 +222,14 @@ impl FilePersistence {
     }
 
     async fn read_entries(&self) -> Result<Vec<Entry>, PersistenceError> {
-        let path = Path::new(&self.directory).join(LOG_PATH);
+        let path = Path::new(&self.directory).join(LOG_PATH.to_string());
         let data = async_std::fs::read(path).await.map_err(|e| {
             PersistenceError::new(format!("Failed to read log file: {}", e.to_string()))
         })?;
         decode_length_delimited_entries(&data)
     }
 
-    async fn read_snapshot(&self) -> Result<(Bytes, EntryId), PersistenceError> {
+    async fn read_snapshot(&self) -> Result<(Bytes, EntryId, ClusterConfig), PersistenceError> {
         let path = Path::new(&self.directory).join(SNAPSHOT_PATH);
         let data = fs::read(path)
             .await
@@ -233,7 +239,10 @@ impl FilePersistence {
         let last = snapshot
             .last
             .ok_or_else(|| PersistenceError::new("Missing last EntryId in snapshot".to_string()))?;
-        Ok((Bytes::from(snapshot.data), last))
+        let cluster_config = snapshot.config.ok_or_else(|| {
+            PersistenceError::new("Missing last cluster config in snapshot".to_string())
+        })?;
+        Ok((Bytes::from(snapshot.data), last, cluster_config))
     }
 
     async fn read_state(&self) -> Result<(i64, Option<Server>), PersistenceError> {
@@ -252,7 +261,7 @@ impl FilePersistence {
         data: &[u8],
         mode: WriteMode,
     ) -> Result<(), PersistenceError> {
-        let path = Path::new(self.directory.as_str()).join(filename);
+        let path = Path::new(self.directory.as_str()).join(filename.to_string());
 
         let mut file = OpenOptions::new()
             .write(true)
@@ -280,7 +289,7 @@ impl FilePersistence {
 
     // Deletes the specified file from the filesystem directory.
     async fn wipe_file(&self, filename: &str) -> Result<(), PersistenceError> {
-        let path = Path::new(&self.directory).join(filename);
+        let path = Path::new(&self.directory).join(filename.to_string());
         match async_std::fs::remove_file(path).await {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()), // Already deleted.
@@ -323,10 +332,16 @@ impl Persistence for FilePersistence {
             .await
     }
 
-    async fn write_snapshot(&self, data: &Bytes, last: &EntryId) -> Result<(), PersistenceError> {
+    async fn write_snapshot(
+        &self,
+        data: &Bytes,
+        last: &EntryId,
+        cluster_config: &ClusterConfig,
+    ) -> Result<(), PersistenceError> {
         let output = Snapshot {
             data: data.to_vec(),
             last: Some(last.clone()),
+            config: Some(cluster_config.clone()),
         };
         self.write_to_file(SNAPSHOT_PATH, &output.encode_to_vec(), WriteMode::Replace)
             .await
@@ -358,7 +373,7 @@ impl Persistence for FilePersistence {
 
         // Now we can read all three and return the result.
         let (term, voted_for) = self.read_state().await?;
-        let (snapshot_bytes, last) = self.read_snapshot().await?;
+        let (snapshot_bytes, last, cluster_conf) = self.read_snapshot().await?;
         let entries = self.read_entries().await?;
 
         let result = PersistentState {
@@ -366,7 +381,8 @@ impl Persistence for FilePersistence {
             voted_for,
             snapshot: LogSnapshot {
                 last,
-                snapshot: snapshot_bytes,
+                data: snapshot_bytes,
+                config: cluster_conf,
             },
             entries,
         };
@@ -384,8 +400,9 @@ impl Persistence for FilePersistence {
         entries: &Vec<Entry>,
         snapshot: &Bytes,
         last: &EntryId,
+        cluster_config: &ClusterConfig,
     ) -> Result<(), PersistenceError> {
-        self.write_snapshot(snapshot, last).await?;
+        self.write_snapshot(snapshot, last, cluster_config).await?;
         self.write_entries(entries).await?;
         self.write_state(term, voted).await?;
         Ok(())
@@ -443,7 +460,7 @@ async fn create_dir_if_not_exists(directory: &str) -> Result<(), PersistenceErro
         }
         Err(e) => {
             if e.kind() == ErrorKind::NotFound {
-                fs::create_dir_all(directory).await.map_err(|e| {
+                fs::create_dir_all(&directory).await.map_err(|e| {
                     PersistenceError::new(format!("Failed to create directory {}", e.to_string()))
                 })
             } else {
@@ -460,498 +477,519 @@ async fn create_dir_if_not_exists(directory: &str) -> Result<(), PersistenceErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::raft_common_proto::entry::Data;
+    use crate::raft::raft_common_proto::{Entry, EntryId, Server};
+    use tempfile::TempDir;
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use crate::raft::raft_common_proto::entry::Data;
-        use crate::raft::raft_common_proto::{Entry, EntryId, Server};
-        use tempfile::TempDir;
+    async fn create_persistence(directory: &str) -> Result<Box<FilePersistence>, PersistenceError> {
+        let options = FilePersistenceOptions {
+            directory: directory.to_string(),
+            wipe: false,
+        };
+        FilePersistence::new(options).await
+    }
 
-        async fn create_persistence(
-            directory: &str,
-        ) -> Result<Box<FilePersistence>, PersistenceError> {
-            let options = FilePersistenceOptions {
-                directory: directory.to_string(),
-                wipe: false,
-            };
-            FilePersistence::new(options).await
+    #[tokio::test]
+    async fn test_write_and_read_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        let persistence = create_persistence(&dir_str).await.unwrap();
+
+        let entries = sample_entries();
+        persistence
+            .write_entries(&entries)
+            .await
+            .expect("Failed to write entries");
+
+        let read_entries = persistence
+            .read_entries()
+            .await
+            .expect("Failed to read entries");
+
+        assert_eq!(entries, read_entries);
+    }
+
+    #[tokio::test]
+    async fn test_encode_decode_length_delimited_entries() {
+        let entries = sample_entries();
+        // Encode
+        let encoded = encode_length_delimited(&entries)
+            .await
+            .expect("Encoding failed");
+        // Decode
+        let decoded = decode_length_delimited_entries(&encoded).expect("Decoding failed");
+        assert_eq!(entries, decoded);
+    }
+
+    #[tokio::test]
+    async fn test_write_and_read_snapshot() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        let persistence = create_persistence(&dir_str).await.unwrap();
+
+        let payload = Bytes::from("snapshot_data_here");
+        let id = EntryId { term: 5, index: 42 };
+        let config = sample_cluster_config();
+
+        persistence
+            .write_snapshot(&payload, &id, &config)
+            .await
+            .unwrap();
+        let (read_data, read_id, read_cluster_config) = persistence.read_snapshot().await.unwrap();
+
+        assert_eq!(&payload, &read_data);
+        assert_eq!(&id, &read_id);
+        assert_eq!(&config, &read_cluster_config)
+    }
+
+    #[tokio::test]
+    async fn test_write_and_read_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        let persistence = create_persistence(&dir_str).await.unwrap();
+
+        let term = 9;
+        let voted = Some(Server {
+            name: "s1".to_string(),
+            host: "addr:1234".to_string(),
+            port: 1234,
+        });
+
+        persistence.write_state(term, &voted).await.unwrap();
+        let (read_term, read_voted) = persistence.read_state().await.unwrap();
+
+        assert_eq!(term, read_term);
+        assert_eq!(voted, read_voted);
+    }
+
+    #[tokio::test]
+    async fn test_append_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        let persistence = create_persistence(&dir_str).await.unwrap();
+
+        let first_batch = vec![sample_entry(1, 1, "one"), sample_entry(1, 2, "two")];
+        let second_batch = vec![sample_entry(1, 3, "three"), sample_entry(1, 4, "four")];
+
+        persistence.write_entries(&first_batch).await.unwrap(); // Overwrite
+        persistence.append_entries(&second_batch).await.unwrap(); // Append
+
+        let all_entries = persistence.read_entries().await.unwrap();
+        let expected = [first_batch, second_batch].concat();
+        assert_eq!(all_entries, expected);
+    }
+
+    #[tokio::test]
+    async fn test_append_multiple_times() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        let persistence = create_persistence(&dir_str).await.unwrap();
+
+        let batch1 = vec![sample_entry(1, 1, "a")];
+        let batch2 = vec![sample_entry(1, 2, "b")];
+        let batch3 = vec![sample_entry(1, 3, "c")];
+
+        persistence.write_entries(&batch1).await.unwrap(); // Overwrite
+        persistence.append_entries(&batch2).await.unwrap(); // Append
+        persistence.append_entries(&batch3).await.unwrap(); // Append
+
+        let all = persistence.read_entries().await.unwrap();
+        let expected = [batch1, batch2, batch3].concat();
+        assert_eq!(all, expected);
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_after_append() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        let persistence = create_persistence(&dir_str).await.unwrap();
+
+        let initial = vec![sample_entry(1, 1, "start")];
+        let appended = vec![sample_entry(1, 2, "middle")];
+        let overwrite = vec![sample_entry(2, 1, "new_start")];
+
+        persistence.write_entries(&initial).await.unwrap(); // Overwrite
+        persistence.append_entries(&appended).await.unwrap(); // Append
+        persistence.write_entries(&overwrite).await.unwrap(); // Overwrite again
+
+        let all = persistence.read_entries().await.unwrap();
+        assert_eq!(all, overwrite); // Only overwrite should remain
+    }
+
+    #[tokio::test]
+    async fn test_append_after_overwrite_sequence() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        let persistence = create_persistence(&dir_str).await.unwrap();
+
+        let initial = vec![sample_entry(1, 1, "1")];
+        let overwrite = vec![sample_entry(2, 1, "2")];
+        let appended = vec![sample_entry(2, 2, "3")];
+
+        persistence.write_entries(&initial).await.unwrap(); // Write [1]
+        persistence.write_entries(&overwrite).await.unwrap(); // Overwrite [2]
+        persistence.append_entries(&appended).await.unwrap(); // [2, 3]
+
+        let all = persistence.read_entries().await.unwrap();
+        let expected = [overwrite, appended].concat();
+        assert_eq!(all, expected);
+    }
+
+    #[tokio::test]
+    async fn test_write_then_empty_append() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        let persistence = create_persistence(&dir_str).await.unwrap();
+
+        let initial = vec![sample_entry(1, 1, "first"), sample_entry(1, 2, "second")];
+        let empty: Vec<Entry> = vec![];
+
+        persistence.write_entries(&initial).await.unwrap(); // Write 2
+        persistence.append_entries(&empty).await.unwrap(); // Append 0
+
+        let all = persistence.read_entries().await.unwrap();
+        assert_eq!(all, initial);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_writes_only_last_remains() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        let persistence = create_persistence(&dir_str).await.unwrap();
+
+        let first = vec![sample_entry(1, 1, "one")];
+        let second = vec![sample_entry(2, 1, "two")];
+        let third = vec![sample_entry(3, 1, "three")];
+
+        persistence.write_entries(&first).await.unwrap();
+        persistence.write_entries(&second).await.unwrap();
+        persistence.write_entries(&third).await.unwrap();
+
+        let all = persistence.read_entries().await.unwrap();
+        assert_eq!(all, third); // Only the final overwrite should persist
+    }
+
+    #[tokio::test]
+    async fn test_full_read_returns_correct_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        let persistence = create_persistence(&dir_str).await.unwrap();
+
+        let term = 42;
+        let voted = Some(Server {
+            name: "leader".to_string(),
+            host: "localhost".to_string(),
+            port: 8080,
+        });
+        let snapshot_data = Bytes::from("snapshot_data_blob");
+        let last_entry_id = EntryId { term: 1, index: 99 };
+        let cluster_conf = sample_cluster_config();
+
+        let entries = vec![sample_entry(1, 100, "a"), sample_entry(1, 101, "b")];
+
+        // Write all required files
+        persistence.write_state(term, &voted).await.unwrap();
+        persistence
+            .write_snapshot(&snapshot_data, &last_entry_id, &cluster_conf)
+            .await
+            .unwrap();
+        persistence.write_entries(&entries).await.unwrap();
+
+        // Now read them back using `read()`
+        let state = persistence
+            .read()
+            .await
+            .expect("read() failed")
+            .expect("Expected Some");
+
+        // Assert state matches what we wrote
+        assert_eq!(state.term, term);
+        assert_eq!(state.voted_for, voted);
+        assert_eq!(state.entries, entries);
+        assert_eq!(&state.snapshot.last, &last_entry_id);
+        assert_eq!(&state.snapshot.data, &snapshot_data);
+        assert_eq!(&state.snapshot.config, &cluster_conf);
+    }
+
+    #[tokio::test]
+    async fn test_read_returns_none_when_no_files_exist() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        let persistence = create_persistence(&dir_str).await.unwrap();
+
+        let result = persistence.read().await.unwrap();
+        assert!(
+            result.is_none(),
+            "Expected read() to return None when no files exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_fails_with_partial_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        let persistence = create_persistence(&dir_str).await.unwrap();
+
+        // Write only one of the three
+        let term = 10;
+        let voted = Some(Server {
+            name: "solo".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 7070,
+        });
+        persistence.write_state(term, &voted).await.unwrap();
+
+        let err = persistence
+            .read()
+            .await
+            .err()
+            .expect("Expected error due to missing files");
+        assert!(err._message.contains("Need all three files"));
+    }
+
+    #[tokio::test]
+    async fn test_read_fails_with_corrupted_main_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        let persistence = create_persistence(&dir_str).await.unwrap();
+
+        // Corrupt main_state.pb.bin
+        let state_path = Path::new(dir_str.as_str()).join(MAIN_STATE_PATH);
+        fs::write(&state_path, b"not a valid protobuf")
+            .await
+            .unwrap();
+
+        // Write valid snapshot and log files
+        let snapshot = Bytes::from("valid snapshot");
+        let last = EntryId { term: 1, index: 1 };
+        let entries = vec![sample_entry(1, 1, "valid")];
+        let cluster_conf = sample_cluster_config();
+
+        persistence
+            .write_snapshot(&snapshot, &last, &cluster_conf)
+            .await
+            .unwrap();
+        persistence.write_entries(&entries).await.unwrap();
+
+        let result = persistence.read().await;
+        assert!(
+            result.is_err(),
+            "Expected read() to fail due to corrupted main_state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wipe_removes_existing_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        let persistence = create_persistence(&dir_str).await.unwrap();
+
+        // Only write two out of the three files.
+        let snapshot = Bytes::from("snapshot_data");
+        let last_id = EntryId { term: 1, index: 1 };
+        let cluster_conf = sample_cluster_config();
+        persistence.write_entries(&sample_entries()).await.unwrap();
+        persistence
+            .write_snapshot(&snapshot, &last_id, &cluster_conf)
+            .await
+            .unwrap();
+
+        // Now create persistence again, with wipe = true
+        let wiped_options = FilePersistenceOptions {
+            directory: dir_str.clone(),
+            wipe: true,
+        };
+        let wiped_persistence = FilePersistence::new(wiped_options).await.unwrap();
+
+        // After wipe, reading should return None
+        let result = wiped_persistence.read().await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_wipe_on_fresh_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+
+        // Create persistence with wipe=true on empty dir (should not fail)
+        let options = FilePersistenceOptions {
+            directory: dir_str.clone(),
+            wipe: true,
+        };
+
+        let persistence = FilePersistence::new(options).await.unwrap();
+
+        // Nothing was there, so read should return None
+        let state = persistence.read().await.unwrap();
+        assert!(state.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_wipe_does_not_delete_unrelated_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let dir_str = dir.to_str().unwrap();
+
+        // Create an unrelated file
+        let unrelated_path = dir.join("unrelated.txt");
+        async_std::fs::write(&unrelated_path, b"preserve this")
+            .await
+            .unwrap();
+        assert!(fs::metadata(&unrelated_path).await.is_ok());
+
+        let persistence = create_persistence(&dir_str).await.unwrap();
+
+        // Create a regular Raft file
+        let entries_path = dir.join(LOG_PATH);
+        persistence.write_entries(&sample_entries()).await.unwrap();
+        persistence.wipe().await.unwrap();
+
+        assert!(fs::metadata(&unrelated_path).await.is_ok());
+        assert!(!fs::metadata(&entries_path).await.is_ok());
+    }
+
+    #[test]
+    fn test_validate_successful() {
+        let entries = vec![sample_entry(1, 1, "entry1"), sample_entry(1, 2, "entry2")];
+        let snapshot = LogSnapshot {
+            last: EntryId { term: 1, index: 1 },
+            data: Bytes::from("data"),
+            config: sample_cluster_config(),
+        };
+        let state = PersistentState {
+            term: 1,
+            voted_for: None,
+            entries,
+            snapshot,
+        };
+
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_fails_on_bad_term() {
+        let state = PersistentState {
+            term: -2,
+            voted_for: None,
+            entries: vec![],
+            snapshot: LogSnapshot {
+                last: EntryId { term: 0, index: 0 },
+                data: Bytes::new(),
+                config: sample_cluster_config(),
+            },
+        };
+
+        let result = state.validate();
+        assert!(result.is_err());
+        assert!(format!("{:?}", result).contains("bad term"));
+    }
+
+    #[test]
+    fn test_validate_fails_on_non_consecutive_entries() {
+        let entries = vec![sample_entry(1, 1, "one"), sample_entry(1, 3, "three")];
+        let snapshot = LogSnapshot {
+            last: EntryId { term: 1, index: 1 },
+            data: Bytes::from("snap"),
+            config: sample_cluster_config(),
+        };
+        let state = PersistentState {
+            term: 1,
+            voted_for: None,
+            entries,
+            snapshot,
+        };
+
+        let result = state.validate();
+        assert!(result.is_err());
+        assert!(format!("{:?}", result).contains("non-consecutive"));
+    }
+
+    #[test]
+    fn test_validate_fails_on_snapshot_mismatch() {
+        let entries = vec![sample_entry(2, 1, "x"), sample_entry(2, 2, "y")];
+        let snapshot = LogSnapshot {
+            last: EntryId { term: 1, index: 1 },
+            data: Bytes::from("snap"),
+            config: sample_cluster_config(),
+        };
+        let state = PersistentState {
+            term: 2,
+            voted_for: None,
+            entries,
+            snapshot,
+        };
+
+        let result = state.validate();
+        assert!(result.is_err());
+        assert!(format!("{:?}", result).contains("incompatible with snapshot"));
+    }
+
+    #[test]
+    fn test_trim_entries_removes_included_entries() {
+        let entries = vec![
+            sample_entry(1, 1, "one"),
+            sample_entry(1, 2, "two"),
+            sample_entry(1, 3, "three"),
+        ];
+        let snapshot = LogSnapshot {
+            last: EntryId { term: 1, index: 2 },
+            data: Bytes::from("snap"),
+            config: sample_cluster_config(),
+        };
+        let mut state = PersistentState {
+            term: 1,
+            voted_for: None,
+            entries,
+            snapshot,
+        };
+
+        state.validate().unwrap(); // Ensure it passes validation first
+        state.trim_entries();
+
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].id.as_ref().unwrap().index, 3);
+    }
+
+    #[test]
+    fn test_check_consecutive_passes_on_valid_entries() {
+        let entries = vec![
+            sample_entry(1, 10, "a"),
+            sample_entry(1, 11, "b"),
+            sample_entry(1, 12, "c"),
+        ];
+        assert!(PersistentState::check_consecutive(&entries).is_ok());
+    }
+
+    #[test]
+    fn test_check_consecutive_fails_on_gap() {
+        let entries = vec![sample_entry(1, 5, "a"), sample_entry(1, 7, "b")];
+        let err = PersistentState::check_consecutive(&entries).unwrap_err();
+        assert!(format!("{:?}", err).contains("non-consecutive"));
+    }
+
+    fn sample_entries() -> Vec<Entry> {
+        vec![
+            sample_entry(1, 2, "first"),
+            sample_entry(2, 3, "second"),
+            sample_entry(3, 4, "third"),
+        ]
+    }
+
+    fn sample_entry(term: i64, index: i64, data: &str) -> Entry {
+        Entry {
+            id: Some(EntryId { term, index }),
+            data: Some(Data::Payload(data.to_string().encode_to_vec())),
         }
-
-        #[tokio::test]
-        async fn test_write_and_read_entries() {
-            let temp_dir = TempDir::new().unwrap();
-            let dir_str = temp_dir.path().to_str().unwrap().to_string();
-            let persistence = create_persistence(&dir_str).await.unwrap();
-
-            let entries = sample_entries();
-            persistence
-                .write_entries(&entries)
-                .await
-                .expect("Failed to write entries");
-
-            let read_entries = persistence
-                .read_entries()
-                .await
-                .expect("Failed to read entries");
-
-            assert_eq!(entries, read_entries);
-        }
-
-        #[tokio::test]
-        async fn test_encode_decode_length_delimited_entries() {
-            let entries = sample_entries();
-            // Encode
-            let encoded = encode_length_delimited(&entries)
-                .await
-                .expect("Encoding failed");
-            // Decode
-            let decoded = decode_length_delimited_entries(&encoded).expect("Decoding failed");
-            assert_eq!(entries, decoded);
-        }
-
-        #[tokio::test]
-        async fn test_write_and_read_snapshot() {
-            let temp_dir = TempDir::new().unwrap();
-            let dir_str = temp_dir.path().to_str().unwrap().to_string();
-            let persistence = create_persistence(&dir_str).await.unwrap();
-
-            let payload = Bytes::from("snapshot_data_here");
-            let id = EntryId { term: 5, index: 42 };
-
-            persistence.write_snapshot(&payload, &id).await.unwrap();
-            let (read_data, read_id) = persistence.read_snapshot().await.unwrap();
-
-            assert_eq!(payload, read_data);
-            assert_eq!(id, read_id);
-        }
-
-        #[tokio::test]
-        async fn test_write_and_read_state() {
-            let temp_dir = TempDir::new().unwrap();
-            let dir_str = temp_dir.path().to_str().unwrap().to_string();
-            let persistence = create_persistence(&dir_str).await.unwrap();
-
-            let term = 9;
-            let voted = Some(Server {
-                name: "s1".to_string(),
-                host: "addr:1234".to_string(),
-                port: 1234,
-            });
-
-            persistence.write_state(term, &voted).await.unwrap();
-            let (read_term, read_voted) = persistence.read_state().await.unwrap();
-
-            assert_eq!(term, read_term);
-            assert_eq!(voted, read_voted);
-        }
-
-        #[tokio::test]
-        async fn test_append_entries() {
-            let temp_dir = TempDir::new().unwrap();
-            let dir_str = temp_dir.path().to_str().unwrap().to_string();
-            let persistence = create_persistence(&dir_str).await.unwrap();
-
-            let first_batch = vec![sample_entry(1, 1, "one"), sample_entry(1, 2, "two")];
-            let second_batch = vec![sample_entry(1, 3, "three"), sample_entry(1, 4, "four")];
-
-            persistence.write_entries(&first_batch).await.unwrap(); // Overwrite
-            persistence.append_entries(&second_batch).await.unwrap(); // Append
-
-            let all_entries = persistence.read_entries().await.unwrap();
-            let expected = [first_batch, second_batch].concat();
-            assert_eq!(all_entries, expected);
-        }
-
-        #[tokio::test]
-        async fn test_append_multiple_times() {
-            let temp_dir = TempDir::new().unwrap();
-            let dir_str = temp_dir.path().to_str().unwrap().to_string();
-            let persistence = create_persistence(&dir_str).await.unwrap();
-
-            let batch1 = vec![sample_entry(1, 1, "a")];
-            let batch2 = vec![sample_entry(1, 2, "b")];
-            let batch3 = vec![sample_entry(1, 3, "c")];
-
-            persistence.write_entries(&batch1).await.unwrap(); // Overwrite
-            persistence.append_entries(&batch2).await.unwrap(); // Append
-            persistence.append_entries(&batch3).await.unwrap(); // Append
-
-            let all = persistence.read_entries().await.unwrap();
-            let expected = [batch1, batch2, batch3].concat();
-            assert_eq!(all, expected);
-        }
-
-        #[tokio::test]
-        async fn test_overwrite_after_append() {
-            let temp_dir = TempDir::new().unwrap();
-            let dir_str = temp_dir.path().to_str().unwrap().to_string();
-            let persistence = create_persistence(&dir_str).await.unwrap();
-
-            let initial = vec![sample_entry(1, 1, "start")];
-            let appended = vec![sample_entry(1, 2, "middle")];
-            let overwrite = vec![sample_entry(2, 1, "new_start")];
-
-            persistence.write_entries(&initial).await.unwrap(); // Overwrite
-            persistence.append_entries(&appended).await.unwrap(); // Append
-            persistence.write_entries(&overwrite).await.unwrap(); // Overwrite again
-
-            let all = persistence.read_entries().await.unwrap();
-            assert_eq!(all, overwrite); // Only overwrite should remain
-        }
-
-        #[tokio::test]
-        async fn test_append_after_overwrite_sequence() {
-            let temp_dir = TempDir::new().unwrap();
-            let dir_str = temp_dir.path().to_str().unwrap().to_string();
-            let persistence = create_persistence(&dir_str).await.unwrap();
-
-            let initial = vec![sample_entry(1, 1, "1")];
-            let overwrite = vec![sample_entry(2, 1, "2")];
-            let appended = vec![sample_entry(2, 2, "3")];
-
-            persistence.write_entries(&initial).await.unwrap(); // Write [1]
-            persistence.write_entries(&overwrite).await.unwrap(); // Overwrite [2]
-            persistence.append_entries(&appended).await.unwrap(); // [2, 3]
-
-            let all = persistence.read_entries().await.unwrap();
-            let expected = [overwrite, appended].concat();
-            assert_eq!(all, expected);
-        }
-
-        #[tokio::test]
-        async fn test_write_then_empty_append() {
-            let temp_dir = TempDir::new().unwrap();
-            let dir_str = temp_dir.path().to_str().unwrap().to_string();
-            let persistence = create_persistence(&dir_str).await.unwrap();
-
-            let initial = vec![sample_entry(1, 1, "first"), sample_entry(1, 2, "second")];
-            let empty: Vec<Entry> = vec![];
-
-            persistence.write_entries(&initial).await.unwrap(); // Write 2
-            persistence.append_entries(&empty).await.unwrap(); // Append 0
-
-            let all = persistence.read_entries().await.unwrap();
-            assert_eq!(all, initial);
-        }
-
-        #[tokio::test]
-        async fn test_multiple_writes_only_last_remains() {
-            let temp_dir = TempDir::new().unwrap();
-            let dir_str = temp_dir.path().to_str().unwrap().to_string();
-            let persistence = create_persistence(&dir_str).await.unwrap();
-
-            let first = vec![sample_entry(1, 1, "one")];
-            let second = vec![sample_entry(2, 1, "two")];
-            let third = vec![sample_entry(3, 1, "three")];
-
-            persistence.write_entries(&first).await.unwrap();
-            persistence.write_entries(&second).await.unwrap();
-            persistence.write_entries(&third).await.unwrap();
-
-            let all = persistence.read_entries().await.unwrap();
-            assert_eq!(all, third); // Only the final overwrite should persist
-        }
-
-        #[tokio::test]
-        async fn test_full_read_returns_correct_state() {
-            let temp_dir = TempDir::new().unwrap();
-            let dir_str = temp_dir.path().to_str().unwrap().to_string();
-            let persistence = create_persistence(&dir_str).await.unwrap();
-
-            let term = 42;
-            let voted = Some(Server {
-                name: "leader".to_string(),
-                host: "localhost".to_string(),
-                port: 8080,
-            });
-            let snapshot_data = Bytes::from("snapshot_data_blob");
-            let last_entry_id = EntryId { term: 1, index: 99 };
-
-            let entries = vec![sample_entry(1, 100, "a"), sample_entry(1, 101, "b")];
-
-            // Write all required files
-            persistence.write_state(term, &voted).await.unwrap();
-            persistence
-                .write_snapshot(&snapshot_data, &last_entry_id)
-                .await
-                .unwrap();
-            persistence.write_entries(&entries).await.unwrap();
-
-            // Now read them back using `read()`
-            let state = persistence
-                .read()
-                .await
-                .expect("read() failed")
-                .expect("Expected Some");
-
-            // Assert state matches what we wrote
-            assert_eq!(state.term, term);
-            assert_eq!(state.voted_for, voted);
-            assert_eq!(state.entries, entries);
-            assert_eq!(state.snapshot.last, last_entry_id);
-            assert_eq!(state.snapshot.snapshot, snapshot_data);
-        }
-
-        #[tokio::test]
-        async fn test_read_returns_none_when_no_files_exist() {
-            let temp_dir = TempDir::new().unwrap();
-            let dir_str = temp_dir.path().to_str().unwrap().to_string();
-            let persistence = create_persistence(&dir_str).await.unwrap();
-
-            let result = persistence.read().await.unwrap();
-            assert!(
-                result.is_none(),
-                "Expected read() to return None when no files exist"
-            );
-        }
-
-        #[tokio::test]
-        async fn test_read_fails_with_partial_files() {
-            let temp_dir = TempDir::new().unwrap();
-            let dir_str = temp_dir.path().to_str().unwrap().to_string();
-            let persistence = create_persistence(&dir_str).await.unwrap();
-
-            // Write only one of the three
-            let term = 10;
-            let voted = Some(Server {
-                name: "solo".to_string(),
-                host: "127.0.0.1".to_string(),
-                port: 7070,
-            });
-            persistence.write_state(term, &voted).await.unwrap();
-
-            let err = persistence
-                .read()
-                .await
-                .err()
-                .expect("Expected error due to missing files");
-            assert!(err._message.contains("Need all three files"));
-        }
-
-        #[tokio::test]
-        async fn test_read_fails_with_corrupted_main_state() {
-            let temp_dir = TempDir::new().unwrap();
-            let dir_str = temp_dir.path().to_str().unwrap().to_string();
-            let persistence = create_persistence(&dir_str).await.unwrap();
-
-            // Corrupt main_state.pb.bin
-            let state_path = Path::new(dir_str.as_str()).join(MAIN_STATE_PATH);
-            fs::write(&state_path, b"not a valid protobuf")
-                .await
-                .unwrap();
-
-            // Write valid snapshot and log files
-            let snapshot = Bytes::from("valid snapshot");
-            let last = EntryId { term: 1, index: 1 };
-            let entries = vec![sample_entry(1, 1, "valid")];
-
-            persistence.write_snapshot(&snapshot, &last).await.unwrap();
-            persistence.write_entries(&entries).await.unwrap();
-
-            let result = persistence.read().await;
-            assert!(
-                result.is_err(),
-                "Expected read() to fail due to corrupted main_state"
-            );
-        }
-
-        #[tokio::test]
-        async fn test_wipe_removes_existing_state() {
-            let temp_dir = TempDir::new().unwrap();
-            let dir_str = temp_dir.path().to_str().unwrap().to_string();
-            let persistence = create_persistence(&dir_str).await.unwrap();
-
-            // Only write two out of the three files.
-            let snapshot = Bytes::from("snapshot_data");
-            let last_id = EntryId { term: 1, index: 1 };
-            persistence.write_entries(&sample_entries()).await.unwrap();
-            persistence
-                .write_snapshot(&snapshot, &last_id)
-                .await
-                .unwrap();
-
-            // Now create persistence again, with wipe = true
-            let wiped_options = FilePersistenceOptions {
-                directory: dir_str.clone(),
-                wipe: true,
-            };
-            let wiped_persistence = FilePersistence::new(wiped_options).await.unwrap();
-
-            // After wipe, reading should return None
-            let result = wiped_persistence.read().await.unwrap();
-            assert!(result.is_none());
-        }
-
-        #[tokio::test]
-        async fn test_wipe_on_fresh_directory() {
-            let temp_dir = TempDir::new().unwrap();
-            let dir_str = temp_dir.path().to_str().unwrap().to_string();
-
-            // Create persistence with wipe=true on empty dir (should not fail)
-            let options = FilePersistenceOptions {
-                directory: dir_str.clone(),
-                wipe: true,
-            };
-
-            let persistence = FilePersistence::new(options).await.unwrap();
-
-            // Nothing was there, so read should return None
-            let state = persistence.read().await.unwrap();
-            assert!(state.is_none());
-        }
-
-        #[tokio::test]
-        async fn test_wipe_does_not_delete_unrelated_files() {
-            let temp_dir = TempDir::new().unwrap();
-            let dir = temp_dir.path();
-            let dir_str = dir.to_str().unwrap();
-
-            // Create an unrelated file
-            let unrelated_path = dir.join("unrelated.txt");
-            async_std::fs::write(&unrelated_path, b"preserve this")
-                .await
-                .unwrap();
-            assert!(fs::metadata(&unrelated_path).await.is_ok());
-
-            let persistence = create_persistence(&dir_str).await.unwrap();
-
-            // Create a regular Raft file
-            let entries_path = dir.join(LOG_PATH);
-            persistence.write_entries(&sample_entries()).await.unwrap();
-            persistence.wipe().await.unwrap();
-
-            assert!(fs::metadata(&unrelated_path).await.is_ok());
-            assert!(!fs::metadata(&entries_path).await.is_ok());
-        }
-
-        #[test]
-        fn test_validate_successful() {
-            let entries = vec![sample_entry(1, 1, "entry1"), sample_entry(1, 2, "entry2")];
-            let snapshot = LogSnapshot {
-                last: EntryId { term: 1, index: 1 },
-                snapshot: Bytes::from("data"),
-            };
-            let state = PersistentState {
-                term: 1,
-                voted_for: None,
-                entries,
-                snapshot,
-            };
-
-            assert!(state.validate().is_ok());
-        }
-
-        #[test]
-        fn test_validate_fails_on_bad_term() {
-            let state = PersistentState {
-                term: -2,
-                voted_for: None,
-                entries: vec![],
-                snapshot: LogSnapshot {
-                    last: EntryId { term: 0, index: 0 },
-                    snapshot: Bytes::new(),
-                },
-            };
-
-            let result = state.validate();
-            assert!(result.is_err());
-            assert!(format!("{:?}", result).contains("bad term"));
-        }
-
-        #[test]
-        fn test_validate_fails_on_non_consecutive_entries() {
-            let entries = vec![sample_entry(1, 1, "one"), sample_entry(1, 3, "three")];
-            let snapshot = LogSnapshot {
-                last: EntryId { term: 1, index: 1 },
-                snapshot: Bytes::from("snap"),
-            };
-            let state = PersistentState {
-                term: 1,
-                voted_for: None,
-                entries,
-                snapshot,
-            };
-
-            let result = state.validate();
-            assert!(result.is_err());
-            assert!(format!("{:?}", result).contains("non-consecutive"));
-        }
-
-        #[test]
-        fn test_validate_fails_on_snapshot_mismatch() {
-            let entries = vec![sample_entry(2, 1, "x"), sample_entry(2, 2, "y")];
-            let snapshot = LogSnapshot {
-                last: EntryId { term: 1, index: 1 },
-                snapshot: Bytes::from("snap"),
-            };
-            let state = PersistentState {
-                term: 2,
-                voted_for: None,
-                entries,
-                snapshot,
-            };
-
-            let result = state.validate();
-            assert!(result.is_err());
-            assert!(format!("{:?}", result).contains("incompatible with snapshot"));
-        }
-
-        #[test]
-        fn test_trim_entries_removes_included_entries() {
-            let entries = vec![
-                sample_entry(1, 1, "one"),
-                sample_entry(1, 2, "two"),
-                sample_entry(1, 3, "three"),
-            ];
-            let snapshot = LogSnapshot {
-                last: EntryId { term: 1, index: 2 },
-                snapshot: Bytes::from("snap"),
-            };
-            let mut state = PersistentState {
-                term: 1,
-                voted_for: None,
-                entries,
-                snapshot,
-            };
-
-            state.validate().unwrap(); // Ensure it passes validation first
-            state.trim_entries();
-
-            assert_eq!(state.entries.len(), 1);
-            assert_eq!(state.entries[0].id.as_ref().unwrap().index, 3);
-        }
-
-        #[test]
-        fn test_check_consecutive_passes_on_valid_entries() {
-            let entries = vec![
-                sample_entry(1, 10, "a"),
-                sample_entry(1, 11, "b"),
-                sample_entry(1, 12, "c"),
-            ];
-            assert!(PersistentState::check_consecutive(&entries).is_ok());
-        }
-
-        #[test]
-        fn test_check_consecutive_fails_on_gap() {
-            let entries = vec![sample_entry(1, 5, "a"), sample_entry(1, 7, "b")];
-            let err = PersistentState::check_consecutive(&entries).unwrap_err();
-            assert!(format!("{:?}", err).contains("non-consecutive"));
-        }
-
-        fn sample_entries() -> Vec<Entry> {
-            vec![
-                sample_entry(1, 2, "first"),
-                sample_entry(2, 3, "second"),
-                sample_entry(3, 4, "third"),
-            ]
-        }
-
-        fn sample_entry(term: i64, index: i64, data: &str) -> Entry {
-            Entry {
-                id: Some(EntryId { term, index }),
-                data: Some(Data::Payload(data.to_string().encode_to_vec())),
-            }
+    }
+
+    fn sample_cluster_config() -> ClusterConfig {
+        ClusterConfig {
+            voters: vec![Server {
+                host: "some-host".to_string(),
+                port: 8765,
+                name: "some-name".to_string(),
+            }],
+            voters_next: vec![],
         }
     }
 }

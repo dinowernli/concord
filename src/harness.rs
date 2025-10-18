@@ -13,14 +13,18 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 use tonic::Status;
+use tonic::transport::Channel;
 use tracing::{Instrument, error, info, info_span};
 
 use crate::keyvalue;
-use crate::keyvalue::grpc::KeyValueServer;
+use crate::keyvalue::grpc::{KeyValueClient, KeyValueServer};
+use crate::keyvalue::keyvalue_proto::{GetRequest, GetResponse};
 use crate::keyvalue::{KeyValueService, MapStore};
 use crate::raft::raft_common_proto::Server;
 use crate::raft::raft_service_proto::raft_server::RaftServer;
-use crate::raft::{Client, Diagnostics, FailureOptions, Options, RaftImpl, new_client};
+use crate::raft::{
+    Client, Diagnostics, FailureOptions, Options, RaftImpl, SnapshotInfo, new_client,
+};
 
 // Represents a collection of participants that interact with each other. In a real
 // production deployment, these participants might be on different actual machines,
@@ -38,6 +42,7 @@ pub struct Harness {
 pub struct HarnessBuilder {
     bound: Vec<BoundAddress>,
     failure: FailureOptions,
+    options: Options,
 }
 
 impl HarnessBuilder {
@@ -55,6 +60,7 @@ impl HarnessBuilder {
         let mut serving = Vec::new();
         let mut instances = Vec::new();
 
+        let raft_options = self.options;
         for bound in self.bound {
             let (address, listener) = (bound.server, bound.listener);
 
@@ -62,10 +68,10 @@ impl HarnessBuilder {
             let persistence_path = env::temp_dir()
                 .as_path()
                 .join("concord")
-                .join(cluster_name)
+                .join(&cluster_name)
                 .join(&address.name);
 
-            let options = Options::new(
+            let options = raft_options.clone().with_persistence(
                 persistence_path.to_str().unwrap().as_ref(),
                 wipe_persistence,
             );
@@ -79,7 +85,6 @@ impl HarnessBuilder {
                 failures.clone(),
             )
             .await?;
-
             let span = info_span!("serve", server=%address.name);
 
             instances.push(instance);
@@ -102,6 +107,16 @@ impl HarnessBuilder {
         Self {
             bound: self.bound,
             failure: failure_options,
+            options: self.options,
+        }
+    }
+
+    // Consumes this instance and returns an instance with the raft options set.
+    pub fn with_options(self: Self, options: Options) -> Self {
+        Self {
+            bound: self.bound,
+            failure: self.failure,
+            options,
         }
     }
 
@@ -114,17 +129,21 @@ impl HarnessBuilder {
 impl Harness {
     // Creates a harness builder. This will immediately bind an incoming port for
     // each supplied instance name.
-    pub async fn builder(names: Vec<&str>) -> Result<HarnessBuilder, Box<dyn Error>> {
+    pub async fn builder(names: Vec<String>) -> Result<HarnessBuilder, Box<dyn Error>> {
         let mut bound = Vec::new();
         for name in names {
             let listener = TcpListener::bind("[::1]:0").await?;
             let port = listener.local_addr()?.port();
-            let server = server("::1", port as i32, name);
+            let server = server("::1", port as i32, name.as_str());
             bound.push(BoundAddress { listener, server })
         }
         Ok(HarnessBuilder {
             bound,
             failure: FailureOptions::no_failures(),
+
+            // TODO - DONOTMERGE - figure out a better way to only allow in testing and reconcile
+            // with the fact that main() needs to support no persistence
+            options: Options::new_without_persistence_for_testing(),
         })
     }
 
@@ -145,20 +164,27 @@ impl Harness {
     }
 
     // Returns a client that can be used to interact with the cluster.
-    pub fn make_client(&self) -> Box<dyn Client + Send + Sync> {
+    pub fn make_raft_client(&self) -> Box<dyn Client + Send + Sync> {
         let server = self.addresses()[0].clone();
         new_client("harness-client", &server)
     }
 
+    // Returns a client that can be used to issue keyvalue operations.
+    pub async fn make_kv_client(&self) -> KeyValueClient<Channel> {
+        let server = self.addresses()[0].clone();
+        let address = format!("http://[{}]:{}", server.host, server.port);
+        KeyValueClient::connect(address).await.expect("connect")
+    }
+
     // Update the cluster membership to contain only the supplied members. The supplied
     // members must all be valid servers as defined at harness creation time.
-    pub async fn update_members(&self, members: Vec<&str>) -> Result<(), Status> {
-        let client = self.make_client();
+    pub async fn update_members(&self, members: Vec<String>) -> Result<(), Status> {
+        let client = self.make_raft_client();
 
         let addresses = self.addresses().clone();
         let mut new_members: Vec<Server> = Vec::new();
         for m in members {
-            let server = addresses.iter().find(|&a| &a.name == m);
+            let server = addresses.iter().find(|&a| &a.name == &m);
             match server {
                 None => return Err(Status::invalid_argument(format!("unknown server: {}", &m))),
                 Some(s) => new_members.push(s.clone()),
@@ -190,6 +216,32 @@ impl Harness {
         for instance in &self.instances {
             instance.stop().await;
         }
+    }
+
+    // Repeatedly makes KV requests until the supplied key has a value. Returns the result.
+    #[cfg(test)]
+    pub async fn wait_for_key(&self, key: &[u8], timeout_duration: Duration) -> GetResponse {
+        wait_for(timeout_duration, || async {
+            let mut c = self.make_kv_client().await;
+            let response = c
+                .get(GetRequest {
+                    key: key.to_vec(),
+                    version: -1, // Request the latest
+                })
+                .await;
+
+            if let Ok(result) = response {
+                let proto = result.into_inner();
+                if proto.entry.is_some() {
+                    return Some(proto);
+                }
+            }
+
+            // This currently bunches together different failure modes, e.g., NotFound and others.
+            None
+        })
+        .await
+        .expect("wait_for_key")
     }
 
     #[cfg(test)]
@@ -224,6 +276,28 @@ impl Harness {
     }
 
     #[cfg(test)]
+    pub async fn wait_for_snapshot(
+        &self,
+        server_name: &str,
+        timeout_duration: Duration,
+    ) -> SnapshotInfo {
+        let diag = self.diagnostics.clone();
+        let server_name = server_name.to_string();
+        wait_for(timeout_duration, || async {
+            let mut locked_diagnostics = diag.lock().await;
+            locked_diagnostics.collect().await;
+            if let Some(installs) = locked_diagnostics.get_snapshot_installs(&server_name) {
+                if let Some((_, info)) = installs.iter().next() {
+                    return Some(info.clone());
+                }
+            }
+            None
+        })
+        .await
+        .expect("wait_for_snapshot")
+    }
+
+    #[cfg(test)]
     fn valid_server_name(&self, name: &String) -> bool {
         self.instances
             .iter()
@@ -249,8 +323,8 @@ impl Instance {
         listener: TcpListener,
         all: &Vec<Server>,
         diagnostics: Arc<Mutex<Diagnostics>>,
-        options: Options,
-        failures: Arc<Mutex<FailureOptions>>,
+        raft_options: Options,
+        failure_options: Arc<Mutex<FailureOptions>>,
     ) -> Result<(Self, Pin<Box<dyn Future<Output = ()> + Send>>), Box<dyn Error>> {
         let name = address.name.to_string();
         let port = listener.local_addr()?.port();
@@ -271,7 +345,10 @@ impl Instance {
             kv_store.clone(),
         ));
         let kv_grpc = KeyValueServer::from_arc(kv_service.clone());
-        let kv_http = Arc::new(keyvalue::HttpHandler::new(kv_service.clone()));
+        let kv_http = Arc::new(keyvalue::HttpHandler::new(
+            path.to_string(),
+            kv_service.clone(),
+        ));
         let web = Router::new().nest(path, kv_http.routes());
 
         // Set up the grpc service for the raft participant. The first 3 server entries are active initially.
@@ -282,10 +359,11 @@ impl Instance {
                 &cluster,
                 kv_store.clone(), // The raft cluster participant is the one applying the KV writes.
                 Some(server_diagnostics),
-                options,
-                failures,
+                raft_options,
+                failure_options,
             )
-            .await,
+            .await
+            .map_err(|e| format!("Failed to create Raft: {}", e))?,
         );
         let raft_grpc = RaftServer::from_arc(raft.clone());
 
