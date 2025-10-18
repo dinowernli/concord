@@ -1314,10 +1314,27 @@ mod tests {
         let dst = server.address().expect("server");
         let mut client = create_local_client_for_testing(dst).await;
 
+        let s1 = create_server(1);
+        let s2 = create_server(2);
+        let s3 = create_server(3);
+        let s4 = create_server(4);
+        let s5 = create_server(5);
+
+        {
+            let state = raft_state.lock().await;
+
+            assert!(state.cluster.is_voting_member(&s1));
+            assert!(state.cluster.is_voting_member(&s2));
+            assert!(state.cluster.is_voting_member(&s3));
+
+            assert!(!state.cluster.is_voting_member(&s4));
+            assert!(!state.cluster.is_voting_member(&s5));
+        }
+
         let leader = create_server(1);
         let new_config = ClusterConfig {
-            voters: vec![leader.clone(), create_server(4), create_server(5)],
-            voters_next: vec![],
+            voters: vec![leader.clone(), s4.clone(), s5.clone()],
+            voters_next: vec![leader.clone(), s4.clone(), s5.clone()],
         };
 
         let new_index = 77;
@@ -1340,7 +1357,14 @@ mod tests {
         {
             let state = raft_state.lock().await;
             assert_eq!(new_index, state.store.last_known_log_entry_id().index);
-            assert_eq!(new_config, state.store.get_config_info().latest().0)
+            assert_eq!(new_config, state.store.get_config_info().latest().0);
+
+            assert!(state.cluster.is_voting_member(&s1));
+            assert!(!state.cluster.is_voting_member(&s2));
+            assert!(!state.cluster.is_voting_member(&s3));
+
+            assert!(state.cluster.is_voting_member(&s4));
+            assert!(state.cluster.is_voting_member(&s5));
         }
     }
 
