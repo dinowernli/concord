@@ -14,20 +14,6 @@ pub struct LogSlice {
     previous_id: EntryId,
 }
 
-// The possible outcomes of asking a log slice whether an entry id is
-// contained inside the slice.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ContainsResult {
-    // Indicates that the beginning of the slice has advanced past an entry.
-    COMPACTED,
-
-    // Indicates that an entry is present in the log slice.
-    PRESENT,
-
-    // Indicates that an entry with this index has yet to be added.
-    ABSENT,
-}
-
 impl LogSlice {
     // Returns a new instance with no entries, starting at some position in
     // the middle of the log. The "previous_id" parameter holds the id of
@@ -37,7 +23,7 @@ impl LogSlice {
         LogSlice {
             entries: Vec::new(),
             size_bytes: 0,
-            previous_id: previous_id,
+            previous_id,
         }
     }
 
@@ -48,6 +34,11 @@ impl LogSlice {
             term: -1,
             index: -1,
         })
+    }
+
+    // Returns a reference to all entries present in this slice.
+    pub fn entries(&self) -> &Vec<Entry> {
+        &self.entries
     }
 
     // Adds a new entry to the end of the slice. Returns the id of the
@@ -99,21 +90,20 @@ impl LogSlice {
         other_last.index >= this_last.index
     }
 
-    // Returns true if the supplied entry is present in this slice.
-    pub fn contains(&self, query: &EntryId) -> ContainsResult {
+    // Returns true if the supplied entry id is present in this slice. Both the term and
+    // the index need to match for the result to be true.
+    fn contains(&self, query: &EntryId) -> bool {
         if query.index <= self.previous_id.index {
-            assert!(query.term <= self.previous_id.term);
-            return ContainsResult::COMPACTED;
+            return false;
         }
 
         let idx = self.local_index(query.index);
         if idx >= self.entries.len() {
-            return ContainsResult::ABSENT;
+            return false;
         }
 
-        let &entry_id = &self.entries[idx as usize].id.as_ref().expect("id");
-        assert!(entry_id == query);
-        return ContainsResult::PRESENT;
+        let &entry_id = &self.entries[idx].id.as_ref().expect("id");
+        entry_id.index == query.index && entry_id.term == query.term
     }
 
     // Returns true if the supplied index lies before the range of entries present
@@ -132,23 +122,30 @@ impl LogSlice {
                 return Some(entry.clone());
             }
         }
-        return None;
+        None
     }
 
     // Adds the supplied entries to the end of the slice. Any conflicting
     // entries are replaced. Any existing entries with indexes higher than the
     // supplied entries are pruned.
     //
+    // If this returns true, the operation was performed as a "clean append",
+    // i.e., we appended every supplied entry to the end of the slice, and
+    // removed no entries.
+    //
     // TODO(dino): this is super dangerous if not called from "store" because
     // store keeps track of the latest config entry. Once our call to
     // "latest_config_entry" becomes cheap, store won't have to cache it anymore
     // and this becomes a lot safer.
-    pub fn append_all(&mut self, entries: &[Entry]) {
+    pub fn append_all(&mut self, entries: &[Entry]) -> bool {
         assert!(!entries.is_empty(), "append_all called with empty entries");
+
+        let mut clean_append = true;
 
         for entry in entries {
             let len_bytes = size_bytes(&entry);
             let index = entry.id.as_ref().expect("id").index;
+
             if index == self.next_index() {
                 self.entries.push(entry.clone());
                 self.size_bytes += len_bytes;
@@ -157,6 +154,9 @@ impl LogSlice {
                 self.size_bytes -= size_bytes(&self.entries[local_index]);
                 self.entries[local_index] = entry.clone();
                 self.size_bytes += len_bytes;
+
+                // If we had to replace an entry, this wasn't a clean append.
+                clean_append = false;
             }
         }
 
@@ -165,7 +165,12 @@ impl LogSlice {
         let local_index = self.local_index(last.index);
         for entry in self.entries.drain((local_index + 1)..) {
             self.size_bytes -= size_bytes(&entry);
+
+            // If we had to remove trailing entries, this wasn't a clean append.
+            clean_append = false;
         }
+
+        clean_append
     }
 
     // Returns the total size in bytes of all stored payloads. This is an
@@ -226,14 +231,22 @@ impl LogSlice {
     // Removes all entries up to and including the supplied id. Once this
     // returns, this instance starts immediately after the supplied id.
     pub fn prune_until(&mut self, entry_id: &EntryId) {
-        assert_eq!(self.contains(entry_id), ContainsResult::PRESENT);
+        assert!(
+            entry_id.index >= self.previous_id.index,
+            "Cannot prune into the past"
+        );
 
-        // We need to add 1 because the "drain()" call below is exclusive, but we want this
-        // drain to be inclusive of the supplied entry.
-        let local_idx = self.local_index(entry_id.index) + 1;
-
-        for entry in self.entries.drain(0..local_idx) {
-            self.size_bytes -= size_bytes(&entry);
+        if self.contains(entry_id) {
+            // We need to add 1 because the "drain()" call below is exclusive, but we want this
+            // drain to be inclusive of the supplied entry.
+            let local_idx = self.local_index(entry_id.index) + 1;
+            for entry in self.entries.drain(0..local_idx) {
+                self.size_bytes -= size_bytes(&entry);
+            }
+        } else {
+            // Entry is not present, we just remove everything.
+            self.entries.clear();
+            self.size_bytes = 0;
         }
         self.previous_id = entry_id.clone();
     }
@@ -278,7 +291,7 @@ mod tests {
     #[test]
     fn test_initial() {
         let l = LogSlice::initial();
-        assert_eq!(l.contains(&entry_id(-1, -1)), ContainsResult::COMPACTED);
+        assert!(!l.contains(&entry_id(-1, -1)));
 
         let after = l.get_entries_after(&entry_id(-1, -1));
         assert!(after.is_empty());
@@ -326,17 +339,21 @@ mod tests {
         let l = create_default_slice();
 
         // Special sentinel case.
-        assert_eq!(ContainsResult::COMPACTED, l.contains(&entry_id(-1, -1)));
+        assert!(!l.contains(&entry_id(-1, -1)));
 
         // Check a few existing entries.
-        assert_eq!(ContainsResult::PRESENT, l.contains(&entry_id(73, 2)));
-        assert_eq!(ContainsResult::PRESENT, l.contains(&entry_id(73, 3)));
+        assert!(l.contains(&entry_id(73, 2)));
+        assert!(l.contains(&entry_id(73, 3)));
+
+        // Check the case where only index matches.
+        assert!(!l.contains(&entry_id(999, 2)));
+        assert!(!l.contains(&entry_id(999, 3)));
 
         // First index not present.
         let next = l.next_index();
         assert_eq!(6, next);
-        assert_eq!(ContainsResult::ABSENT, l.contains(&entry_id(95, next)));
-        assert_eq!(ContainsResult::ABSENT, l.contains(&entry_id(12, next)));
+        assert!(!l.contains(&entry_id(95, next)));
+        assert!(!l.contains(&entry_id(12, next)));
     }
 
     #[test]
@@ -428,13 +445,52 @@ mod tests {
 
     #[test]
     fn test_prune_until_all_entries() {
-        let mut l = create_default_slice();
-        assert_eq!(l.next_index(), 6);
-        assert_eq!(l.size_bytes(), 6);
+        {
+            let mut l = create_default_slice();
+            assert_eq!(l.next_index(), 6);
+            assert_eq!(l.size_bytes(), 6);
 
-        l.prune_until(&entry_id(74, 5));
-        assert_eq!(l.next_index(), 6);
+            l.prune_until(&entry_id(74, 5));
+            assert_eq!(l.next_index(), 6);
+            assert_eq!(l.size_bytes(), 0);
+        }
+
+        {
+            let original_previous = entry_id(12, 189);
+            let mut l2 = LogSlice::new(original_previous.clone());
+            l2.append(12 /* term */, Data::Payload(Vec::new()));
+            l2.append(13 /* term */, Data::Payload(Vec::new()));
+            assert_eq!(l2.next_index(), 192);
+
+            l2.prune_until(&original_previous);
+            assert_eq!(l2.next_index(), 190);
+        }
+    }
+
+    // Tests that prune_until ends up emptying the slice if the requested
+    // stopping entry is not present at all.
+    #[test]
+    fn test_prune_until_no_match() {
+        let mut l = LogSlice::new(EntryId {
+            term: 22,
+            index: 91,
+        });
+        assert_eq!(l.next_index(), 92);
+
+        l.append(26 /* term */, Data::Payload(Vec::new()));
+        l.append(26 /* term */, Data::Payload(Vec::new()));
+        l.append(26 /* term */, Data::Payload(Vec::new()));
+        assert_eq!(l.next_index(), 95);
+
+        // Prune until an entry with an index we know about, but the wrong term. Should
+        // clear the slice entirely.
+        l.prune_until(&EntryId {
+            term: 16,
+            index: 93,
+        });
         assert_eq!(l.size_bytes(), 0);
+        assert!(l.entries.is_empty());
+        assert_eq!(l.next_index(), 94);
     }
 
     #[test]

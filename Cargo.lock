@@ -470,6 +470,7 @@ dependencies = [
  "rand",
  "reqwest",
  "structopt",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",
