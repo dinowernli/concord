@@ -152,7 +152,8 @@ impl Store {
     // Adds the supplied entries to the end of the store. Any conflicting
     // entries are replaced. Any existing entries with indexes higher than the
     // supplied entries are pruned.
-    pub fn append_all(&mut self, entries: &[Entry]) {
+    pub async fn append_all(&mut self, entries: &[Entry]) {
+        // TODO: This is in preparation for a future change where the store will be async.
         let is_any_config = entries.iter().any(|e| matches!(e.data, Some(Config(_))));
 
         self.log.append_all(entries);
@@ -171,13 +172,14 @@ impl Store {
     }
 
     // Updates just the "voted_for" part of the persistent state.
-    pub fn update_voted_for(&mut self, voted_for: &Option<Server>) {
+    pub async fn update_voted_for(&mut self, voted_for: &Option<Server>) {
         let term = self.term;
-        self.update_term_info(term, voted_for);
+        self.update_term_info(term, voted_for).await;
     }
 
     // Updates the term information in persistent state.
-    pub fn update_term_info(&mut self, term: i64, voted_for: &Option<Server>) {
+    pub async fn update_term_info(&mut self, term: i64, voted_for: &Option<Server>) {
+        // TODO: This is in preparation for a future change where the store will be async.
         self.term = term;
         self.voted_for = voted_for.clone();
     }
@@ -674,15 +676,18 @@ mod tests {
             payload_entry(12, 0),
             payload_entry(12, 1),
             payload_entry(12, 2),
-        ]);
+        ])
+        .await;
         assert!(store.get_config_info().latest_appended.is_none());
 
         let voters = 7;
-        store.append_all(&vec![
-            payload_entry(12, 3),
-            config_entry(12, 4, voters),
-            payload_entry(12, 5),
-        ]);
+        store
+            .append_all(&vec![
+                payload_entry(12, 3),
+                config_entry(12, 4, voters),
+                payload_entry(12, 5),
+            ])
+            .await;
         assert!(store.get_config_info().latest_appended.is_some());
         match store
             .get_config_info()
@@ -696,11 +701,13 @@ mod tests {
         }
 
         let voters = 5;
-        store.append_all(&vec![
-            config_entry(12, 6, 3),
-            config_entry(12, 7, 3),
-            config_entry(12, 8, voters),
-        ]);
+        store
+            .append_all(&vec![
+                config_entry(12, 6, 3),
+                config_entry(12, 7, 3),
+                config_entry(12, 8, voters),
+            ])
+            .await;
         assert!(store.get_config_info().latest_appended.is_some());
         match store
             .get_config_info()
