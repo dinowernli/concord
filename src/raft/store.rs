@@ -274,6 +274,7 @@ impl Store {
     // entries are replaced. Any existing entries with indexes higher than the
     // supplied entries are pruned.
     pub async fn append_all(&mut self, entries: &[Entry]) {
+        // TODO: This is in preparation for a future change where the store will be async.
         let is_any_config = entries.iter().any(|e| matches!(e.data, Some(Config(_))));
 
         let clean_append = self.log.append_all(entries);
@@ -325,6 +326,7 @@ impl Store {
 
     // Updates the term information in persistent state.
     pub async fn update_term_info(&mut self, term: i64, voted_for: &Option<Server>) {
+        // TODO: This is in preparation for a future change where the store will be async.
         self.term = term;
         self.voted_for = voted_for.clone();
 
