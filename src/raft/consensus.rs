@@ -132,6 +132,8 @@ impl RaftImpl {
         options: Options,
         failures: Arc<Mutex<FailureOptions>>,
     ) -> RaftResult<RaftImpl> {
+        let snapshot_bytes = state_machine.lock().await.create_snapshot();
+
         // A config which gives us (once applied) all the initial members as voters.
         let initial_cluster_config = ClusterConfig {
             voters: all.clone().to_vec(),
@@ -148,9 +150,7 @@ impl RaftImpl {
             server.name.as_str(),
         )
         .await
-        .map_err(|e| RaftError::InitializationFailed {
-            source: Box::new(e),
-        })?;
+        .map_err(|e| RaftError::Initialization(format!("Failed to create store: {}", e)))?;
 
         let mut cluster =
             Cluster::new_with_failures(server.clone(), all.as_slice(), failures.clone());
@@ -752,7 +752,9 @@ impl RaftState {
         debug!(term, "becoming follower");
         assert!(term >= self.term(), "Term should never decrease");
 
-        self.store.update_term_info(term, &None /* voted_for */).await;
+        self.store
+            .update_term_info(term, &None /* voted_for */)
+            .await;
         self.role = RaftRole::Follower;
         self.reset_follower_timer(arc_state.clone(), term + 1);
     }
@@ -952,7 +954,9 @@ impl Raft for RaftImpl {
         // If we're in an outdated term, we revert to follower in the new later
         // term and may still grant the requesting candidate our vote.
         if request.term > state.term() {
-            state.become_follower(self.state.clone(), request.term).await;
+            state
+                .become_follower(self.state.clone(), request.term)
+                .await;
         }
 
         let candidate = request
@@ -1008,7 +1012,9 @@ impl Raft for RaftImpl {
         // by resetting to a "clean" follower state for the leader's (greater)
         // term. Note that we then handle the leader's append afterwards.
         if request.term > state.term() {
-            state.become_follower(self.state.clone(), request.term).await;
+            state
+                .become_follower(self.state.clone(), request.term)
+                .await;
         }
         let term = state.term();
 

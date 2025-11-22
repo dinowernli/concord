@@ -1,4 +1,6 @@
 use crate::raft::diagnostics::ServerDiagnostics;
+use crate::raft::error::RaftError::Initialization;
+use crate::raft::error::RaftResult;
 use crate::raft::log::LogSlice;
 use crate::raft::persistence::{
     Persistence, PersistenceError, PersistenceOptions, PersistentState,
@@ -90,23 +92,6 @@ impl ConfigInfo {
     }
 }
 
-#[derive(Debug, Clone, Error)]
-pub struct StoreError {
-    _message: String,
-}
-
-impl Display for StoreError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("StoreError: {}", self._message))
-    }
-}
-
-impl StoreError {
-    pub fn new(message: String) -> Self {
-        Self { _message: message }
-    }
-}
-
 impl Store {
     pub async fn new(
         persistence_options: PersistenceOptions,
@@ -115,16 +100,16 @@ impl Store {
         diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
         compaction_threshold_bytes: i64,
         name: &str,
-    ) -> Result<Self, StoreError> {
+    ) -> RaftResult<Self> {
         // Initialize persistence and try to load state from previous instance.
         let persistence = persistence::new(persistence_options)
             .await
-            .map_err(|e| StoreError::new(format!("Failed to create persistence: {:?}", e)))?;
+            .map_err(|e| Initialization(format!("Failed to create persistence: {:?}", e)))?;
 
         let loaded_state = persistence
             .read()
             .await
-            .map_err(|e| StoreError::new(format!("Failed to read from persistence: {:?}", e)))?;
+            .map_err(|e| Initialization(format!("Failed to read from persistence: {:?}", e)))?;
 
         // If none was loaded, create a new initial state to use below.
         let (persistent_state, slice) = match loaded_state {
@@ -185,7 +170,7 @@ impl Store {
         result
             .restore_persisted()
             .await
-            .map_err(|e| StoreError::new(format!("Failed to restore persisted: {:?}", e)))?;
+            .map_err(|e| Initialization(format!("Failed to restore persisted: {:?}", e)))?;
 
         // Perform a one-time write to make sure that we start off in a state where we've
         // created the persisted files. Otherwise, partial writes might create a persisted
@@ -196,15 +181,16 @@ impl Store {
     }
 
     // Reads state from the persistence instance and installs it in this store.
-    async fn restore_persisted(&mut self) -> Result<(), StoreError> {
-        let read =
-            self.persistence.read().await.map_err(|e| {
-                StoreError::new(format!("Failed to read from persistence: {:?}", e))
-            })?;
+    async fn restore_persisted(&mut self) -> Result<(), String> {
+        let read = self
+            .persistence
+            .read()
+            .await
+            .map_err(|e| format!("Failed to read from persistence: {:?}", e))?;
         if let Some(mut loaded) = read {
-            loaded.validate().map_err(|e| {
-                StoreError::new(format!("Failed to validate persisted contents: {:?}", e))
-            })?;
+            loaded
+                .validate()
+                .map_err(|e| format!("Failed to validate persisted contents: {:?}", e))?;
             loaded.trim_entries();
 
             let snap = loaded.snapshot;
@@ -216,10 +202,10 @@ impl Store {
 
             let status = self.install(snap, loaded.entries).await;
             if &status.code() != &Code::Ok {
-                return Err(StoreError::new(format!(
+                return Err(format!(
                     "Failed to install loaded snapshot: {}",
                     status.to_string()
-                )));
+                ));
             }
         }
         Ok(())

@@ -363,7 +363,7 @@ impl Instance {
                 failure_options,
             )
             .await
-            .map_err(|e| format!("Failed to create Raft: {}", e))?,
+            .map_err(|e| format!("Failed to create Raft for '{}': {}", address.name, e))?,
         );
         let raft_grpc = RaftServer::from_arc(raft.clone());
 

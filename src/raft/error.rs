@@ -7,6 +7,9 @@ pub type RaftResult<T> = Result<T, RaftError>;
 /// Structured error type used throughout the raft package.
 #[derive(Error, Debug)]
 pub enum RaftError {
+    #[error("Initialization error: {0}")]
+    Initialization(String),
+
     #[error("RPC error from peer {peer}: {status}")]
     Rpc {
         peer: String,
@@ -29,12 +32,6 @@ pub enum RaftError {
 
     #[error("Stale term state")]
     StaleState,
-
-    #[error("Failed to initialize: {source}")]
-    InitializationFailed {
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 impl RaftError {
