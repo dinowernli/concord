@@ -1,5 +1,6 @@
 use crate::raft::StateMachine;
 use crate::raft::diagnostics::ServerDiagnostics;
+use crate::raft::error::RaftResult;
 use crate::raft::log::{ContainsResult, LogSlice};
 use crate::raft::raft_common_proto::entry::Data;
 use crate::raft::raft_common_proto::entry::Data::Config;
@@ -90,7 +91,8 @@ impl Store {
         diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
         compaction_threshold_bytes: i64,
         name: &str,
-    ) -> Self {
+    ) -> RaftResult<Self> {
+        // TODO: This is in preparation for a future change where the store will be async.
         let index = initial_snapshot.last.index;
         let latest_applied = initial_snapshot.config.clone();
         let config_info = ConfigInfo {
@@ -98,7 +100,7 @@ impl Store {
             committed: false,
             latest_applied,
         };
-        Self {
+        Ok(Self {
             name: name.to_string(),
             compaction_threshold_bytes,
             state_machine,
@@ -116,7 +118,7 @@ impl Store {
 
             listener_uid: 0,
             listeners: BTreeSet::new(),
-        }
+        })
     }
 
     // Returns the index up to (and including) which the corresponding entries are
@@ -534,6 +536,7 @@ mod tests {
             COMPACTION_THRESHOLD_BYTES,
             "testing-store",
         )
+        .unwrap()
     }
 
     #[test]
