@@ -102,7 +102,7 @@ impl RaftImpl {
         diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
         options: Options,
         failures: Arc<Mutex<FailureOptions>>,
-    ) -> RaftImpl {
+    ) -> RaftResult<RaftImpl> {
         let snapshot_bytes = state_machine.lock().await.create_snapshot();
 
         // A config which gives us (once applied) all the initial members as voters.
@@ -128,7 +128,8 @@ impl RaftImpl {
             diagnostics.clone(),
             options.compaction_threshold_bytes,
             server.name.as_str(),
-        );
+        )
+        .map_err(|e| RaftError::Initialization(format!("Failed to create store: {}", e)))?;
 
         let mut cluster =
             Cluster::new_with_failures(server.clone(), all.as_slice(), failures.clone());
@@ -137,7 +138,7 @@ impl RaftImpl {
         // TODO(dino): We probably want to just only support initializing with a cluster info.
         cluster.update(store.get_config_info());
 
-        RaftImpl {
+        Ok(RaftImpl {
             address: server.clone(),
             state: Arc::new(Mutex::new(RaftState {
                 options,
@@ -149,7 +150,7 @@ impl RaftImpl {
                 followers: HashMap::new(),
                 timer_guard: None,
             })),
-        }
+        })
     }
 
     pub async fn start(&self) {
@@ -1479,6 +1480,7 @@ mod tests {
             Arc::new(Mutex::new(FailureOptions::no_failures())),
         )
         .await
+        .unwrap()
     }
 
     fn create_config_for_testing() -> Options {

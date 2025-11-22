@@ -343,7 +343,8 @@ impl Instance {
                 raft_options,
                 failure_options,
             )
-            .await,
+            .await
+            .map_err(|e| format!("Failed to create raft impl for '{}': {}", address.name, e))?,
         );
         let raft_grpc = RaftServer::from_arc(raft.clone());
 
