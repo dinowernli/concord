@@ -675,12 +675,13 @@ mod tests {
         let mut store = make_store();
         assert!(store.get_config_info().latest_appended.is_none());
 
-        store.append_all(&vec![
-            payload_entry(12, 0),
-            payload_entry(12, 1),
-            payload_entry(12, 2),
-        ])
-        .await;
+        store
+            .append_all(&vec![
+                payload_entry(12, 0),
+                payload_entry(12, 1),
+                payload_entry(12, 2),
+            ])
+            .await;
         assert!(store.get_config_info().latest_appended.is_none());
 
         let voters = 7;

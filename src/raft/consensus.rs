@@ -729,7 +729,9 @@ impl RaftState {
         debug!(term, "becoming follower");
         assert!(term >= self.term(), "Term should never decrease");
 
-        self.store.update_term_info(term, &None /* voted_for */).await;
+        self.store
+            .update_term_info(term, &None /* voted_for */)
+            .await;
         self.role = RaftRole::Follower;
         self.reset_follower_timer(arc_state.clone(), term + 1);
     }
@@ -929,7 +931,9 @@ impl Raft for RaftImpl {
         // If we're in an outdated term, we revert to follower in the new later
         // term and may still grant the requesting candidate our vote.
         if request.term > state.term() {
-            state.become_follower(self.state.clone(), request.term).await;
+            state
+                .become_follower(self.state.clone(), request.term)
+                .await;
         }
 
         let candidate = request
@@ -985,7 +989,9 @@ impl Raft for RaftImpl {
         // by resetting to a "clean" follower state for the leader's (greater)
         // term. Note that we then handle the leader's append afterwards.
         if request.term > state.term() {
-            state.become_follower(self.state.clone(), request.term).await;
+            state
+                .become_follower(self.state.clone(), request.term)
+                .await;
         }
         let term = state.term();
 
