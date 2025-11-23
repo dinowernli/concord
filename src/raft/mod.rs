@@ -18,6 +18,9 @@ pub use state_machine::{StateMachine, StateMachineResult};
 #[path = "generated/raft_common_proto.rs"]
 pub mod raft_common_proto;
 
+#[path = "generated/raft_persistence_proto.rs"]
+pub mod raft_persistence_proto;
+
 #[path = "generated/raft_service_proto.rs"]
 pub mod raft_service_proto;
 
@@ -28,6 +31,7 @@ mod diagnostics;
 mod error;
 mod failure_injection;
 mod log;
+mod persistence;
 mod state_machine;
 mod store;
 

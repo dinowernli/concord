@@ -4,9 +4,9 @@ use crate::raft::raft_common_proto::entry::Data::Config;
 use crate::raft::raft_common_proto::{ClusterConfig, Server};
 use crate::raft::raft_service_proto::raft_client::RaftClient;
 use crate::raft::store::ConfigInfo;
-use std::cmp::PartialEq;
 
 use async_std::sync::Mutex;
+use std::cmp::PartialEq;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;

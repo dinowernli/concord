@@ -5,6 +5,7 @@ use axum_tonic::NestTonic;
 use axum_tonic::RestGrpcService;
 use futures::Future;
 use futures::future::join_all;
+use std::env;
 use std::error::Error;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -51,6 +52,7 @@ impl HarnessBuilder {
     // of the serving process for all instances managed by the harness.
     pub async fn build(
         self,
+        wipe_persistence: bool,
     ) -> Result<(Harness, Pin<Box<dyn Future<Output = ()> + Send>>), Box<dyn Error>> {
         let diag = Arc::new(Mutex::new(Diagnostics::new()));
         let failures = Arc::new(Mutex::new(self.failure.clone()));
@@ -62,12 +64,25 @@ impl HarnessBuilder {
         let raft_options = self.options;
         for bound in self.bound {
             let (address, listener) = (bound.server, bound.listener);
+
+            // Use something like /tmp/concord/<cluster>/<server> for persistence
+            let persistence_path = env::temp_dir()
+                .as_path()
+                .join("concord")
+                .join(&self.cluster_name)
+                .join(&address.name);
+
+            let options = raft_options.clone().with_persistence(
+                persistence_path.to_str().unwrap().as_ref(),
+                wipe_persistence,
+            );
+
             let (instance, future) = Instance::new(
                 &address,
                 listener,
                 &all,
                 diag.clone(),
-                raft_options.clone(),
+                options,
                 failures.clone(),
             )
             .await?;
@@ -123,7 +138,7 @@ impl Harness {
         server_names: &[&str],
     ) -> Result<HarnessBuilder, Box<dyn Error>> {
         let mut bound = Vec::new();
-        for name in server_names {
+        for &name in server_names {
             let listener = TcpListener::bind("[::1]:0").await?;
             let port = listener.local_addr()?.port();
             let server = server("::1", port as i32, name);
@@ -133,7 +148,10 @@ impl Harness {
             cluster_name: cluster_name.to_string(),
             bound,
             failure: FailureOptions::no_failures(),
-            options: Options::default(),
+
+            // TODO - DONOTMERGE - figure out a better way to only allow in testing and reconcile
+            // with the fact that main() needs to support no persistence
+            options: Options::new_without_persistence_for_testing(),
         })
     }
 
