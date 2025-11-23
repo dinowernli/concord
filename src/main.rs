@@ -227,13 +227,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
     let arguments = Arc::new(Arguments::from_args());
 
-    let (harness, serving) = Harness::builder(vec!["A", "B", "C", "D", "E"])
+    let (harness, serving) = Harness::builder("dev-cluster", &["A", "B", "C", "D", "E"])
         .await
         .expect("builder")
         .with_failure(make_default_failure_options())
         .build()
         .await
         .expect("harness");
+
+    info!("Created cluster '{}'", harness.name());
 
     let addresses = harness.addresses();
     let diagnostics = harness.diagnostics();

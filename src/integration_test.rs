@@ -9,7 +9,7 @@ const NAMES: [&str; 3] = ["A", "B", "C"];
 
 #[tokio::test]
 async fn test_start_and_elect_leader() {
-    let harness = make_harness(NAMES.to_vec()).await;
+    let harness = make_harness(&NAMES).await;
 
     harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
 
@@ -22,7 +22,7 @@ async fn test_start_and_elect_leader_many_nodes() {
     let n = 17;
     let owned: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
     let names: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
-    let harness = make_harness(names).await;
+    let harness = make_harness(&names).await;
 
     harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
 
@@ -32,7 +32,7 @@ async fn test_start_and_elect_leader_many_nodes() {
 
 #[tokio::test]
 async fn test_disconnect_leader() {
-    let harness = make_harness(NAMES.to_vec()).await;
+    let harness = make_harness(&NAMES).await;
 
     // Wait for the initial leader and capture its term and server.
     let (term1, leader1) = harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
@@ -62,7 +62,7 @@ async fn test_disconnect_leader() {
 
 #[tokio::test]
 async fn test_commit() {
-    let harness = make_harness(NAMES.to_vec()).await;
+    let harness = make_harness(&NAMES).await;
     harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
     let client = harness.make_raft_client();
 
@@ -77,7 +77,7 @@ async fn test_commit() {
 #[tokio::test]
 async fn test_reconfigure_cluster() {
     let names = vec!["A", "B", "C", "D", "E"];
-    let harness = make_harness(names.clone()).await;
+    let harness = make_harness(&names).await;
 
     let (t1, leader1) = harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
     let without_leader: Vec<&str> = names
@@ -103,7 +103,7 @@ async fn test_reconfigure_cluster() {
 
 #[tokio::test]
 async fn test_keyvalue() {
-    let harness = make_harness(NAMES.to_vec()).await;
+    let harness = make_harness(&NAMES).await;
     let mut kv = harness.make_kv_client().await;
 
     let k1 = "k1".as_bytes().to_vec();
@@ -125,7 +125,7 @@ async fn test_keyvalue() {
 #[tokio::test]
 async fn test_snapshotting() {
     let raft_options = Options::default().with_compaction(5 * 1024 * 1024, 1000);
-    let harness = make_harness_with_options(NAMES.to_vec(), Some(raft_options)).await;
+    let harness = make_harness_with_options(&NAMES, Some(raft_options)).await;
 
     // Disconnect a node that will later have to catch up.
     harness.failures().lock().await.disconnect("B");
@@ -163,12 +163,12 @@ fn term_greater(n: i64) -> Box<dyn Fn(&(i64, Server)) -> bool> {
     Box::new(move |(term, _)| *term > n)
 }
 
-async fn make_harness(nodes: Vec<&str>) -> Harness {
+async fn make_harness(nodes: &[&str]) -> Harness {
     make_harness_with_options(nodes, None).await
 }
 
-async fn make_harness_with_options(nodes: Vec<&str>, options: Option<Options>) -> Harness {
-    let mut builder = Harness::builder(nodes).await.expect("builder");
+async fn make_harness_with_options(nodes: &[&str], options: Option<Options>) -> Harness {
+    let mut builder = Harness::builder("test-cluster", nodes).await.expect("builder");
 
     if let Some(opts) = options {
         builder = builder.with_options(opts)
