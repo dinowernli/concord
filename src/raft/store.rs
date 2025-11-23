@@ -820,11 +820,5 @@ mod tests {
         }
     }
 
-    fn server(host: &str, port: i32) -> Server {
-        Server {
-            host: host.to_string(),
-            port,
-            name: String::new(),
-        }
-    }
+
 }

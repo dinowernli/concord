@@ -29,6 +29,7 @@ use crate::raft::{
 // production deployment, these participants might be on different actual machines,
 // but the harness manages all of them in a single process for convenience.
 pub struct Harness {
+    cluster_name: String,
     instances: Vec<Instance>,
     diagnostics: Arc<Mutex<Diagnostics>>,
     failures: Arc<Mutex<FailureOptions>>,
@@ -39,6 +40,7 @@ pub struct Harness {
 // addresses, and then start the underlying services (which require knowledge of the
 // ports for the other participants).
 pub struct HarnessBuilder {
+    cluster_name: String,
     bound: Vec<BoundAddress>,
     failure: FailureOptions,
     options: Options,
@@ -79,6 +81,7 @@ impl HarnessBuilder {
             join_all(serving).await;
         });
         let harness = Harness {
+            cluster_name: self.cluster_name,
             instances,
             diagnostics: diag,
             failures,
@@ -89,6 +92,7 @@ impl HarnessBuilder {
     // Consumes this instance and returns an instance with the failure options set.
     pub fn with_failure(self: Self, failure_options: FailureOptions) -> Self {
         Self {
+            cluster_name: self.cluster_name,
             bound: self.bound,
             failure: failure_options,
             options: self.options,
@@ -98,6 +102,7 @@ impl HarnessBuilder {
     // Consumes this instance and returns an instance with the raft options set.
     pub fn with_options(self: Self, options: Options) -> Self {
         Self {
+            cluster_name: self.cluster_name,
             bound: self.bound,
             failure: self.failure,
             options,
@@ -113,19 +118,27 @@ impl HarnessBuilder {
 impl Harness {
     // Creates a harness builder. This will immediately bind an incoming port for
     // each supplied instance name.
-    pub async fn builder(names: Vec<&str>) -> Result<HarnessBuilder, Box<dyn Error>> {
+    pub async fn builder(
+        cluster_name: &str,
+        server_names: &[&str],
+    ) -> Result<HarnessBuilder, Box<dyn Error>> {
         let mut bound = Vec::new();
-        for name in names {
+        for name in server_names {
             let listener = TcpListener::bind("[::1]:0").await?;
             let port = listener.local_addr()?.port();
             let server = server("::1", port as i32, name);
             bound.push(BoundAddress { listener, server })
         }
         Ok(HarnessBuilder {
+            cluster_name: cluster_name.to_string(),
             bound,
             failure: FailureOptions::no_failures(),
             options: Options::default(),
         })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.cluster_name
     }
 
     // Returns all the addresses managed by this harness. Note that this can include
