@@ -30,6 +30,7 @@ use crate::raft::{
 // production deployment, these participants might be on different actual machines,
 // but the harness manages all of them in a single process for convenience.
 pub struct Harness {
+    cluster_name: String,
     instances: Vec<Instance>,
     diagnostics: Arc<Mutex<Diagnostics>>,
     failures: Arc<Mutex<FailureOptions>>,
@@ -40,6 +41,7 @@ pub struct Harness {
 // addresses, and then start the underlying services (which require knowledge of the
 // ports for the other participants).
 pub struct HarnessBuilder {
+    cluster_name: String,
     bound: Vec<BoundAddress>,
     failure: FailureOptions,
     options: Options,
@@ -50,7 +52,6 @@ impl HarnessBuilder {
     // of the serving process for all instances managed by the harness.
     pub async fn build(
         self,
-        cluster_name: &str,
         wipe_persistence: bool,
     ) -> Result<(Harness, Pin<Box<dyn Future<Output = ()> + Send>>), Box<dyn Error>> {
         let diag = Arc::new(Mutex::new(Diagnostics::new()));
@@ -68,7 +69,7 @@ impl HarnessBuilder {
             let persistence_path = env::temp_dir()
                 .as_path()
                 .join("concord")
-                .join(&cluster_name)
+                .join(&self.cluster_name)
                 .join(&address.name);
 
             let options = raft_options.clone().with_persistence(
@@ -95,6 +96,7 @@ impl HarnessBuilder {
             join_all(serving).await;
         });
         let harness = Harness {
+            cluster_name: self.cluster_name,
             instances,
             diagnostics: diag,
             failures,
@@ -105,6 +107,7 @@ impl HarnessBuilder {
     // Consumes this instance and returns an instance with the failure options set.
     pub fn with_failure(self: Self, failure_options: FailureOptions) -> Self {
         Self {
+            cluster_name: self.cluster_name,
             bound: self.bound,
             failure: failure_options,
             options: self.options,
@@ -114,6 +117,7 @@ impl HarnessBuilder {
     // Consumes this instance and returns an instance with the raft options set.
     pub fn with_options(self: Self, options: Options) -> Self {
         Self {
+            cluster_name: self.cluster_name,
             bound: self.bound,
             failure: self.failure,
             options,
@@ -129,15 +133,19 @@ impl HarnessBuilder {
 impl Harness {
     // Creates a harness builder. This will immediately bind an incoming port for
     // each supplied instance name.
-    pub async fn builder(names: Vec<String>) -> Result<HarnessBuilder, Box<dyn Error>> {
+    pub async fn builder(
+        cluster_name: &str,
+        server_names: &[&str],
+    ) -> Result<HarnessBuilder, Box<dyn Error>> {
         let mut bound = Vec::new();
-        for name in names {
+        for &name in server_names {
             let listener = TcpListener::bind("[::1]:0").await?;
             let port = listener.local_addr()?.port();
-            let server = server("::1", port as i32, name.as_str());
+            let server = server("::1", port as i32, name);
             bound.push(BoundAddress { listener, server })
         }
         Ok(HarnessBuilder {
+            cluster_name: cluster_name.to_string(),
             bound,
             failure: FailureOptions::no_failures(),
 
@@ -145,6 +153,10 @@ impl Harness {
             // with the fact that main() needs to support no persistence
             options: Options::new_without_persistence_for_testing(),
         })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.cluster_name
     }
 
     // Returns all the addresses managed by this harness. Note that this can include
@@ -178,13 +190,13 @@ impl Harness {
 
     // Update the cluster membership to contain only the supplied members. The supplied
     // members must all be valid servers as defined at harness creation time.
-    pub async fn update_members(&self, members: Vec<String>) -> Result<(), Status> {
+    pub async fn update_members(&self, members: Vec<&str>) -> Result<(), Status> {
         let client = self.make_raft_client();
 
         let addresses = self.addresses().clone();
         let mut new_members: Vec<Server> = Vec::new();
         for m in members {
-            let server = addresses.iter().find(|&a| &a.name == &m);
+            let server = addresses.iter().find(|&a| &a.name == m);
             match server {
                 None => return Err(Status::invalid_argument(format!("unknown server: {}", &m))),
                 Some(s) => new_members.push(s.clone()),
@@ -363,7 +375,7 @@ impl Instance {
                 failure_options,
             )
             .await
-            .map_err(|e| format!("Failed to create Raft for '{}': {}", address.name, e))?,
+            .map_err(|e| format!("Failed to create raft impl for '{}': {}", address.name, e))?,
         );
         let raft_grpc = RaftServer::from_arc(raft.clone());
 

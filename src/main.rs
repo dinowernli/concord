@@ -226,16 +226,6 @@ async fn run_reconfigure_loop(
     info!("Finished")
 }
 
-fn names() -> Vec<String> {
-    vec![
-        "A".to_string(),
-        "B".to_string(),
-        "C".to_string(),
-        "D".to_string(),
-        "E".to_string(),
-    ]
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // This allows configuring the filters using the RUST_LOG env variable.
@@ -249,13 +239,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
     let arguments = Arc::new(Arguments::from_args());
 
-    let (harness, serving) = Harness::builder(names())
+    let (harness, serving) = Harness::builder(CLUSTER_NAME, &["A", "B", "C", "D", "E"])
         .await
         .expect("builder")
         .with_failure(make_default_failure_options())
-        .build(CLUSTER_NAME, arguments.wipe_persistence)
+        .build(arguments.wipe_persistence)
         .await
         .expect("harness");
+
+    info!("Created cluster '{}'", harness.name());
 
     let addresses = harness.addresses();
     let diagnostics = harness.diagnostics();

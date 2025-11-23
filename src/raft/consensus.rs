@@ -132,8 +132,6 @@ impl RaftImpl {
         options: Options,
         failures: Arc<Mutex<FailureOptions>>,
     ) -> RaftResult<RaftImpl> {
-        let snapshot_bytes = state_machine.lock().await.create_snapshot();
-
         // A config which gives us (once applied) all the initial members as voters.
         let initial_cluster_config = ClusterConfig {
             voters: all.clone().to_vec(),

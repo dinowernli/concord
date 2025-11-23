@@ -6,15 +6,11 @@ use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 const CLUSTER_NAME: &str = "test-cluster";
-
-fn names() -> Vec<String> {
-    vec!["A".to_string(), "B".to_string(), "C".to_string()]
-}
+const NAMES: [&str; 3] = ["A", "B", "C"];
 
 #[tokio::test]
 async fn test_start_and_elect_leader() {
-    let harness = make_harness(names()).await;
-
+    let harness = make_harness(&NAMES).await;
     harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
 
     harness.validate().await;
@@ -25,7 +21,8 @@ async fn test_start_and_elect_leader() {
 async fn test_start_and_elect_leader_many_nodes() {
     let n = 17;
     let owned: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
-    let harness = make_harness(owned).await;
+    let names: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+    let harness = make_harness(&names).await;
 
     harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
 
@@ -35,7 +32,7 @@ async fn test_start_and_elect_leader_many_nodes() {
 
 #[tokio::test]
 async fn test_disconnect_leader() {
-    let harness = make_harness(names()).await;
+    let harness = make_harness(&NAMES).await;
 
     // Wait for the initial leader and capture its term and server.
     let (term1, leader1) = harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
@@ -65,7 +62,7 @@ async fn test_disconnect_leader() {
 
 #[tokio::test]
 async fn test_commit() {
-    let harness = make_harness(names()).await;
+    let harness = make_harness(&NAMES).await;
     harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
     let client = harness.make_raft_client();
 
@@ -79,34 +76,27 @@ async fn test_commit() {
 
 #[tokio::test]
 async fn test_reconfigure_cluster() {
-    let names = vec![
-        "A".to_string(),
-        "B".to_string(),
-        "C".to_string(),
-        "D".to_string(),
-        "E".to_string(),
-    ];
-    let harness = make_harness(names.clone()).await;
+    let names = vec!["A", "B", "C", "D", "E"];
+    let harness = make_harness(&names).await;
 
     let (t1, leader1) = harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
 
-    let without_leader: Vec<String> = names
-        .clone()
+    let without_leader: Vec<&str> = names
         .iter()
-        .filter(|&s| *s != leader1.name)
-        .map(|s| s.clone())
+        .copied()
+        .filter(|s| *s != leader1.name)
         .collect();
     assert_eq!(without_leader.len(), 4);
 
     // Change cluster to contain only 3 members, and not including the current leader.
-    let new_members: Vec<String> = without_leader.iter().take(3).map(|s| s.clone()).collect();
+    let new_members: Vec<&str> = without_leader.iter().copied().take(3).collect();
     let result = harness.update_members(new_members.clone()).await;
     assert!(result.is_ok());
 
     // Wait for a new leader and verify.
     let (_, leader2) = harness.wait_for_leader(TIMEOUT, term_greater(t1)).await;
     assert_ne!(&leader2.name, &leader1.name);
-    assert!(new_members.contains(&leader2.name));
+    assert!(new_members.contains(&leader2.name.as_str()));
 
     harness.validate().await;
     harness.stop().await;
@@ -114,7 +104,7 @@ async fn test_reconfigure_cluster() {
 
 #[tokio::test]
 async fn test_keyvalue() {
-    let harness = make_harness(names()).await;
+    let harness = make_harness(&NAMES).await;
     let mut kv = harness.make_kv_client().await;
 
     let k1 = "k1".as_bytes().to_vec();
@@ -137,7 +127,7 @@ async fn test_keyvalue() {
 async fn test_snapshotting() {
     let raft_options =
         Options::new_without_persistence_for_testing().with_compaction(5 * 1024 * 1024, 1000);
-    let harness = make_harness_with_options(names(), Some(raft_options)).await;
+    let harness = make_harness_with_options(&NAMES, Some(raft_options)).await;
 
     // Disconnect a node that will later have to catch up.
     harness.failures().lock().await.disconnect("B");
@@ -175,22 +165,21 @@ fn term_greater(n: i64) -> Box<dyn Fn(&(i64, Server)) -> bool> {
     Box::new(move |(term, _)| *term > n)
 }
 
-async fn make_harness(nodes: Vec<String>) -> Harness {
+async fn make_harness(nodes: &[&str]) -> Harness {
     make_harness_with_options(nodes, None).await
 }
 
-async fn make_harness_with_options(nodes: Vec<String>, options: Option<Options>) -> Harness {
-    let mut builder = Harness::builder(nodes).await.expect("builder");
+async fn make_harness_with_options(nodes: &[&str], options: Option<Options>) -> Harness {
+    let mut builder = Harness::builder(CLUSTER_NAME, nodes)
+        .await
+        .expect("builder");
 
     if let Some(opts) = options {
         builder = builder.with_options(opts)
     }
 
     let wipe_persistence = true;
-    let (harness, serving) = builder
-        .build(CLUSTER_NAME, wipe_persistence)
-        .await
-        .expect("harness");
+    let (harness, serving) = builder.build(wipe_persistence).await.expect("harness");
     harness.start().await;
     tokio::spawn(async { serving.await });
     harness

@@ -2,9 +2,7 @@ use crate::raft::diagnostics::ServerDiagnostics;
 use crate::raft::error::RaftError::Initialization;
 use crate::raft::error::RaftResult;
 use crate::raft::log::LogSlice;
-use crate::raft::persistence::{
-    Persistence, PersistenceError, PersistenceOptions, PersistentState,
-};
+use crate::raft::persistence::{Persistence, PersistenceOptions, PersistentState};
 use crate::raft::raft_common_proto::entry::Data;
 use crate::raft::raft_common_proto::entry::Data::Config;
 use crate::raft::raft_common_proto::{ClusterConfig, Entry, EntryId, Server};
@@ -14,10 +12,7 @@ use bytes::Bytes;
 use futures::channel::oneshot::{Receiver, Sender, channel};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
-use std::error::Error;
-use std::fmt::{Display, Formatter, Write};
 use std::hash::{Hash, Hasher};
-use thiserror::Error;
 use tonic::{Code, Status};
 use tracing::{debug, info, warn};
 
