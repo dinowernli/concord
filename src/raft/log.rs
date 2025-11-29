@@ -15,20 +15,6 @@ pub struct LogSlice {
     previous_id: EntryId,
 }
 
-// The possible outcomes of asking a log slice whether an entry id is
-// contained inside the slice.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ContainsResult {
-    // Indicates that the beginning of the slice has advanced past an entry.
-    COMPACTED,
-
-    // Indicates that an entry is present in the log slice.
-    PRESENT,
-
-    // Indicates that an entry with this index has yet to be added.
-    ABSENT,
-}
-
 impl LogSlice {
     // Returns a new instance with the given entries. The "previous_id" parameter
     // holds the id of the last element in the log *not present* in this slice,
@@ -120,21 +106,20 @@ impl LogSlice {
         other_last.index >= this_last.index
     }
 
-    // Returns true if the supplied entry is present in this slice.
-    pub fn contains(&self, query: &EntryId) -> ContainsResult {
+    // Returns true if the supplied entry id is present in this slice. Both the term and
+    // the index need to match for the result to be true.
+    fn contains(&self, query: &EntryId) -> bool {
         if query.index <= self.previous_id.index {
-            assert!(query.term <= self.previous_id.term);
-            return ContainsResult::COMPACTED;
+            return false;
         }
 
         let idx = self.local_index(query.index);
         if idx >= self.entries.len() {
-            return ContainsResult::ABSENT;
+            return false;
         }
 
-        let &entry_id = &self.entries[idx as usize].id.as_ref().expect("id");
-        assert!(entry_id == query);
-        return ContainsResult::PRESENT;
+        let &entry_id = &self.entries[idx].id.as_ref().expect("id");
+        entry_id == query
     }
 
     // Returns true if the supplied index lies before the range of entries present
@@ -153,7 +138,7 @@ impl LogSlice {
                 return Some(entry.clone());
             }
         }
-        return None;
+        None
     }
 
     // Adds the supplied entries to the end of the slice. Any conflicting
@@ -216,6 +201,25 @@ impl LogSlice {
         result
     }
 
+    // Returns true if the supplied entry ID represents a conflict, i.e., if we
+    // have an entry with the supplied index, and a different term.
+    pub fn conflict(&self, id: &EntryId) -> bool {
+        let idx = id.index;
+
+        // Before our slice, no conflict to report.
+        if idx < self.previous_id.index {
+            return false;
+        }
+
+        // After the last entry we have, also no conflict to report.
+        if idx >= self.next_index() {
+            return false;
+        }
+
+        // Remaining case is that it's within our range. Resolve and check the term.
+        self.id_at(idx).term != id.term
+    }
+
     // Returns the entry id for the entry at the supplied index. Must only be
     // called if the index is known to this slice.
     //
@@ -247,14 +251,22 @@ impl LogSlice {
     // Removes all entries up to and including the supplied id. Once this
     // returns, this instance starts immediately after the supplied id.
     pub fn prune_until(&mut self, entry_id: &EntryId) {
-        assert_eq!(self.contains(entry_id), ContainsResult::PRESENT);
+        assert!(
+            entry_id.index >= self.previous_id.index,
+            "Cannot prune into the past"
+        );
 
-        // We need to add 1 because the "drain()" call below is exclusive, but we want this
-        // drain to be inclusive of the supplied entry.
-        let local_idx = self.local_index(entry_id.index) + 1;
-
-        for entry in self.entries.drain(0..local_idx) {
-            self.size_bytes -= size_bytes(&entry);
+        if self.contains(entry_id) {
+            // We need to add 1 because the "drain()" call below is exclusive, but we want this
+            // drain to be inclusive of the supplied entry.
+            let local_idx = self.local_index(entry_id.index) + 1;
+            for entry in self.entries.drain(0..local_idx) {
+                self.size_bytes -= size_bytes(&entry);
+            }
+        } else {
+            // Entry is not present, we just remove everything.
+            self.entries.clear();
+            self.size_bytes = 0;
         }
         self.previous_id = entry_id.clone();
     }
@@ -300,7 +312,7 @@ mod tests {
     #[test]
     fn test_initial() {
         let l = create_initial_slice();
-        assert_eq!(l.contains(&entry_id(0, 0)), ContainsResult::COMPACTED);
+        assert!(!l.contains(&entry_id(0, 0)));
 
         let after = l.get_entries_after(&entry_id(0, 0));
         assert!(after.is_empty());
@@ -360,20 +372,50 @@ mod tests {
 
     #[test]
     fn test_contains() {
-        let l = create_default_slice();
+        let l = create_default_slice(); // Contains entries with indices 1 through 6. Previous is (0,0).
 
-        // Special sentinel case.
-        assert_eq!(ContainsResult::COMPACTED, l.contains(&entry_id(0, 0)));
+        // Case 1: Entry is equal to "previous".
+        // The log slice does not "contain" the previous entry, but starts *after* it.
+        assert!(!l.contains(&entry_id(0, 0)),);
 
-        // Check a few existing entries.
-        assert_eq!(ContainsResult::PRESENT, l.contains(&entry_id(73, 3)));
-        assert_eq!(ContainsResult::PRESENT, l.contains(&entry_id(73, 4)));
+        // Case 2: Absent because index is too low (before previous_id).
+        assert!(!l.contains(&entry_id(0, -5)),);
 
-        // First index not present.
-        let next = l.next_index();
+        // Case 3: Present and matching.
+        assert!(l.contains(&entry_id(73, 3)),);
+        assert!(l.contains(&entry_id(73, 4)),);
+
+        // Case 4: Absent because index is too high (beyond next_index).
+        let next = l.next_index(); // next_index is 7
         assert_eq!(7, next);
-        assert_eq!(ContainsResult::ABSENT, l.contains(&entry_id(95, next)));
-        assert_eq!(ContainsResult::ABSENT, l.contains(&entry_id(12, next)));
+        assert!(!l.contains(&entry_id(95, next)),);
+        assert!(!l.contains(&entry_id(12, next + 5)),);
+
+        // Case 5: Entry present, but term doesn't match. `contains` expects both term and index to match.
+        assert!(!l.contains(&entry_id(1, 1)),);
+    }
+
+    #[test]
+    fn test_conflict() {
+        let l = create_default_slice(); // Contains entries with indices 1 through 6. Previous is (0,0).
+
+        // Case 1: Entry is equal to "previous_id.index".
+        assert!(!l.conflict(&entry_id(0, 0)),);
+
+        // Case 2: Absent because index is too low (before previous_id.index).
+        assert!(!l.conflict(&entry_id(0, -5)),);
+
+        // Case 3: Absent because index is too high (at or beyond next_index).
+        let next = l.next_index(); // next_index is 7
+        assert_eq!(7, next);
+        assert!(!l.conflict(&entry_id(95, next)),);
+        assert!(!l.conflict(&entry_id(12, next + 5)),);
+
+        // Case 4: No conflict, present and matching.
+        assert!(!l.conflict(&entry_id(71, 1)),);
+
+        // Case 5: Conflict, present with different term.
+        assert!(l.conflict(&entry_id(70, 1)),);
     }
 
     #[test]
@@ -465,13 +507,52 @@ mod tests {
 
     #[test]
     fn test_prune_until_all_entries() {
-        let mut l = create_default_slice();
-        assert_eq!(l.next_index(), 7);
-        assert_eq!(l.size_bytes(), 6);
+        {
+            let mut l = create_default_slice();
+            assert_eq!(l.next_index(), 7);
+            assert_eq!(l.size_bytes(), 6);
 
-        l.prune_until(&entry_id(74, 6));
-        assert_eq!(l.next_index(), 7);
+            l.prune_until(&entry_id(74, 5));
+            assert_eq!(l.next_index(), 6);
+            assert_eq!(l.size_bytes(), 0);
+        }
+
+        {
+            let original_previous = entry_id(12, 189);
+            let mut l2 = LogSlice::new_empty(original_previous.clone());
+            l2.append(12 /* term */, Payload(Vec::new()));
+            l2.append(13 /* term */, Payload(Vec::new()));
+            assert_eq!(l2.next_index(), 192);
+
+            l2.prune_until(&original_previous);
+            assert_eq!(l2.next_index(), 190);
+        }
+    }
+
+    // Tests that prune_until ends up emptying the slice if the requested
+    // stopping entry is not present at all.
+    #[test]
+    fn test_prune_until_no_match() {
+        let mut l = LogSlice::new_empty(EntryId {
+            term: 22,
+            index: 91,
+        });
+        assert_eq!(l.next_index(), 92);
+
+        l.append(26 /* term */, Payload(Vec::new()));
+        l.append(26 /* term */, Payload(Vec::new()));
+        l.append(26 /* term */, Payload(Vec::new()));
+        assert_eq!(l.next_index(), 95);
+
+        // Prune until an entry with an index we know about, but the wrong term. Should
+        // clear the slice entirely.
+        l.prune_until(&EntryId {
+            term: 16,
+            index: 93,
+        });
         assert_eq!(l.size_bytes(), 0);
+        assert!(l.entries.is_empty());
+        assert_eq!(l.next_index(), 94);
     }
 
     #[test]

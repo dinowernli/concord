@@ -17,7 +17,6 @@ use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
 use diagnostics::ServerDiagnostics;
 use raft::StateMachine;
-use raft::log::ContainsResult;
 use raft::raft_common_proto::EntryId;
 use raft::raft_service_proto::{AppendRequest, AppendResponse, VoteRequest, VoteResponse};
 use raft::raft_service_proto::{CommitRequest, CommitResponse, StepDownRequest, StepDownResponse};
@@ -1006,18 +1005,29 @@ impl Raft for RaftImpl {
         let next_term = term + 1;
         state.reset_follower_timer(self.state.clone(), next_term);
 
-        // Make sure we have the previous log index sent. Note that COMPACTED
-        // can happen whenever we have no entries (e.g.,initially or just after
-        // a snapshot install).
-        let previous = &request.previous.ok_or(RaftError::missing("previous"))?;
-        let next_index = state.store.next_index();
-        if state.store.log_contains(previous) == ContainsResult::ABSENT {
-            // Let the leader know that this entry is too far in the future, so
-            // it can try again from with earlier index.
+        // Make sure we have the previous log index sent.
+        //
+        // This can be false in two cases:
+        // 1) The leader's "previous" is too far in the future, i.e., the index is larger
+        //    than the next index we expect to append to our log.
+        // 2) The leader's "previous" is too far in the past, i.e., the entry has been
+        //    compacted into our snapshot, and is no longer present in our log.
+        //
+        // Right now, we only handle case (1) below.
+        let leader_previous = &request.previous.ok_or(RaftError::missing("previous"))?;
+        let expected_next_index = state.store.next_index();
+
+        // The Raft paper says to return false if we can't check the exact (term, index)
+        // match of the leader's "previous", but we can't do that for case (2).
+        let conflict = state.store.conflict(leader_previous);
+
+        // Either way, we inform the leader that we were unable to append, and the leader will
+        // try again with an earlier "previous", which will hopefully match.
+        if conflict || leader_previous.index >= expected_next_index {
             return Ok(Response::new(AppendResponse {
                 term,
                 success: false,
-                next: next_index,
+                next: expected_next_index,
             }));
         }
 

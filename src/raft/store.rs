@@ -1,7 +1,7 @@
 use crate::raft::StateMachine;
 use crate::raft::diagnostics::ServerDiagnostics;
 use crate::raft::error::{RaftError, RaftResult};
-use crate::raft::log::{ContainsResult, LogSlice};
+use crate::raft::log::LogSlice;
 use crate::raft::raft_common_proto::entry::Data;
 use crate::raft::raft_common_proto::entry::Data::Config;
 use crate::raft::raft_common_proto::{ClusterConfig, Entry, EntryId, Server};
@@ -264,6 +264,12 @@ impl Store {
         self.log.id_at(index)
     }
 
+    // Returns true if the supplied entry ID represents a conflict, i.e., if we
+    // have an entry with the supplied index, and a different term.
+    pub fn conflict(&self, id: &EntryId) -> bool {
+        self.log.conflict(id)
+    }
+
     // Returns the highest index known to exist (even if the entry is not held
     // in this instance). Returns -1 if there are no known entries at all.
     pub fn last_known_log_entry_id(&self) -> &EntryId {
@@ -274,11 +280,6 @@ impl Store {
     // as the slice of the log tracked by this instance.
     pub fn log_entry_is_up_to_date(&self, other_last: &EntryId) -> bool {
         self.log.is_up_to_date(other_last)
-    }
-
-    // Returns true if the supplied entry is present in this slice.
-    pub fn log_contains(&self, query: &EntryId) -> ContainsResult {
-        self.log.contains(query)
     }
 
     // Returns all entries strictly after the supplied id. Must only be called
@@ -304,11 +305,31 @@ impl Store {
         receiver
     }
 
-    // Resets the state of this store to the supplied snapshot.
     pub async fn install_snapshot(&mut self, snapshot: LogSnapshot) -> Status {
-        // Update the state machine.
-        let mut state_machine = self.state_machine.lock().await;
-        match state_machine.load_snapshot(&snapshot.data) {
+        // Just a snapshot without additional entries.
+        let add_entries = Vec::new();
+        self.install(snapshot, add_entries).await
+    }
+
+    // Resets the state of this store to the supplied snapshot and log entries.
+    async fn install(&mut self, snapshot: LogSnapshot, add_entries: Vec<Entry>) -> Status {
+        let last = snapshot.last.clone();
+        let data = snapshot.data.clone();
+        let cluster_config = snapshot.config.clone();
+
+        // Check that the snapshot does indeed take us into the future.
+        if last.index < self.applied {
+            return Status::invalid_argument(format!(
+                "[{}] Refused to install snapshot that would go back in time. Last applied index in snapshot is {}, our latest applied index is {}",
+                &self.name, &last.index, &self.applied
+            ));
+        }
+
+        // Update the state machine. Do this before the operations below so that we can fail the
+        // incoming RPC cleanly in case this fails, as if the call had never happened.
+        let state_machine = self.state_machine.clone();
+        let mut locked_machine = state_machine.lock().await;
+        match locked_machine.load_snapshot(&data) {
             Ok(_) => (),
             Err(message) => {
                 return Status::internal(format!(
@@ -318,34 +339,36 @@ impl Store {
             }
         }
 
-        // Update the log.
-        let last = snapshot.last.clone();
-        let contains = self.log.contains(&last);
-        match contains {
-            ContainsResult::ABSENT => {
-                // Common case, snapshot from the future. Just clear the log.
-                self.log = LogSlice::new_empty(last.clone());
-            }
-            ContainsResult::PRESENT => {
-                // Entries that came after the latest snapshot entry might still be valid.
-                self.log.prune_until(&last);
-            }
-            ContainsResult::COMPACTED => {
-                warn!(
-                    "[{}] Got snapshot for already compacted index {}",
-                    &self.name, last.index,
-                );
-            }
+        // Store the new snapshot.
+        self.snapshot = snapshot.clone();
+
+        // Update the log. There is some subtlety in why this call is the right thing.
+        //
+        // The common case here is that the snapshot's last entry is greater than anything
+        // our log slice knows about, in which case we clear the log slice entirely.
+        //
+        // It's also possible that the snapshot's latest entry is somewhere in the range
+        // (our_snapshot.latest, our_log.max_index]. In this case:
+        //  * If the exact entry is present, keep everything that comes after
+        //  * If the index is present, but it's the wrong entry, also clear the slice
+        self.log.prune_until(&last);
+
+        // Append any new entries provided.
+        if !add_entries.is_empty() {
+            self.append_all(&add_entries).await;
         }
 
+        // Update our volatile state.
         self.applied = last.index;
         self.committed = last.index;
-        self.snapshot = snapshot.clone();
         self.config_info = ConfigInfo {
             latest_appended: None,
             committed: false,
-            latest_applied: snapshot.config,
+            latest_applied: cluster_config,
         };
+
+        // Go through listeners and have them catch up to the current commit.
+        self.resolve_listeners();
 
         Status::ok("")
     }
@@ -575,6 +598,23 @@ mod tests {
         assert_eq!(store.committed_index(), 4);
         assert_eq!(store.applied, 4);
         assert_eq!(store.next_index(), 8);
+    }
+
+    #[test]
+    fn test_conflict() {
+        let mut store = make_store();
+        store.append(71, Payload(Vec::new()));
+        store.append(72, Payload(Vec::new()));
+        store.append(73, Payload(Vec::new()));
+
+        // No conflict, not present.
+        assert!(!store.conflict(&EntryId { term: 1, index: 17 }));
+
+        // No conflict, present.
+        assert!(!store.conflict(&EntryId { term: 71, index: 1 }));
+
+        // Conflict, present with different term.
+        assert!(store.conflict(&EntryId { term: 70, index: 1 }));
     }
 
     #[tokio::test]
