@@ -1,6 +1,6 @@
 use crate::raft::StateMachine;
 use crate::raft::diagnostics::ServerDiagnostics;
-use crate::raft::error::RaftResult;
+use crate::raft::error::{RaftError, RaftResult};
 use crate::raft::log::{ContainsResult, LogSlice};
 use crate::raft::raft_common_proto::entry::Data;
 use crate::raft::raft_common_proto::entry::Data::Config;
@@ -87,14 +87,15 @@ impl ConfigInfo {
 impl Store {
     pub fn new(
         state_machine: Arc<Mutex<dyn StateMachine + Send>>,
-        initial_snapshot: LogSnapshot,
+        snapshot: LogSnapshot,
+        entries: Vec<Entry>,
         diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
         compaction_threshold_bytes: i64,
         name: &str,
     ) -> RaftResult<Self> {
-        // TODO: This is in preparation for a future change where the store will be async.
-        let index = initial_snapshot.last.index;
-        let latest_applied = initial_snapshot.config.clone();
+        let last = snapshot.last.clone();
+        let index = last.index.clone();
+        let latest_applied = snapshot.config.clone();
         let config_info = ConfigInfo {
             latest_appended: None,
             committed: false,
@@ -106,8 +107,10 @@ impl Store {
             state_machine,
             diagnostics,
 
-            log: LogSlice::initial(),
-            snapshot: initial_snapshot,
+            log: LogSlice::new(last, entries).map_err(|e| {
+                RaftError::Initialization(format!("Failed to create log slice: {}", e))
+            })?,
+            snapshot,
             term: 0,
             voted_for: None,
 
@@ -321,7 +324,7 @@ impl Store {
         match contains {
             ContainsResult::ABSENT => {
                 // Common case, snapshot from the future. Just clear the log.
-                self.log = LogSlice::new(last.clone());
+                self.log = LogSlice::new_empty(last.clone());
             }
             ContainsResult::PRESENT => {
                 // Entries that came after the latest snapshot entry might still be valid.
@@ -522,16 +525,14 @@ mod tests {
     fn make_store() -> Store {
         let state_machine = FakeStateMachine::new();
         let snapshot = LogSnapshot {
-            last: EntryId {
-                term: -1,
-                index: -1,
-            },
+            last: EntryId { term: 0, index: 0 },
             data: state_machine.create_snapshot(),
             config: make_cluster_config(),
         };
         Store::new(
             Arc::new(Mutex::new(state_machine)),
             snapshot,
+            vec![],
             None, /* diagnostics */
             COMPACTION_THRESHOLD_BYTES,
             "testing-store",
@@ -542,9 +543,38 @@ mod tests {
     #[test]
     fn test_initial() {
         let store = make_store();
-        assert_eq!(store.committed_index(), -1);
-        assert_eq!(store.applied, -1);
-        assert_eq!(store.next_index(), 0);
+        assert_eq!(store.committed_index(), 0);
+        assert_eq!(store.applied, 0);
+        assert_eq!(store.next_index(), 1);
+    }
+
+    #[test]
+    fn test_initial_with_entries() {
+        let state_machine = FakeStateMachine::new();
+        let snapshot = LogSnapshot {
+            last: EntryId { term: 1, index: 4 },
+            data: state_machine.create_snapshot(),
+            config: make_cluster_config(),
+        };
+
+        let entries = vec![
+            payload_entry(1, 5),
+            payload_entry(1, 6),
+            payload_entry(1, 7),
+        ];
+        let store = Store::new(
+            Arc::new(Mutex::new(state_machine)),
+            snapshot,
+            entries,
+            None,
+            COMPACTION_THRESHOLD_BYTES,
+            "test-store",
+        )
+        .unwrap();
+
+        assert_eq!(store.committed_index(), 4);
+        assert_eq!(store.applied, 4);
+        assert_eq!(store.next_index(), 8);
     }
 
     #[tokio::test]
@@ -572,30 +602,30 @@ mod tests {
     #[tokio::test]
     async fn test_listener() {
         let mut store = make_store();
-        let receiver = store.add_listener(2);
+        let receiver = store.add_listener(3);
 
         store.append(67, Payload(Vec::new()));
         store.append(67, Payload(Vec::new()));
         store.append(68, Payload(Vec::new()));
 
-        store.commit_to(2).await;
+        store.commit_to(3).await;
         let output = receiver.now_or_never();
         assert!(output.is_some());
 
         let result = output.unwrap().unwrap();
-        assert_eq!(2, result.index);
+        assert_eq!(3, result.index);
         assert_eq!(68, result.term);
     }
 
     #[tokio::test]
     async fn test_listener_multi() {
         let mut store = make_store();
-        let receiver1 = store.add_listener(0);
-        let receiver2 = store.add_listener(1);
-        let receiver3 = store.add_listener(0);
+        let receiver1 = store.add_listener(1);
+        let receiver2 = store.add_listener(2);
+        let receiver3 = store.add_listener(1);
 
         store.append(67, Payload(Vec::new()));
-        store.commit_to(0).await;
+        store.commit_to(1).await;
 
         assert!(receiver1.now_or_never().is_some());
         assert!(receiver2.now_or_never().is_none());
@@ -608,9 +638,9 @@ mod tests {
 
         store.append(67, Payload(Vec::new()));
         store.append(67, Payload(Vec::new()));
-        store.commit_to(1).await;
+        store.commit_to(2).await;
 
-        let receiver = store.add_listener(0);
+        let receiver = store.add_listener(1);
         assert!(receiver.now_or_never().is_some());
     }
 
@@ -632,8 +662,8 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot() {
         let mut store = make_store();
-        assert_eq!(store.get_latest_snapshot().last.term, -1);
-        assert_eq!(store.get_latest_snapshot().last.index, -1);
+        assert_eq!(store.get_latest_snapshot().last.term, 0);
+        assert_eq!(store.get_latest_snapshot().last.index, 0);
 
         let cluster_config = make_cluster_config();
         let snap = LogSnapshot {
@@ -677,9 +707,9 @@ mod tests {
 
         store
             .append_all(&vec![
-                payload_entry(12, 0),
                 payload_entry(12, 1),
                 payload_entry(12, 2),
+                payload_entry(12, 3),
             ])
             .await;
         assert!(store.get_config_info().latest_appended.is_none());
@@ -687,9 +717,9 @@ mod tests {
         let voters = 7;
         store
             .append_all(&vec![
-                payload_entry(12, 3),
-                config_entry(12, 4, voters),
-                payload_entry(12, 5),
+                payload_entry(12, 4),
+                config_entry(12, 5, voters),
+                payload_entry(12, 6),
             ])
             .await;
         assert!(store.get_config_info().latest_appended.is_some());
@@ -707,9 +737,9 @@ mod tests {
         let voters = 5;
         store
             .append_all(&vec![
-                config_entry(12, 6, 3),
                 config_entry(12, 7, 3),
-                config_entry(12, 8, voters),
+                config_entry(12, 8, 3),
+                config_entry(12, 9, voters),
             ])
             .await;
         assert!(store.get_config_info().latest_appended.is_some());
@@ -725,7 +755,7 @@ mod tests {
         }
         assert!(!store.get_config_info().committed);
 
-        store.commit_to(8).await;
+        store.commit_to(9).await;
         assert!(store.get_config_info().committed);
     }
 
@@ -819,6 +849,4 @@ mod tests {
             data: Some(Config(make_config(num_voters))),
         }
     }
-
-
 }

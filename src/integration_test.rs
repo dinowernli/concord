@@ -168,7 +168,9 @@ async fn make_harness(nodes: &[&str]) -> Harness {
 }
 
 async fn make_harness_with_options(nodes: &[&str], options: Option<Options>) -> Harness {
-    let mut builder = Harness::builder("test-cluster", nodes).await.expect("builder");
+    let mut builder = Harness::builder("test-cluster", nodes)
+        .await
+        .expect("builder");
 
     if let Some(opts) = options {
         builder = builder.with_options(opts)
