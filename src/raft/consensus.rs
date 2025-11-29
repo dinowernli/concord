@@ -111,20 +111,19 @@ impl RaftImpl {
             voters_next: all.clone().to_vec(),
         };
 
-        // TODO(dino) - Consider pre-populating the store / log with an initial
-        // sentinel entry just containing the cluster config.
         let snapshot = LogSnapshot {
             data: snapshot_bytes,
-            last: EntryId {
-                term: -1,
-                index: -1,
-            },
+            last: EntryId { term: 0, index: 0 },
             config,
         };
+
+        // No entries to begin with.
+        let entries = vec![];
 
         let store = Store::new(
             state_machine,
             snapshot,
+            entries,
             diagnostics.clone(),
             options.compaction_threshold_bytes,
             server.name.as_str(),
@@ -1388,11 +1387,11 @@ mod tests {
         let append_request = AppendRequest {
             term: 12,
             leader: Some(leader.clone()),
-            previous: Some(entry_id(-1, -1)),
+            previous: Some(entry_id(0, 0)),
             entries: vec![
-                entry(entry_id(8, 0), Vec::new()),
                 entry(entry_id(8, 1), Vec::new()),
                 entry(entry_id(8, 2), Vec::new()),
+                entry(entry_id(8, 3), Vec::new()),
             ],
             committed: 0,
         };
@@ -1412,16 +1411,16 @@ mod tests {
             let state = raft_state.lock().await;
             assert_eq!(state.current_leader(), Some(leader.clone()));
             assert_eq!(state.term(), 12);
-            assert!(!state.store.is_index_compacted(0)); // Not compacted
-            assert_eq!(state.store.next_index(), 3);
+            assert!(!state.store.is_index_compacted(1)); // Not compacted
+            assert_eq!(state.store.next_index(), 4);
         }
 
         // Run a compaction, should have no effect
         {
             let mut state = raft_state.lock().await;
             state.store.try_compact().await;
-            assert!(!state.store.is_index_compacted(0)); // Not compacted
-            assert_eq!(state.store.next_index(), 3);
+            assert!(!state.store.is_index_compacted(1)); // Not compacted
+            assert_eq!(state.store.next_index(), 4);
         }
 
         // Now send an append request with a payload large enough to trigger compaction.
@@ -1430,14 +1429,14 @@ mod tests {
         let append_request_2 = AppendRequest {
             term: 12,
             leader: Some(leader.clone()),
-            previous: Some(entry_id(8, 2)),
+            previous: Some(entry_id(8, 3)),
             entries: vec![entry(
-                entry_id(8, 3),
+                entry_id(8, 4),
                 vec![0; 2 * compaction_bytes as usize],
             )],
             // This tells the follower that the entries are committed (only committed
             // entries are eligible for compaction).
-            committed: 3,
+            committed: 4,
         };
 
         let append_response_2 = client
@@ -1451,16 +1450,16 @@ mod tests {
         assert!(append_response_2.success);
         {
             let state = raft_state.lock().await;
-            assert!(!state.store.is_index_compacted(0)); // Not compacted
-            assert_eq!(state.store.next_index(), 4); // New entry incorporated
+            assert!(!state.store.is_index_compacted(1)); // Not compacted
+            assert_eq!(state.store.next_index(), 5); // New entry incorporated
         }
 
         // Run a compaction, this one should actually compact things now.
         {
             let mut state = raft_state.lock().await;
             state.store.try_compact().await;
-            assert!(state.store.is_index_compacted(0)); // Compacted
-            assert_eq!(state.store.get_latest_snapshot().last.index, 3)
+            assert!(state.store.is_index_compacted(1)); // Compacted
+            assert_eq!(state.store.get_latest_snapshot().last.index, 4)
         }
     }
 
