@@ -433,6 +433,7 @@ dependencies = [
  "reqwest",
  "serde",
  "structopt",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",

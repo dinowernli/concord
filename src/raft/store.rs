@@ -1,17 +1,21 @@
-use crate::raft::StateMachine;
 use crate::raft::diagnostics::ServerDiagnostics;
+use crate::raft::error::RaftError::Initialization;
 use crate::raft::error::{RaftError, RaftResult};
 use crate::raft::log::LogSlice;
+use crate::raft::persistence::{
+    Persistence, PersistenceError, PersistenceOptions, PersistentState,
+};
 use crate::raft::raft_common_proto::entry::Data;
 use crate::raft::raft_common_proto::entry::Data::Config;
 use crate::raft::raft_common_proto::{ClusterConfig, Entry, EntryId, Server};
+use crate::raft::{StateMachine, persistence};
 use async_std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::channel::oneshot::{Receiver, Sender, channel};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
-use tonic::Status;
+use tonic::{Code, Status};
 use tracing::{debug, info, warn};
 
 // Handles persistent storage for a Raft member, including a snapshot starting
@@ -26,6 +30,7 @@ pub struct Store {
     name: String,
     state_machine: Arc<Mutex<dyn StateMachine + Send>>,
     diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
+    persistence: Box<dyn Persistence + Send>,
 
     // Persistent raft state as defined in the paper.
     log: LogSlice,
@@ -46,7 +51,7 @@ pub struct Store {
 #[derive(Clone, PartialEq)]
 pub struct ConfigInfo {
     // The latest appended entry containing a cluster config.
-    pub latest_appended: Option<Entry>,
+    latest_appended: Option<Entry>,
 
     // Whether the latest appended entry has been committed.
     committed: bool,
@@ -85,43 +90,101 @@ impl ConfigInfo {
 }
 
 impl Store {
-    pub fn new(
+    pub async fn new(
+        persistence_options: PersistenceOptions,
+        initial_cluster_config: ClusterConfig,
         state_machine: Arc<Mutex<dyn StateMachine + Send>>,
-        snapshot: LogSnapshot,
-        entries: Vec<Entry>,
         diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
         compaction_threshold_bytes: i64,
         name: &str,
     ) -> RaftResult<Self> {
-        let last = snapshot.last.clone();
-        let index = last.index.clone();
-        let latest_applied = snapshot.config.clone();
-        let config_info = ConfigInfo {
-            latest_appended: None,
-            committed: false,
-            latest_applied,
+        // Initialize persistence and try to load state from previous instance.
+        let persistence = persistence::new(persistence_options)
+            .await
+            .map_err(|e| Initialization(format!("Failed to create persistence: {:?}", e)))?;
+
+        let loaded_state = persistence
+            .read()
+            .await
+            .map_err(|e| Initialization(format!("Failed to read from persistence: {:?}", e)))?;
+
+        // If none was loaded, create a new initial state to use below.
+        let persistent_state = match loaded_state {
+            Some(mut state) => {
+                state
+                    .validate()
+                    .map_err(|e| Initialization(format!("Loaded invalid state: {:?}", e)))?;
+                state.trim_entries();
+                state
+            }
+            None => {
+                let data = state_machine.lock().await.create_snapshot();
+                let snapshot = LogSnapshot::make_initial(data, initial_cluster_config);
+                let state = PersistentState {
+                    term: 0,
+                    voted_for: None,
+                    snapshot,
+                    entries: vec![],
+                };
+                state
+            }
         };
-        Ok(Self {
+
+        let snapshot = persistent_state.snapshot.clone();
+        let snapshot_last_index = snapshot.last.index;
+        let slice = LogSlice::new(snapshot.last.clone(), persistent_state.entries)
+            .map_err(|e| Initialization(format!("Failed to create log slice: {:?}", e)))?;
+
+        let config_info = ConfigInfo {
+            latest_appended: slice.latest_config_entry(),
+            committed: false, // Conservative. If committed, we'll find out.
+            latest_applied: snapshot.config.clone(),
+        };
+
+        let result = Self {
             name: name.to_string(),
             compaction_threshold_bytes,
             state_machine,
             diagnostics,
+            persistence,
 
-            log: LogSlice::new(last, entries).map_err(|e| {
-                RaftError::Initialization(format!("Failed to create log slice: {}", e))
-            })?,
-            snapshot,
-            term: 0,
-            voted_for: None,
+            // Persistent state.
+            log: slice,
+            snapshot: persistent_state.snapshot,
+            term: persistent_state.term,
+            voted_for: persistent_state.voted_for,
 
             // Non-persistent. Just bookkeeping.
-            committed: index,
-            applied: index,
+            committed: snapshot_last_index,
+            applied: snapshot_last_index,
             config_info,
 
             listener_uid: 0,
             listeners: BTreeSet::new(),
-        })
+        };
+
+        // Make one initial write to make sure that after creation, persistence reflects our
+        // current state. This is especially important after a creation from an empty state
+        // because we need to make sure all the files exist.
+        result.persist_all().await.map_err(|e| {
+            Initialization(format!("Failed make initial persistence write: {:?}", e))
+        })?;
+
+        Ok(result)
+    }
+
+    // Writes all the current persistent state.
+    async fn persist_all(&self) -> Result<(), PersistenceError> {
+        self.persistence
+            .write(
+                self.term,
+                &self.voted_for,
+                self.log.entries(),
+                &self.snapshot.data,
+                &self.snapshot.last,
+                &self.snapshot.config,
+            )
+            .await
     }
 
     // Returns the index up to (and including) which the corresponding entries are
@@ -161,11 +224,37 @@ impl Store {
         // TODO: This is in preparation for a future change where the store will be async.
         let is_any_config = entries.iter().any(|e| matches!(e.data, Some(Config(_))));
 
-        self.log.append_all(entries);
+        let clean_append = self.log.append_all(entries);
 
         if is_any_config {
             self.update_config_info();
         }
+
+        // TODO(dino): If uncommented, this logic appears to occasionally produce non-consecutive
+        // log slices on disk. However, if we always flush the entire contents, this doesn't happen.
+        // Needs debugging. Repro with `cargo run -- -r -w` and wait for crash.
+        //
+        // if clean_append {
+        //     // Optimization for the case where we just appended entries to the back of the slice
+        //     // and didn't remove anything - persistence can just append the entries.
+        //     self.persistence
+        //         .append_entries(entries)
+        //         .await
+        //         .expect("append entries");
+        // } else {
+        //     // Otherwise, replace the persisted entries.
+        //     self.persist_entries().await;
+        // }
+
+        self.persist_entries().await;
+    }
+
+    async fn persist_entries(&mut self) {
+        // TODO(dino): Important to make sure we don't accept or serve any more RPCs if this fails
+        self.persistence
+            .write_entries(self.log.entries())
+            .await
+            .expect("write entries");
     }
 
     pub fn term(&self) -> i64 {
@@ -187,6 +276,22 @@ impl Store {
         // TODO: This is in preparation for a future change where the store will be async.
         self.term = term;
         self.voted_for = voted_for.clone();
+
+        // TODO(dino): Important to make sure we don't accept or serve any more RPCs if this fails
+        self.persistence
+            .write_state(self.term, &self.voted_for)
+            .await
+            .expect("write state");
+    }
+
+    async fn update_snapshot(&mut self, snapshot: LogSnapshot) {
+        self.snapshot = snapshot.clone();
+
+        // TODO(dino): Important to make sure we don't accept or serve any more RPCs if this fails
+        self.persistence
+            .write_snapshot(&snapshot.data, &snapshot.last, &snapshot.config)
+            .await
+            .expect("write snapshot");
     }
 
     // Returns information about cluster config entries in the store.
@@ -205,7 +310,7 @@ impl Store {
                 last: latest_id.clone(),
                 config: latest_applied_config,
             };
-            self.snapshot = snap;
+            self.update_snapshot(snap).await;
 
             // Note that we prefer not to clear the log slice entirely
             // because although losing uncommitted entries is safe, the
@@ -305,14 +410,8 @@ impl Store {
         receiver
     }
 
+    // Resets the state of this store to the supplied snapshot.
     pub async fn install_snapshot(&mut self, snapshot: LogSnapshot) -> Status {
-        // Just a snapshot without additional entries.
-        let add_entries = Vec::new();
-        self.install(snapshot, add_entries).await
-    }
-
-    // Resets the state of this store to the supplied snapshot and log entries.
-    async fn install(&mut self, snapshot: LogSnapshot, add_entries: Vec<Entry>) -> Status {
         let last = snapshot.last.clone();
         let data = snapshot.data.clone();
         let cluster_config = snapshot.config.clone();
@@ -340,7 +439,7 @@ impl Store {
         }
 
         // Store the new snapshot.
-        self.snapshot = snapshot.clone();
+        self.update_snapshot(snapshot.clone()).await;
 
         // Update the log. There is some subtlety in why this call is the right thing.
         //
@@ -352,11 +451,6 @@ impl Store {
         //  * If the exact entry is present, keep everything that comes after
         //  * If the index is present, but it's the wrong entry, also clear the slice
         self.log.prune_until(&last);
-
-        // Append any new entries provided.
-        if !add_entries.is_empty() {
-            self.append_all(&add_entries).await;
-        }
 
         // Update our volatile state.
         self.applied = last.index;
@@ -375,8 +469,12 @@ impl Store {
 
     // If diagnostics is enabled, report that the supplied entry has been applied
     // to the state machine.
-    async fn report_apply(&self, entry_id: &EntryId, bytes: &Vec<u8>) {
-        let diag = self.diagnostics.clone();
+    async fn report_apply(
+        diagnostics: Option<Arc<Mutex<ServerDiagnostics>>>,
+        entry_id: &EntryId,
+        bytes: &Vec<u8>,
+    ) {
+        let diag = diagnostics.clone();
         if !diag.is_some() {
             return;
         }
@@ -393,6 +491,7 @@ impl Store {
     // Called to apply any committed values that haven't been applied to the
     // state machine. This method is always safe to call, on leaders and followers.
     async fn apply_committed(&mut self) {
+        let diagnostics = self.diagnostics.clone();
         while self.applied < self.committed {
             self.applied = self.applied + 1;
             let entry = self.log.entry_at(self.applied);
@@ -402,7 +501,7 @@ impl Store {
                 match data {
                     Data::Payload(bytes) => {
                         // Report for debugging purposes.
-                        self.report_apply(&entry_id, &bytes).await;
+                        Self::report_apply(diagnostics.clone(), &entry_id, &bytes).await;
 
                         // Apply the entry in the state machine.
                         let result = self.state_machine.lock().await.apply(&Bytes::from(bytes));
@@ -469,7 +568,7 @@ impl Store {
 
 // Represents a snapshot of the store after applying a complete prefix
 // of entries since the beginning of time.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct LogSnapshot {
     // The id of the latest entry included in the snapshot.
     pub last: EntryId,
@@ -480,6 +579,16 @@ pub struct LogSnapshot {
     // The cluster configuration present in the latest included entry
     // that contains a cluster configuration.
     pub config: ClusterConfig,
+}
+
+impl LogSnapshot {
+    pub fn make_initial(initial_bytes: Bytes, config: ClusterConfig) -> Self {
+        LogSnapshot {
+            last: EntryId { term: 0, index: 0 },
+            data: initial_bytes,
+            config,
+        }
+    }
 }
 
 // Each instance represents an ongoing commit operation waiting for the committed
@@ -523,10 +632,12 @@ fn entry_id_key(entry_id: &EntryId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::persistence::{FilePersistenceOptions, PersistenceOptions};
     use crate::raft::raft_common_proto::entry::Data::Payload;
     use crate::raft::raft_common_proto::{ClusterConfig, Server};
     use crate::raft::testing::FakeStateMachine;
     use futures::FutureExt;
+    use tempfile::TempDir;
 
     const COMPACTION_THRESHOLD_BYTES: i64 = 5000;
 
@@ -545,64 +656,70 @@ mod tests {
         }
     }
 
-    fn make_store() -> Store {
+    async fn make_store() -> Store {
         let state_machine = FakeStateMachine::new();
-        let snapshot = LogSnapshot {
-            last: EntryId { term: 0, index: 0 },
-            data: state_machine.create_snapshot(),
-            config: make_cluster_config(),
-        };
         Store::new(
+            PersistenceOptions::NoPersistenceForTesting,
+            make_cluster_config(),
             Arc::new(Mutex::new(state_machine)),
-            snapshot,
-            vec![],
             None, /* diagnostics */
             COMPACTION_THRESHOLD_BYTES,
             "testing-store",
         )
-        .unwrap()
+        .await
+        .expect("make")
     }
 
-    #[test]
-    fn test_initial() {
-        let store = make_store();
+    #[tokio::test]
+    async fn test_initial() {
+        let fixture = Fixture::new().await;
+        let store = fixture.make_store().await;
         assert_eq!(store.committed_index(), 0);
         assert_eq!(store.applied, 0);
         assert_eq!(store.next_index(), 1);
     }
 
-    #[test]
-    fn test_initial_with_entries() {
-        let state_machine = FakeStateMachine::new();
-        let snapshot = LogSnapshot {
-            last: EntryId { term: 1, index: 4 },
-            data: state_machine.create_snapshot(),
-            config: make_cluster_config(),
-        };
+    #[tokio::test]
+    async fn test_initial_with_entries() {
+        let fixture = Fixture::new().await;
 
-        let entries = vec![
-            payload_entry(1, 5),
-            payload_entry(1, 6),
-            payload_entry(1, 7),
-        ];
-        let store = Store::new(
-            Arc::new(Mutex::new(state_machine)),
-            snapshot,
-            entries,
-            None,
-            COMPACTION_THRESHOLD_BYTES,
-            "test-store",
-        )
-        .unwrap();
+        {
+            let mut store = fixture.make_store().await;
 
-        assert_eq!(store.committed_index(), 4);
-        assert_eq!(store.applied, 4);
-        assert_eq!(store.next_index(), 8);
+            let state_machine = FakeStateMachine::new();
+            let snapshot = LogSnapshot {
+                last: EntryId { term: 1, index: 4 },
+                data: state_machine.create_snapshot(),
+                config: make_cluster_config(),
+            };
+
+            assert_eq!(store.install_snapshot(snapshot).await.code(), Code::Ok);
+
+            let entries = vec![
+                payload_entry(1, 5),
+                payload_entry(1, 6),
+                payload_entry(1, 7),
+            ];
+            store.append_all(&entries).await;
+
+            assert_eq!(store.committed_index(), 4);
+            assert_eq!(store.applied, 4);
+            assert_eq!(store.next_index(), 8);
+        }
+
+        {
+            let mut store = fixture.make_store().await;
+            assert_eq!(store.committed_index(), 4);
+            assert_eq!(store.applied, 4);
+            assert_eq!(store.next_index(), 8);
+        }
     }
 
-    #[test]
-    fn test_conflict() {
-        let mut store = make_store();
+    #[tokio::test]
+    async fn test_conflict() {
+        let fixture = Fixture::new().await;
+        let mut store = fixture.make_store().await;
+
         store.append(71, Payload(Vec::new()));
         store.append(72, Payload(Vec::new()));
         store.append(73, Payload(Vec::new()));
@@ -620,7 +737,8 @@ mod tests {
     #[tokio::test]
     #[should_panic]
     async fn test_commit_to_bad_index() {
-        let mut store = make_store();
+        let fixture = Fixture::new().await;
+        let mut store = fixture.make_store().await;
         store.append(2, Payload(Vec::new()));
 
         // Attempt to "commit to" a value which hasn't yet been appended.
@@ -629,7 +747,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_to() {
-        let mut store = make_store();
+        let fixture = Fixture::new().await;
+        let mut store = fixture.make_store().await;
         let eid = store.append(2, Payload(Vec::new()));
 
         // Should succeed.
@@ -641,7 +760,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_listener() {
-        let mut store = make_store();
+        let fixture = Fixture::new().await;
+        let mut store = fixture.make_store().await;
         let receiver = store.add_listener(3);
 
         store.append(67, Payload(Vec::new()));
@@ -659,7 +779,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_listener_multi() {
-        let mut store = make_store();
+        let fixture = Fixture::new().await;
+        let mut store = fixture.make_store().await;
         let receiver1 = store.add_listener(1);
         let receiver2 = store.add_listener(2);
         let receiver3 = store.add_listener(1);
@@ -674,7 +795,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_listener_past() {
-        let mut store = make_store();
+        let fixture = Fixture::new().await;
+        let mut store = fixture.make_store().await;
 
         store.append(67, Payload(Vec::new()));
         store.append(67, Payload(Vec::new()));
@@ -686,7 +808,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_compaction() {
-        let mut store = make_store();
+        let fixture = Fixture::new().await;
+        let mut store = fixture.make_store().await;
         let eid = store.append(
             67,
             Payload(vec![0; 2 * COMPACTION_THRESHOLD_BYTES as usize]),
@@ -701,7 +824,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot() {
-        let mut store = make_store();
+        let fixture = Fixture::new().await;
+        let mut store = fixture.make_store().await;
         assert_eq!(store.get_latest_snapshot().last.term, 0);
         assert_eq!(store.get_latest_snapshot().last.index, 0);
 
@@ -724,9 +848,38 @@ mod tests {
         assert_eq!(new_snap.config, snap.config);
     }
 
-    #[test]
-    fn test_config_info_append() {
-        let mut store = make_store();
+    #[tokio::test]
+    async fn test_install_snapshot_resolves_listeners() {
+        let fixture = Fixture::new().await;
+        let mut store = fixture.make_store().await;
+        assert_eq!(store.get_latest_snapshot().last.term, 0);
+        assert_eq!(store.get_latest_snapshot().last.index, 0);
+
+        // Add a listener for a commit that will never go through here.
+        let listener = store.add_listener(14);
+
+        let log_snapshot = LogSnapshot {
+            last: EntryId {
+                term: 17,
+                index: 22,
+            },
+            data: Bytes::from(""),
+            config: make_cluster_config(),
+        };
+        store.install_snapshot(log_snapshot).await;
+        assert_eq!(22, store.committed_index());
+
+        // The listener should be cancelled because the commit we created before the
+        // snapshot was installed is not the one that went through.
+        let result = listener.await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_config_info_append() {
+        let fixture = Fixture::new().await;
+        let mut store = fixture.make_store().await;
+
         assert!(store.config_info.latest_appended.is_none());
 
         store.append(17, Payload(Vec::new()));
@@ -742,7 +895,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_config_info_append_all() {
-        let mut store = make_store();
+        let fixture = Fixture::new().await;
+        let mut store = fixture.make_store().await;
         assert!(store.get_config_info().latest_appended.is_none());
 
         store
@@ -800,8 +954,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_restore_persisted_snapshot() {
+        let fixture = Fixture::new().await;
+
+        let snapshot_bytes = Bytes::from("some snapshot");
+        let entry_id = EntryId {
+            term: 15,
+            index: 19,
+        };
+        let log_snapshot = LogSnapshot {
+            data: snapshot_bytes.clone(),
+            last: entry_id,
+            config: make_cluster_config(),
+        };
+
+        // Make some changes with a first store, then let it go out of scope.
+        {
+            let mut store = fixture.make_store().await;
+            let status = store.install_snapshot(log_snapshot).await;
+            assert_eq!(status.code(), Code::Ok);
+        }
+
+        // Now create another store backed by the same directory and check we can load contents.
+        {
+            let store = fixture.make_store().await;
+            assert_eq!(&store.snapshot.last, &entry_id);
+            assert_eq!(&store.snapshot.data, &snapshot_bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restore_persisted_voted_for() {
+        let fixture = Fixture::new().await;
+
+        let voted_for = Some(server("some host", 1414));
+
+        // Make some changes with a first store, then let it go out of scope.
+        {
+            let mut store = fixture.make_store().await;
+            store.update_voted_for(&voted_for).await;
+        }
+
+        // Now create another store backed by the same directory and check we can load contents.
+        {
+            let store = fixture.make_store().await;
+            assert_eq!(store.voted_for(), voted_for);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restore_persisted_term() {
+        let fixture = Fixture::new().await;
+        let term = 728;
+
+        // Make some changes with a first store, then let it go out of scope.
+        {
+            let mut store = fixture.make_store().await;
+            store.update_term_info(term, &None).await;
+        }
+
+        // Now create another store backed by the same directory and check we can load contents.
+        {
+            let store = fixture.make_store().await;
+            assert_eq!(store.term(), term);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restore_persisted_entries() {
+        let fixture = Fixture::new().await;
+
+        // Make some changes with a first store, then let it go out of scope.
+        {
+            let mut store = fixture.make_store().await;
+            store
+                .append_all(&[
+                    payload_entry(12, 1),
+                    payload_entry(12, 2),
+                    payload_entry(12, 3),
+                ])
+                .await;
+            assert_eq!(3, store.last_known_log_entry_id().index);
+        }
+
+        // Now create another store backed by the same directory and check we can load contents.
+        {
+            let store = fixture.make_store().await;
+            assert_eq!(3, store.last_known_log_entry_id().index);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restore_trims_entries_included_in_snapshot() {
+        let fixture = Fixture::new().await;
+
+        let entries = vec![
+            payload_entry(4, 10),
+            payload_entry(4, 11),
+            payload_entry(4, 12),
+            payload_entry(4, 13),
+        ];
+        let last_in_snapshot = EntryId { term: 4, index: 11 };
+        let cluster_conf = make_cluster_config();
+
+        {
+            let store = fixture.make_store().await;
+            store
+                .persistence
+                .write(
+                    7,
+                    &None,
+                    &entries,
+                    &Bytes::from("some snap"),
+                    &last_in_snapshot,
+                    &cluster_conf,
+                )
+                .await
+                .expect("failed to write");
+        }
+
+        {
+            let mut store = fixture.make_store().await;
+
+            panic!(
+                "cant restore in place, need to create a new store from the same persistence settings to test this"
+            )
+            // store.restore_persisted().await.expect("restore");
+            // let entries = store.log.entries().clone();
+            //
+            // // Only the last two entries should remain.
+            // assert_eq!(entries.len(), 2);
+            // assert_eq!(entries[0].id.unwrap().index, 12);
+            // assert_eq!(entries[1].id.unwrap().index, 13);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_todo() {
+        // Major construction sites:
+        // - Overhaul error handling to use less expect()
+        // - Fix issue with the entry append optimization (see below)
+        // - Include cluster configuration in snapshot so that snapshots work with reconfiguration
+        // - Build a test harness [done] that allows crashing / stopping / disconnecting for better tests
+        panic!(
+            "Look investigate why the append optimization for writing entries to persistent storage produces non-consecutive files (see todo in code above)"
+        );
+    }
+
+    #[tokio::test]
     async fn test_config_info_apply() {
-        let mut store = make_store();
+        let mut store = make_store().await;
         let initial_config = store.get_config_info().latest_applied;
 
         // Append and commit a payload, should not change applied config.
@@ -861,6 +1163,40 @@ mod tests {
         assert!(committed);
     }
 
+    struct Fixture {
+        temp_dir: TempDir,
+    }
+
+    impl Fixture {
+        async fn new() -> Fixture {
+            Fixture {
+                temp_dir: TempDir::new().unwrap(),
+            }
+        }
+
+        async fn make_store(&self) -> Store {
+            let options = persistence_options(&self.temp_dir);
+            Store::new(
+                options,
+                make_cluster_config(),
+                Arc::new(Mutex::new(FakeStateMachine::new())),
+                None, /* diagnostics */
+                COMPACTION_THRESHOLD_BYTES,
+                "testing-store",
+            )
+            .await
+            .expect("make")
+        }
+    }
+
+    fn persistence_options(temp_dir: &TempDir) -> PersistenceOptions {
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        PersistenceOptions::FilePersistence(FilePersistenceOptions {
+            directory: dir_str,
+            wipe: false,
+        })
+    }
+
     fn make_config(num_voters: usize) -> ClusterConfig {
         let mut voters = Vec::new();
         for i in 0..num_voters {
@@ -887,6 +1223,14 @@ mod tests {
         Entry {
             id: Some(EntryId { term, index }),
             data: Some(Config(make_config(num_voters))),
+        }
+    }
+
+    fn server(host: &str, port: i32) -> Server {
+        Server {
+            host: host.to_string(),
+            port,
+            name: String::new(),
         }
     }
 }

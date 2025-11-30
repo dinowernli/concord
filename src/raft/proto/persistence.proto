@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+import "common.proto";
+
+package raft_persistence_proto;
+
+// Persisted Raft state consists of three files, in the same directory
+// 1) A main file containing a State instance
+// 2) A log file containing a sequence of size-delimited Log instances
+// 3) A snapshot file containing a Snapshot instance
+
+// Schema for file (1) described above.
+message State {
+  // The current term.
+  int64 term = 1;
+
+  // The candidate for whom we've voted for in this term, if any.
+  raft_common_proto.Server voted_for = 2;
+}
+
+// For file (2) described above, we just use raw "Entry" proto.
+// If we end up needing a dedicated schema, we'll add one here.
+
+// Schema for file (3) described above.
+message Snapshot {
+  // The ID of the last entry present in the snapshot.
+  raft_common_proto.EntryId last = 1;
+
+  // The raw snapshot bytes to feed to the state machine.
+  bytes data = 2;
+
+  // Information about cluster membership.
+  raft_common_proto.ClusterConfig config = 3;
+}

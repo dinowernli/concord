@@ -5,12 +5,12 @@ use crate::raft::raft_common_proto::Server;
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
+const CLUSTER_NAME: &str = "test-cluster";
 const NAMES: [&str; 3] = ["A", "B", "C"];
 
 #[tokio::test]
 async fn test_start_and_elect_leader() {
     let harness = make_harness(&NAMES).await;
-
     harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
 
     harness.validate().await;
@@ -80,6 +80,7 @@ async fn test_reconfigure_cluster() {
     let harness = make_harness(&names).await;
 
     let (t1, leader1) = harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
+
     let without_leader: Vec<&str> = names
         .iter()
         .copied()
@@ -124,7 +125,8 @@ async fn test_keyvalue() {
 
 #[tokio::test]
 async fn test_snapshotting() {
-    let raft_options = Options::default().with_compaction(5 * 1024 * 1024, 1000);
+    let raft_options =
+        Options::new_without_persistence_for_testing().with_compaction(5 * 1024 * 1024, 1000);
     let harness = make_harness_with_options(&NAMES, Some(raft_options)).await;
 
     // Disconnect a node that will later have to catch up.
@@ -168,7 +170,7 @@ async fn make_harness(nodes: &[&str]) -> Harness {
 }
 
 async fn make_harness_with_options(nodes: &[&str], options: Option<Options>) -> Harness {
-    let mut builder = Harness::builder("test-cluster", nodes)
+    let mut builder = Harness::builder(CLUSTER_NAME, nodes)
         .await
         .expect("builder");
 
@@ -176,7 +178,8 @@ async fn make_harness_with_options(nodes: &[&str], options: Option<Options>) -> 
         builder = builder.with_options(opts)
     }
 
-    let (harness, serving) = builder.build().await.expect("harness");
+    let wipe_persistence = true;
+    let (harness, serving) = builder.build(wipe_persistence).await.expect("harness");
     harness.start().await;
     tokio::spawn(async { serving.await });
     harness
