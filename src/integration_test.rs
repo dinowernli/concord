@@ -2,6 +2,7 @@ use crate::harness::Harness;
 use crate::keyvalue::keyvalue_proto::PutRequest;
 use crate::raft::Options;
 use crate::raft::raft_common_proto::Server;
+use rand::{Rng, distributions::Alphanumeric};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
@@ -15,6 +16,7 @@ async fn test_start_and_elect_leader() {
 
     harness.validate().await;
     harness.stop().await;
+    harness.wipe_persistence().await;
 }
 
 #[tokio::test]
@@ -28,6 +30,7 @@ async fn test_start_and_elect_leader_many_nodes() {
 
     harness.validate().await;
     harness.stop().await;
+    harness.wipe_persistence().await;
 }
 
 #[tokio::test]
@@ -58,6 +61,7 @@ async fn test_disconnect_leader() {
 
     harness.validate().await;
     harness.stop().await;
+    harness.wipe_persistence().await;
 }
 
 #[tokio::test]
@@ -72,6 +76,7 @@ async fn test_commit() {
 
     harness.validate().await;
     harness.stop().await;
+    harness.wipe_persistence().await;
 }
 
 #[tokio::test]
@@ -100,6 +105,7 @@ async fn test_reconfigure_cluster() {
 
     harness.validate().await;
     harness.stop().await;
+    harness.wipe_persistence().await;
 }
 
 #[tokio::test]
@@ -121,6 +127,10 @@ async fn test_keyvalue() {
 
     assert_eq!(&entry.key, &k1);
     assert_eq!(&entry.value, &v1);
+
+    harness.validate().await;
+    harness.stop().await;
+    harness.wipe_persistence().await;
 }
 
 #[tokio::test]
@@ -158,6 +168,7 @@ async fn test_snapshotting() {
 
     harness.validate().await;
     harness.stop().await;
+    harness.wipe_persistence().await;
 }
 
 // Convenience method that returns a matcher for terms greater than a value.
@@ -169,8 +180,18 @@ async fn make_harness(nodes: &[&str]) -> Harness {
     make_harness_with_options(nodes, None).await
 }
 
+fn make_name() -> String {
+    let suffix: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .filter(|c| c.is_ascii_lowercase())
+        .take(4)
+        .map(char::from)
+        .collect();
+    format!("{}-{}", CLUSTER_NAME, suffix)
+}
+
 async fn make_harness_with_options(nodes: &[&str], options: Option<Options>) -> Harness {
-    let mut builder = Harness::builder(CLUSTER_NAME, nodes)
+    let mut builder = Harness::builder(make_name().as_str(), nodes)
         .await
         .expect("builder");
 

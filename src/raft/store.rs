@@ -1,8 +1,10 @@
 use crate::raft::diagnostics::ServerDiagnostics;
 use crate::raft::error::RaftError::Initialization;
-use crate::raft::error::RaftResult;
+use crate::raft::error::{RaftError, RaftResult};
 use crate::raft::log::LogSlice;
-use crate::raft::persistence::{Persistence, PersistenceOptions, PersistentState};
+use crate::raft::persistence::{
+    Persistence, PersistenceError, PersistenceOptions, PersistentState,
+};
 use crate::raft::raft_common_proto::entry::Data;
 use crate::raft::raft_common_proto::entry::Data::Config;
 use crate::raft::raft_common_proto::{ClusterConfig, Entry, EntryId, Server};
@@ -107,14 +109,13 @@ impl Store {
             .map_err(|e| Initialization(format!("Failed to read from persistence: {:?}", e)))?;
 
         // If none was loaded, create a new initial state to use below.
-        let (persistent_state, slice) = match loaded_state {
-            Some(state) => {
-                let last = state.snapshot.last.clone();
-                // TODO(dino): The slice just reflects the snapshot, not the entries. We currently
-                // install the entries by calling "restore_persisted()" after creation. We should
-                // figure out a way to initialize the full store correctly instead.
-                let slice = LogSlice::new(last);
-                (state, slice)
+        let persistent_state = match loaded_state {
+            Some(mut state) => {
+                state
+                    .validate()
+                    .map_err(|e| Initialization(format!("Loaded invalid state: {:?}", e)))?;
+                state.trim_entries();
+                state
             }
             None => {
                 let data = state_machine.lock().await.create_snapshot();
@@ -125,19 +126,22 @@ impl Store {
                     snapshot,
                     entries: vec![],
                 };
-                (state, LogSlice::initial())
+                state
             }
         };
 
-        let last = persistent_state.snapshot.last.index;
-        let latest_applied_config = persistent_state.snapshot.config.clone();
+        let snapshot = persistent_state.snapshot.clone();
+        let snapshot_last_index = snapshot.last.index;
+        let slice = LogSlice::new(snapshot.last.clone(), persistent_state.entries)
+            .map_err(|e| Initialization(format!("Failed to create log slice: {:?}", e)))?;
+
         let config_info = ConfigInfo {
-            latest_appended: None,
-            committed: false,
-            latest_applied: latest_applied_config,
+            latest_appended: slice.latest_config_entry(),
+            committed: false, // Conservative. If committed, we'll find out.
+            latest_applied: snapshot.config.clone(),
         };
 
-        let mut result = Self {
+        let result = Self {
             name: name.to_string(),
             compaction_threshold_bytes,
             state_machine,
@@ -151,63 +155,26 @@ impl Store {
             voted_for: persistent_state.voted_for,
 
             // Non-persistent. Just bookkeeping.
-            committed: last,
-            applied: last,
+            committed: snapshot_last_index,
+            applied: snapshot_last_index,
             config_info,
 
             listener_uid: 0,
             listeners: BTreeSet::new(),
         };
 
-        // Try restoring state from our persistence source. It's important that we do this
-        // immediately before calling anything else on the result store, to avoid the store
-        // clobbering the persisted state as part of other operations.
-        result
-            .restore_persisted()
-            .await
-            .map_err(|e| Initialization(format!("Failed to restore persisted: {:?}", e)))?;
-
-        // Perform a one-time write to make sure that we start off in a state where we've
-        // created the persisted files. Otherwise, partial writes might create a persisted
-        // state that cannot be read (e.g., because only some files exist).
-        result.persist_all().await;
+        // Make one initial write to make sure that after creation, persistence reflects our
+        // current state. This is especially important after a creation from an empty state
+        // because we need to make sure all the files exist.
+        result.persist_all().await.map_err(|e| {
+            Initialization(format!("Failed make initial persistence write: {:?}", e))
+        })?;
 
         Ok(result)
     }
 
-    // Reads state from the persistence instance and installs it in this store.
-    async fn restore_persisted(&mut self) -> Result<(), String> {
-        let read = self
-            .persistence
-            .read()
-            .await
-            .map_err(|e| format!("Failed to read from persistence: {:?}", e))?;
-        if let Some(mut loaded) = read {
-            loaded
-                .validate()
-                .map_err(|e| format!("Failed to validate persisted contents: {:?}", e))?;
-            loaded.trim_entries();
-
-            let snap = loaded.snapshot;
-            let last = snap.last.clone();
-
-            self.voted_for = loaded.voted_for;
-            self.term = loaded.term;
-            self.log = LogSlice::new(last);
-
-            let status = self.install(snap, loaded.entries).await;
-            if &status.code() != &Code::Ok {
-                return Err(format!(
-                    "Failed to install loaded snapshot: {}",
-                    status.to_string()
-                ));
-            }
-        }
-        Ok(())
-    }
-
     // Writes all the current persistent state.
-    async fn persist_all(&self) {
+    async fn persist_all(&self) -> Result<(), PersistenceError> {
         self.persistence
             .write(
                 self.term,
@@ -218,7 +185,6 @@ impl Store {
                 &self.snapshot.config,
             )
             .await
-            .expect("write persisted state");
     }
 
     // Returns the index up to (and including) which the corresponding entries are
@@ -403,6 +369,12 @@ impl Store {
         self.log.id_at(index)
     }
 
+    // Returns true if the supplied entry ID represents a conflict, i.e., if we
+    // have an entry with the supplied index, and a different term.
+    pub fn conflict(&self, id: &EntryId) -> bool {
+        self.log.conflict(id)
+    }
+
     // Returns the highest index known to exist (even if the entry is not held
     // in this instance). Returns -1 if there are no known entries at all.
     pub fn last_known_log_entry_id(&self) -> &EntryId {
@@ -438,14 +410,8 @@ impl Store {
         receiver
     }
 
+    // Resets the state of this store to the supplied snapshot.
     pub async fn install_snapshot(&mut self, snapshot: LogSnapshot) -> Status {
-        // Just a snapshot without additional entries.
-        let add_entries = Vec::new();
-        self.install(snapshot, add_entries).await
-    }
-
-    // Resets the state of this store to the supplied snapshot and log entries.
-    async fn install(&mut self, snapshot: LogSnapshot, add_entries: Vec<Entry>) -> Status {
         let last = snapshot.last.clone();
         let data = snapshot.data.clone();
         let cluster_config = snapshot.config.clone();
@@ -458,29 +424,8 @@ impl Store {
             ));
         }
 
-        // Store the new snapshot, including writing it to persistence.
-        self.update_snapshot(snapshot).await;
-
-        // Update the log. There is some subtlety in why this call is the right thing.
-        //
-        // The common case here is that the snapshot's last entry is greater than anything
-        // our log slice knows about, in which case we clear the log slice entirely.
-        //
-        // It's also possible that the snapshot's latest entry is somewhere in the range
-        // (our_snapshot.latest, our_log.max_index]. In this case:
-        //  * If the exact entry is present, keep everything that comes after
-        //  * If the index is present, but it's the wrong entry, also clear the slice
-        self.log.prune_until(&last);
-
-        // Append any new entries provided.
-        if !add_entries.is_empty() {
-            self.append_all(&add_entries).await;
-        }
-
-        // Make sure we've persisted the latest state, even if nothing appended.
-        self.persist_entries().await;
-
-        // Update the state machine.
+        // Update the state machine. Do this before the operations below so that we can fail the
+        // incoming RPC cleanly in case this fails, as if the call had never happened.
         let state_machine = self.state_machine.clone();
         let mut locked_machine = state_machine.lock().await;
         match locked_machine.load_snapshot(&data) {
@@ -492,6 +437,20 @@ impl Store {
                 ));
             }
         }
+
+        // Store the new snapshot.
+        self.update_snapshot(snapshot.clone()).await;
+
+        // Update the log. There is some subtlety in why this call is the right thing.
+        //
+        // The common case here is that the snapshot's last entry is greater than anything
+        // our log slice knows about, in which case we clear the log slice entirely.
+        //
+        // It's also possible that the snapshot's latest entry is somewhere in the range
+        // (our_snapshot.latest, our_log.max_index]. In this case:
+        //  * If the exact entry is present, keep everything that comes after
+        //  * If the index is present, but it's the wrong entry, also clear the slice
+        self.log.prune_until(&last);
 
         // Update our volatile state.
         self.applied = last.index;
@@ -625,10 +584,7 @@ pub struct LogSnapshot {
 impl LogSnapshot {
     pub fn make_initial(initial_bytes: Bytes, config: ClusterConfig) -> Self {
         LogSnapshot {
-            last: EntryId {
-                term: -1,
-                index: -1,
-            },
+            last: EntryId { term: 0, index: 0 },
             data: initial_bytes,
             config,
         }
@@ -718,9 +674,64 @@ mod tests {
     async fn test_initial() {
         let fixture = Fixture::new().await;
         let store = fixture.make_store().await;
-        assert_eq!(store.committed_index(), -1);
-        assert_eq!(store.applied, -1);
-        assert_eq!(store.next_index(), 0);
+        assert_eq!(store.committed_index(), 0);
+        assert_eq!(store.applied, 0);
+        assert_eq!(store.next_index(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_initial_with_entries() {
+        let fixture = Fixture::new().await;
+
+        {
+            let mut store = fixture.make_store().await;
+
+            let state_machine = FakeStateMachine::new();
+            let snapshot = LogSnapshot {
+                last: EntryId { term: 1, index: 4 },
+                data: state_machine.create_snapshot(),
+                config: make_cluster_config(),
+            };
+
+            assert_eq!(store.install_snapshot(snapshot).await.code(), Code::Ok);
+
+            let entries = vec![
+                payload_entry(1, 5),
+                payload_entry(1, 6),
+                payload_entry(1, 7),
+            ];
+            store.append_all(&entries).await;
+
+            assert_eq!(store.committed_index(), 4);
+            assert_eq!(store.applied, 4);
+            assert_eq!(store.next_index(), 8);
+        }
+
+        {
+            let mut store = fixture.make_store().await;
+            assert_eq!(store.committed_index(), 4);
+            assert_eq!(store.applied, 4);
+            assert_eq!(store.next_index(), 8);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_conflict() {
+        let fixture = Fixture::new().await;
+        let mut store = fixture.make_store().await;
+
+        store.append(71, Payload(Vec::new()));
+        store.append(72, Payload(Vec::new()));
+        store.append(73, Payload(Vec::new()));
+
+        // No conflict, not present.
+        assert!(!store.conflict(&EntryId { term: 1, index: 17 }));
+
+        // No conflict, present.
+        assert!(!store.conflict(&EntryId { term: 71, index: 1 }));
+
+        // Conflict, present with different term.
+        assert!(store.conflict(&EntryId { term: 70, index: 1 }));
     }
 
     #[tokio::test]
@@ -751,18 +762,18 @@ mod tests {
     async fn test_listener() {
         let fixture = Fixture::new().await;
         let mut store = fixture.make_store().await;
-        let receiver = store.add_listener(2);
+        let receiver = store.add_listener(3);
 
         store.append(67, Payload(Vec::new()));
         store.append(67, Payload(Vec::new()));
         store.append(68, Payload(Vec::new()));
 
-        store.commit_to(2).await;
+        store.commit_to(3).await;
         let output = receiver.now_or_never();
         assert!(output.is_some());
 
         let result = output.unwrap().unwrap();
-        assert_eq!(2, result.index);
+        assert_eq!(3, result.index);
         assert_eq!(68, result.term);
     }
 
@@ -770,12 +781,12 @@ mod tests {
     async fn test_listener_multi() {
         let fixture = Fixture::new().await;
         let mut store = fixture.make_store().await;
-        let receiver1 = store.add_listener(0);
-        let receiver2 = store.add_listener(1);
-        let receiver3 = store.add_listener(0);
+        let receiver1 = store.add_listener(1);
+        let receiver2 = store.add_listener(2);
+        let receiver3 = store.add_listener(1);
 
         store.append(67, Payload(Vec::new()));
-        store.commit_to(0).await;
+        store.commit_to(1).await;
 
         assert!(receiver1.now_or_never().is_some());
         assert!(receiver2.now_or_never().is_none());
@@ -789,9 +800,9 @@ mod tests {
 
         store.append(67, Payload(Vec::new()));
         store.append(67, Payload(Vec::new()));
-        store.commit_to(1).await;
+        store.commit_to(2).await;
 
-        let receiver = store.add_listener(0);
+        let receiver = store.add_listener(1);
         assert!(receiver.now_or_never().is_some());
     }
 
@@ -815,8 +826,8 @@ mod tests {
     async fn test_snapshot() {
         let fixture = Fixture::new().await;
         let mut store = fixture.make_store().await;
-        assert_eq!(store.get_latest_snapshot().last.term, -1);
-        assert_eq!(store.get_latest_snapshot().last.index, -1);
+        assert_eq!(store.get_latest_snapshot().last.term, 0);
+        assert_eq!(store.get_latest_snapshot().last.index, 0);
 
         let cluster_config = make_cluster_config();
         let snap = LogSnapshot {
@@ -841,8 +852,8 @@ mod tests {
     async fn test_install_snapshot_resolves_listeners() {
         let fixture = Fixture::new().await;
         let mut store = fixture.make_store().await;
-        assert_eq!(store.get_latest_snapshot().last.term, -1);
-        assert_eq!(store.get_latest_snapshot().last.index, -1);
+        assert_eq!(store.get_latest_snapshot().last.term, 0);
+        assert_eq!(store.get_latest_snapshot().last.index, 0);
 
         // Add a listener for a commit that will never go through here.
         let listener = store.add_listener(14);
@@ -890,9 +901,9 @@ mod tests {
 
         store
             .append_all(&vec![
-                payload_entry(12, 0),
                 payload_entry(12, 1),
                 payload_entry(12, 2),
+                payload_entry(12, 3),
             ])
             .await;
         assert!(store.get_config_info().latest_appended.is_none());
@@ -900,9 +911,9 @@ mod tests {
         let voters = 7;
         store
             .append_all(&vec![
-                payload_entry(12, 3),
-                config_entry(12, 4, voters),
-                payload_entry(12, 5),
+                payload_entry(12, 4),
+                config_entry(12, 5, voters),
+                payload_entry(12, 6),
             ])
             .await;
         assert!(store.get_config_info().latest_appended.is_some());
@@ -920,9 +931,9 @@ mod tests {
         let voters = 5;
         store
             .append_all(&vec![
-                config_entry(12, 6, 3),
                 config_entry(12, 7, 3),
-                config_entry(12, 8, voters),
+                config_entry(12, 8, 3),
+                config_entry(12, 9, voters),
             ])
             .await;
         assert!(store.get_config_info().latest_appended.is_some());
@@ -938,7 +949,7 @@ mod tests {
         }
         assert!(!store.get_config_info().committed);
 
-        store.commit_to(8).await;
+        store.commit_to(9).await;
         assert!(store.get_config_info().committed);
     }
 
@@ -1018,18 +1029,18 @@ mod tests {
             let mut store = fixture.make_store().await;
             store
                 .append_all(&[
-                    payload_entry(12, 0),
                     payload_entry(12, 1),
                     payload_entry(12, 2),
+                    payload_entry(12, 3),
                 ])
                 .await;
-            assert_eq!(2, store.last_known_log_entry_id().index);
+            assert_eq!(3, store.last_known_log_entry_id().index);
         }
 
         // Now create another store backed by the same directory and check we can load contents.
         {
             let store = fixture.make_store().await;
-            assert_eq!(2, store.last_known_log_entry_id().index);
+            assert_eq!(3, store.last_known_log_entry_id().index);
         }
     }
 
@@ -1064,13 +1075,17 @@ mod tests {
 
         {
             let mut store = fixture.make_store().await;
-            store.restore_persisted().await.expect("restore");
-            let entries = store.log.entries().clone();
 
-            // Only the last two entries should remain.
-            assert_eq!(entries.len(), 2);
-            assert_eq!(entries[0].id.unwrap().index, 12);
-            assert_eq!(entries[1].id.unwrap().index, 13);
+            panic!(
+                "cant restore in place, need to create a new store from the same persistence settings to test this"
+            )
+            // store.restore_persisted().await.expect("restore");
+            // let entries = store.log.entries().clone();
+            //
+            // // Only the last two entries should remain.
+            // assert_eq!(entries.len(), 2);
+            // assert_eq!(entries[0].id.unwrap().index, 12);
+            // assert_eq!(entries[1].id.unwrap().index, 13);
         }
     }
 

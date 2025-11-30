@@ -1028,18 +1028,29 @@ impl Raft for RaftImpl {
         let next_term = term + 1;
         state.reset_follower_timer(self.state.clone(), next_term);
 
-        // Make sure we have the previous log index sent. Note that COMPACTED
-        // can happen whenever we have no entries (e.g.,initially or just after
-        // a snapshot install).
-        let previous = &request.previous.ok_or(RaftError::missing("previous"))?;
-        let next_index = state.store.next_index();
-        if previous.index >= next_index {
-            // Let the leader know that this entry is too far in the future, so
-            // it can try again from an earlier index.
+        // Make sure we have the previous log index sent.
+        //
+        // This can be false in two cases:
+        // 1) The leader's "previous" is too far in the future, i.e., the index is larger
+        //    than the next index we expect to append to our log.
+        // 2) The leader's "previous" is too far in the past, i.e., the entry has been
+        //    compacted into our snapshot, and is no longer present in our log.
+        //
+        // Right now, we only handle case (1) below.
+        let leader_previous = &request.previous.ok_or(RaftError::missing("previous"))?;
+        let expected_next_index = state.store.next_index();
+
+        // The Raft paper says to return false if we can't check the exact (term, index)
+        // match of the leader's "previous", but we can't do that for case (2).
+        let conflict = state.store.conflict(leader_previous);
+
+        // Either way, we inform the leader that we were unable to append, and the leader will
+        // try again with an earlier "previous", which will hopefully match.
+        if conflict || leader_previous.index >= expected_next_index {
             return Ok(Response::new(AppendResponse {
                 term,
                 success: false,
-                next: next_index,
+                next: expected_next_index,
             }));
         }
 
@@ -1408,11 +1419,11 @@ mod tests {
         let append_request = AppendRequest {
             term: 12,
             leader: Some(leader.clone()),
-            previous: Some(entry_id(-1, -1)),
+            previous: Some(entry_id(0, 0)),
             entries: vec![
-                entry(entry_id(8, 0), Vec::new()),
                 entry(entry_id(8, 1), Vec::new()),
                 entry(entry_id(8, 2), Vec::new()),
+                entry(entry_id(8, 3), Vec::new()),
             ],
             committed: 0,
         };
@@ -1432,16 +1443,16 @@ mod tests {
             let state = raft_state.lock().await;
             assert_eq!(state.current_leader(), Some(leader.clone()));
             assert_eq!(state.term(), 12);
-            assert!(!state.store.is_index_compacted(0)); // Not compacted
-            assert_eq!(state.store.next_index(), 3);
+            assert!(!state.store.is_index_compacted(1)); // Not compacted
+            assert_eq!(state.store.next_index(), 4);
         }
 
         // Run a compaction, should have no effect
         {
             let mut state = raft_state.lock().await;
             state.store.try_compact().await;
-            assert!(!state.store.is_index_compacted(0)); // Not compacted
-            assert_eq!(state.store.next_index(), 3);
+            assert!(!state.store.is_index_compacted(1)); // Not compacted
+            assert_eq!(state.store.next_index(), 4);
         }
 
         // Now send an append request with a payload large enough to trigger compaction.
@@ -1450,14 +1461,14 @@ mod tests {
         let append_request_2 = AppendRequest {
             term: 12,
             leader: Some(leader.clone()),
-            previous: Some(entry_id(8, 2)),
+            previous: Some(entry_id(8, 3)),
             entries: vec![entry(
-                entry_id(8, 3),
+                entry_id(8, 4),
                 vec![0; 2 * compaction_bytes as usize],
             )],
             // This tells the follower that the entries are committed (only committed
             // entries are eligible for compaction).
-            committed: 3,
+            committed: 4,
         };
 
         let append_response_2 = client
@@ -1471,16 +1482,16 @@ mod tests {
         assert!(append_response_2.success);
         {
             let state = raft_state.lock().await;
-            assert!(!state.store.is_index_compacted(0)); // Not compacted
-            assert_eq!(state.store.next_index(), 4); // New entry incorporated
+            assert!(!state.store.is_index_compacted(1)); // Not compacted
+            assert_eq!(state.store.next_index(), 5); // New entry incorporated
         }
 
         // Run a compaction, this one should actually compact things now.
         {
             let mut state = raft_state.lock().await;
             state.store.try_compact().await;
-            assert!(state.store.is_index_compacted(0)); // Compacted
-            assert_eq!(state.store.get_latest_snapshot().last.index, 3)
+            assert!(state.store.is_index_compacted(1)); // Compacted
+            assert_eq!(state.store.get_latest_snapshot().last.index, 4)
         }
     }
 

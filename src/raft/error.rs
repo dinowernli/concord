@@ -30,6 +30,9 @@ pub enum RaftError {
     #[error("Internal error: {0}")]
     Internal(String),
 
+    #[error("Non-contiguous log entries supplied. Expected index {expected}, got {actual}")]
+    NonContiguousLog { expected: i64, actual: i64 },
+
     #[error("Stale term state")]
     StaleState,
 }
