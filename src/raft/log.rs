@@ -1,3 +1,4 @@
+use crate::raft::error::{RaftError, RaftResult};
 use crate::raft::raft_common_proto::entry::Data;
 use crate::raft::raft_common_proto::entry::Data::{Config, Payload};
 use crate::raft::raft_common_proto::{Entry, EntryId};
@@ -15,30 +16,45 @@ pub struct LogSlice {
 }
 
 impl LogSlice {
+    // Returns a new instance with the given entries. The "previous_id" parameter
+    // holds the id of the last element in the log *not present* in this slice,
+    // i.e., the entry immediately before this slice starts.
+    pub fn new(previous_id: EntryId, entries: Vec<Entry>) -> RaftResult<Self> {
+        // Verify that the entries are contiguous.
+        let mut next_index = previous_id.index + 1;
+        let mut total_size_bytes = 0;
+        for entry in &entries {
+            let id = match entry.id.as_ref() {
+                Some(id) => id,
+                None => {
+                    return Err(RaftError::Internal(
+                        "Log entry found with no ID present".to_string(),
+                    ));
+                }
+            };
+            if id.index != next_index {
+                return Err(RaftError::NonContiguousLog {
+                    expected: next_index,
+                    actual: id.index,
+                });
+            }
+            total_size_bytes += size_bytes(entry);
+            next_index += 1;
+        }
+
+        Ok(LogSlice {
+            entries,
+            size_bytes: total_size_bytes,
+            previous_id,
+        })
+    }
+
     // Returns a new instance with no entries, starting at some position in
     // the middle of the log. The "previous_id" parameter holds the id of
     // the last element in the log *not present* in this slice, i.e., the entry
     // immediately before this slice starts.
-    pub fn new(previous_id: EntryId) -> Self {
-        LogSlice {
-            entries: Vec::new(),
-            size_bytes: 0,
-            previous_id,
-        }
-    }
-
-    // Returns a new instance with no entries, representing the *beginning* of
-    // the log, i.e., the next expected entry has index 0.
-    pub fn initial() -> Self {
-        Self::new(EntryId {
-            term: -1,
-            index: -1,
-        })
-    }
-
-    // Returns a reference to all entries present in this slice.
-    pub fn entries(&self) -> &Vec<Entry> {
-        &self.entries
+    pub fn new_empty(previous_id: EntryId) -> Self {
+        Self::new(previous_id, Vec::new()).unwrap()
     }
 
     // Adds a new entry to the end of the slice. Returns the id of the
@@ -103,7 +119,7 @@ impl LogSlice {
         }
 
         let &entry_id = &self.entries[idx].id.as_ref().expect("id");
-        entry_id.index == query.index && entry_id.term == query.term
+        entry_id == query
     }
 
     // Returns true if the supplied index lies before the range of entries present
@@ -145,7 +161,6 @@ impl LogSlice {
         for entry in entries {
             let len_bytes = size_bytes(&entry);
             let index = entry.id.as_ref().expect("id").index;
-
             if index == self.next_index() {
                 self.entries.push(entry.clone());
                 self.size_bytes += len_bytes;
@@ -173,6 +188,11 @@ impl LogSlice {
         clean_append
     }
 
+    // Returns a reference to all entries present in this slice.
+    pub fn entries(&self) -> &Vec<Entry> {
+        &self.entries
+    }
+
     // Returns the total size in bytes of all stored payloads. This is an
     // approximation of the total memory occupied by this instance. Note that
     // the size of the entry metadata and other meta structures are not
@@ -198,6 +218,25 @@ impl LogSlice {
             result.push(value.clone());
         }
         result
+    }
+
+    // Returns true if the supplied entry ID represents a conflict, i.e., if we
+    // have an entry with the supplied index, and a different term.
+    pub fn conflict(&self, id: &EntryId) -> bool {
+        let idx = id.index;
+
+        // Before our slice, no conflict to report.
+        if idx < self.previous_id.index {
+            return false;
+        }
+
+        // After the last entry we have, also no conflict to report.
+        if idx >= self.next_index() {
+            return false;
+        }
+
+        // Remaining case is that it's within our range. Resolve and check the term.
+        self.id_at(idx).term != id.term
     }
 
     // Returns the entry id for the entry at the supplied index. Must only be
@@ -286,22 +325,38 @@ fn size_bytes(entry: &Entry) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::error::RaftError;
     use crate::raft::raft_common_proto::ClusterConfig;
 
     #[test]
     fn test_initial() {
-        let l = LogSlice::initial();
-        assert!(!l.contains(&entry_id(-1, -1)));
+        let l = create_initial_slice();
+        assert!(!l.contains(&entry_id(0, 0)));
 
-        let after = l.get_entries_after(&entry_id(-1, -1));
+        let after = l.get_entries_after(&entry_id(0, 0));
         assert!(after.is_empty());
-        assert_eq!(0, l.next_index());
+        assert_eq!(1, l.next_index());
+    }
+
+    #[test]
+    fn test_new_returns_error_on_non_contiguous_entries() {
+        let previous = entry_id(1, 4);
+        let entries = vec![entry(1, 5, 1), entry(1, 7, 1)];
+        let result = LogSlice::new(previous, entries);
+        assert!(result.is_err());
+        match result.err().unwrap() {
+            RaftError::NonContiguousLog { expected, actual } => {
+                assert_eq!(expected, 6);
+                assert_eq!(actual, 7);
+            }
+            _ => panic!("Unexpected error type"),
+        }
     }
 
     #[test]
     fn test_empty() {
         let previous = entry_id(65 /* term */, 17 /* index */);
-        let l = LogSlice::new(previous.clone());
+        let l = LogSlice::new_empty(previous.clone());
 
         assert_eq!(l.size_bytes(), 0);
         assert_eq!(l.next_index(), 18);
@@ -310,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_size_bytes() {
-        let mut l = LogSlice::initial();
+        let mut l = create_initial_slice();
         assert_eq!(0, l.size_bytes());
 
         l.append(13 /* term */, payload_of_size(25));
@@ -322,57 +377,83 @@ mod tests {
 
     #[test]
     fn test_single_entry() {
-        let mut l = LogSlice::initial();
+        let mut l = create_initial_slice();
         l.append(
             72, /* term */
             Payload("some payload".as_bytes().to_vec()),
         );
 
-        let expected_id = entry_id(72 /* term */, 0 /* index */);
+        let expected_id = entry_id(72 /* term */, 1 /* index */);
 
-        assert_eq!(&l.id_at(0), &expected_id);
-        assert_eq!(1, l.next_index());
+        assert_eq!(&l.id_at(1), &expected_id);
+        assert_eq!(2, l.next_index());
     }
 
     #[test]
     fn test_contains() {
-        let l = create_default_slice();
+        let l = create_default_slice(); // Contains entries with indices 1 through 6. Previous is (0,0).
 
-        // Special sentinel case.
-        assert!(!l.contains(&entry_id(-1, -1)));
+        // Case 1: Entry is equal to "previous".
+        // The log slice does not "contain" the previous entry, but starts *after* it.
+        assert!(!l.contains(&entry_id(0, 0)),);
 
-        // Check a few existing entries.
-        assert!(l.contains(&entry_id(73, 2)));
-        assert!(l.contains(&entry_id(73, 3)));
+        // Case 2: Absent because index is too low (before previous_id).
+        assert!(!l.contains(&entry_id(0, -5)),);
 
-        // Check the case where only index matches.
-        assert!(!l.contains(&entry_id(999, 2)));
-        assert!(!l.contains(&entry_id(999, 3)));
+        // Case 3: Present and matching.
+        assert!(l.contains(&entry_id(73, 3)),);
+        assert!(l.contains(&entry_id(73, 4)),);
 
-        // First index not present.
-        let next = l.next_index();
-        assert_eq!(6, next);
-        assert!(!l.contains(&entry_id(95, next)));
-        assert!(!l.contains(&entry_id(12, next)));
+        // Case 4: Absent because index is too high (beyond next_index).
+        let next = l.next_index(); // next_index is 7
+        assert_eq!(7, next);
+        assert!(!l.contains(&entry_id(95, next)),);
+        assert!(!l.contains(&entry_id(12, next + 5)),);
+
+        // Case 5: Entry present, but term doesn't match. `contains` expects both term and index to match.
+        assert!(!l.contains(&entry_id(1, 1)),);
+    }
+
+    #[test]
+    fn test_conflict() {
+        let l = create_default_slice(); // Contains entries with indices 1 through 6. Previous is (0,0).
+
+        // Case 1: Entry is equal to "previous_id.index".
+        assert!(!l.conflict(&entry_id(0, 0)),);
+
+        // Case 2: Absent because index is too low (before previous_id.index).
+        assert!(!l.conflict(&entry_id(0, -5)),);
+
+        // Case 3: Absent because index is too high (at or beyond next_index).
+        let next = l.next_index(); // next_index is 7
+        assert_eq!(7, next);
+        assert!(!l.conflict(&entry_id(95, next)),);
+        assert!(!l.conflict(&entry_id(12, next + 5)),);
+
+        // Case 4: No conflict, present and matching.
+        assert!(!l.conflict(&entry_id(71, 1)),);
+
+        // Case 5: Conflict, present with different term.
+        assert!(l.conflict(&entry_id(70, 1)),);
     }
 
     #[test]
     fn test_id_at_valid() {
         let l = create_default_slice();
 
-        let i = l.id_at(0);
-        assert_eq!(0, i.index);
+        let i = l.id_at(1);
+        assert_eq!(1, i.index);
         assert_eq!(71, i.term);
 
-        let j = l.id_at(4);
-        assert_eq!(4, j.index);
+        let j = l.id_at(5);
+        assert_eq!(5, j.index);
         assert_eq!(73, j.term);
     }
 
     #[test]
     #[should_panic]
     fn test_entry_at_previous() {
-        let l = LogSlice::new(entry_id(75 /* term */, 17 /* index */));
+        let l = LogSlice::new_empty(entry_id(75 /* term */, 17 /* index */));
 
         // Even though the id is known, the entry is not present.
         l.entry_at(17);
@@ -381,14 +462,14 @@ mod tests {
     #[test]
     fn test_id_at_previous() {
         let previous = entry_id(75 /* term */, 17 /* index */);
-        let l = LogSlice::new(previous.clone());
+        let l = LogSlice::new_empty(previous.clone());
         assert_eq!(l.id_at(17), previous);
     }
 
     #[test]
     fn test_id_at_initial() {
-        let l = LogSlice::initial();
-        assert_eq!(l.id_at(-1), entry_id(-1, -1));
+        let l = create_initial_slice();
+        assert_eq!(l.id_at(0), entry_id(0, 0));
     }
 
     #[test]
@@ -409,8 +490,8 @@ mod tests {
         assert!(!l.is_up_to_date(&entry_id(69, 12)));
 
         // Should be up to date.
-        assert!(l.is_up_to_date(&entry_id(74, 5)));
-        assert!(l.is_up_to_date(&entry_id(75, 5)));
+        assert!(l.is_up_to_date(&entry_id(74, 6)));
+        assert!(l.is_up_to_date(&entry_id(75, 6)));
         assert!(l.is_up_to_date(&entry_id(75, 17)));
     }
 
@@ -419,35 +500,35 @@ mod tests {
         let mut l = create_default_slice();
 
         assert_eq!(l.size_bytes(), 6);
-        assert_eq!(l.next_index(), 6);
+        assert_eq!(l.next_index(), 7);
 
-        assert!(!l.is_index_compacted(0));
         assert!(!l.is_index_compacted(1));
         assert!(!l.is_index_compacted(2));
         assert!(!l.is_index_compacted(3));
         assert!(!l.is_index_compacted(4));
         assert!(!l.is_index_compacted(5));
+        assert!(!l.is_index_compacted(6));
 
         // Prune up to index 3, inclusive.
-        l.prune_until(&entry_id(73, 3));
-        assert_eq!(l.previous_id, entry_id(73, 3));
+        l.prune_until(&entry_id(73, 4));
+        assert_eq!(l.previous_id, entry_id(73, 4));
 
         assert_eq!(l.size_bytes(), 2);
-        assert_eq!(l.next_index(), 6);
+        assert_eq!(l.next_index(), 7);
 
-        assert!(l.is_index_compacted(0));
         assert!(l.is_index_compacted(1));
         assert!(l.is_index_compacted(2));
         assert!(l.is_index_compacted(3));
-        assert!(!l.is_index_compacted(4));
+        assert!(l.is_index_compacted(4));
         assert!(!l.is_index_compacted(5));
+        assert!(!l.is_index_compacted(6));
     }
 
     #[test]
     fn test_prune_until_all_entries() {
         {
             let mut l = create_default_slice();
-            assert_eq!(l.next_index(), 6);
+            assert_eq!(l.next_index(), 7);
             assert_eq!(l.size_bytes(), 6);
 
             l.prune_until(&entry_id(74, 5));
@@ -457,9 +538,9 @@ mod tests {
 
         {
             let original_previous = entry_id(12, 189);
-            let mut l2 = LogSlice::new(original_previous.clone());
-            l2.append(12 /* term */, Data::Payload(Vec::new()));
-            l2.append(13 /* term */, Data::Payload(Vec::new()));
+            let mut l2 = LogSlice::new_empty(original_previous.clone());
+            l2.append(12 /* term */, Payload(Vec::new()));
+            l2.append(13 /* term */, Payload(Vec::new()));
             assert_eq!(l2.next_index(), 192);
 
             l2.prune_until(&original_previous);
@@ -471,15 +552,15 @@ mod tests {
     // stopping entry is not present at all.
     #[test]
     fn test_prune_until_no_match() {
-        let mut l = LogSlice::new(EntryId {
+        let mut l = LogSlice::new_empty(EntryId {
             term: 22,
             index: 91,
         });
         assert_eq!(l.next_index(), 92);
 
-        l.append(26 /* term */, Data::Payload(Vec::new()));
-        l.append(26 /* term */, Data::Payload(Vec::new()));
-        l.append(26 /* term */, Data::Payload(Vec::new()));
+        l.append(26 /* term */, Payload(Vec::new()));
+        l.append(26 /* term */, Payload(Vec::new()));
+        l.append(26 /* term */, Payload(Vec::new()));
         assert_eq!(l.next_index(), 95);
 
         // Prune until an entry with an index we know about, but the wrong term. Should
@@ -505,23 +586,23 @@ mod tests {
         let mut l = create_default_slice();
         let id = l.append(74, Payload("bad term".as_bytes().to_vec()));
         assert_eq!(74, id.term);
-        assert_eq!(6, id.index);
+        assert_eq!(7, id.index);
     }
 
     #[test]
     fn test_append_all_from_initial() {
-        let mut l = LogSlice::initial();
+        let mut l = create_initial_slice();
         l.append_all(&[
-            entry(75, 0 /* index */, 10 /* size */),
             entry(75, 1 /* index */, 10 /* size */),
+            entry(75, 2 /* index */, 10 /* size */),
         ]);
-        assert_eq!(l.id_at(0), entry_id(75, 0));
         assert_eq!(l.id_at(1), entry_id(75, 1));
+        assert_eq!(l.id_at(2), entry_id(75, 2));
     }
 
     #[test]
     fn test_append_all_from_empty() {
-        let mut l = LogSlice::new(entry_id(75, 17 /* index */));
+        let mut l = LogSlice::new_empty(entry_id(75, 17 /* index */));
         l.append_all(&[
             entry(75, 18 /* index */, 10 /* size */),
             entry(75, 19 /* index */, 10 /* size */),
@@ -536,25 +617,25 @@ mod tests {
         let mut l = create_default_slice();
 
         // Validate the initial state.
-        assert_eq!(l.id_at(0).index, 0);
-        assert_eq!(l.id_at(5).index, 5);
-        assert_eq!(l.next_index(), 6);
+        assert_eq!(l.id_at(1).index, 1);
+        assert_eq!(l.id_at(6).index, 6);
+        assert_eq!(l.next_index(), 7);
         let initial_size_bytes = 6;
         assert_eq!(l.size_bytes(), initial_size_bytes);
 
-        // This should replace entries 3 and 4, and remove entry 5
+        // This should replace entries 4 and 5, and remove entry 6
         l.append_all(&[
-            entry(75, 3 /* index */, 10 /* size */),
             entry(75, 4 /* index */, 10 /* size */),
+            entry(75, 5 /* index */, 10 /* size */),
         ]);
-        assert_eq!(l.id_at(0).index, 0);
-        assert_eq!(l.next_index(), 5);
+        assert_eq!(l.id_at(1).index, 1);
+        assert_eq!(l.next_index(), 6);
         let size_bytes = initial_size_bytes - 3 + 20;
         assert_eq!(l.size_bytes(), size_bytes);
 
-        // This should just append a new entry 5
-        l.append_all(&[entry(76, 5 /* index */, 10 /* size */)]);
-        assert_eq!(l.next_index(), 6);
+        // This should just append a new entry 6
+        l.append_all(&[entry(76, 6 /* index */, 10 /* size */)]);
+        assert_eq!(l.next_index(), 7);
         let new_size_bytes = size_bytes + 10;
         assert_eq!(l.size_bytes(), new_size_bytes);
     }
@@ -569,7 +650,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_append_far_future_index_panics() {
-        let mut l = LogSlice::new(entry_id(75, 10));
+        let mut l = LogSlice::new_empty(entry_id(75, 10));
 
         // Make an append with indexes that are far in the future.
         l.append_all(&[
@@ -580,10 +661,10 @@ mod tests {
 
     #[test]
     fn test_last_known_id() {
-        let initial = LogSlice::initial();
-        assert_eq!(initial.last_known_id(), &entry_id(-1, -1));
+        let initial = create_initial_slice();
+        assert_eq!(initial.last_known_id(), &entry_id(0, 0));
 
-        let other = LogSlice::new(entry_id(6, 8));
+        let other = LogSlice::new_empty(entry_id(6, 8));
         assert_eq!(other.last_known_id(), &entry_id(6, 8));
     }
 
@@ -604,7 +685,7 @@ mod tests {
     }
 
     fn create_default_slice() -> LogSlice {
-        let mut result = LogSlice::initial();
+        let mut result = create_initial_slice();
         result.append(71 /* term */, payload_of_size(1));
         result.append(72 /* term */, payload_of_size(1));
         result.append(73 /* term */, payload_of_size(1));
@@ -612,6 +693,10 @@ mod tests {
         result.append(73 /* term */, payload_of_size(1));
         result.append(74 /* term */, payload_of_size(1));
         result
+    }
+
+    fn create_initial_slice() -> LogSlice {
+        LogSlice::new_empty(EntryId { term: 0, index: 0 })
     }
 
     fn payload_of_size(size_bytes: i64) -> Data {
