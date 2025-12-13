@@ -27,16 +27,16 @@ use crate::raft::cluster::{Cluster, QuorumResult};
 use crate::raft::cluster::{RaftClientType, key};
 use crate::raft::consensus::CommitError::{Internal, NotLeader};
 use crate::raft::consensus::RaftRole::Leader;
-use crate::raft::diagnostics;
 use crate::raft::error::{RaftError, RaftResult};
 use crate::raft::failure_injection::FailureOptions;
+use crate::raft::persistence::{FilePersistenceOptions, PersistenceOptions};
 use crate::raft::raft_common_proto::entry::Data;
 use crate::raft::raft_common_proto::entry::Data::{Config, Payload};
 use crate::raft::raft_common_proto::{ClusterConfig, Server};
-use crate::raft::raft_service_proto;
 use crate::raft::raft_service_proto::raft_server::Raft;
 use crate::raft::raft_service_proto::{ChangeConfigRequest, ChangeConfigResponse};
 use crate::raft::store::{LogSnapshot, Store};
+use crate::raft::{diagnostics, raft_service_proto};
 
 const RPC_TIMEOUT_MS: u64 = 100;
 
@@ -60,28 +60,58 @@ pub struct Options {
     // entries stored locally.
     compaction_threshold_bytes: i64,
 
-    // How frequently to check whether or not a compaction is necessary.
+    // How frequently to check whether a compaction is necessary.
     compaction_check_periods_ms: i64,
+
+    // A directory on disk to use for persisting state.
+    persistence_options: PersistenceOptions,
 }
 
 impl Options {
-    pub fn default() -> Self {
+    pub fn new(persistence_directory: &str, wipe_persistence: bool) -> Self {
         Options {
             follower_timeout_ms: 200,
             candidate_timeouts_ms: 300,
             leader_replicate_ms: 50,
             compaction_threshold_bytes: 10 * 1000 * 1000,
             compaction_check_periods_ms: 5000,
+            persistence_options: PersistenceOptions::FilePersistence(FilePersistenceOptions {
+                directory: persistence_directory.to_string(),
+                wipe: wipe_persistence,
+            }),
+        }
+    }
+
+    pub fn new_without_persistence_for_testing() -> Self {
+        Options {
+            follower_timeout_ms: 200,
+            candidate_timeouts_ms: 300,
+            leader_replicate_ms: 50,
+            compaction_threshold_bytes: 10 * 1000 * 1000,
+            compaction_check_periods_ms: 5000,
+            persistence_options: PersistenceOptions::NoPersistenceForTesting,
         }
     }
 
     pub fn with_compaction(self: Self, threshold_bytes: i64, check_period_ms: i64) -> Self {
         Self {
-            follower_timeout_ms: self.follower_timeout_ms,
-            candidate_timeouts_ms: self.candidate_timeouts_ms,
-            leader_replicate_ms: self.leader_replicate_ms,
             compaction_threshold_bytes: threshold_bytes,
             compaction_check_periods_ms: check_period_ms,
+            ..self
+        }
+    }
+
+    pub fn with_persistence(
+        self: Self,
+        persistence_directory: &str,
+        wipe_persistence: bool,
+    ) -> Self {
+        Self {
+            persistence_options: PersistenceOptions::FilePersistence(FilePersistenceOptions {
+                directory: persistence_directory.to_string(),
+                wipe: wipe_persistence,
+            }),
+            ..self
         }
     }
 }
@@ -102,31 +132,22 @@ impl RaftImpl {
         options: Options,
         failures: Arc<Mutex<FailureOptions>>,
     ) -> RaftResult<RaftImpl> {
-        let snapshot_bytes = state_machine.lock().await.create_snapshot();
-
         // A config which gives us (once applied) all the initial members as voters.
-        let config = ClusterConfig {
+        let initial_cluster_config = ClusterConfig {
             voters: all.clone().to_vec(),
             voters_next: all.clone().to_vec(),
         };
 
-        let snapshot = LogSnapshot {
-            data: snapshot_bytes,
-            last: EntryId { term: 0, index: 0 },
-            config,
-        };
-
-        // No entries to begin with.
-        let entries = vec![];
-
+        let persistence_options = options.persistence_options.clone();
         let store = Store::new(
+            persistence_options,
+            initial_cluster_config,
             state_machine,
-            snapshot,
-            entries,
             diagnostics.clone(),
             options.compaction_threshold_bytes,
             server.name.as_str(),
         )
+        .await
         .map_err(|e| RaftError::Initialization(format!("Failed to create store: {}", e)))?;
 
         let mut cluster =
@@ -136,7 +157,7 @@ impl RaftImpl {
         // TODO(dino): We probably want to just only support initializing with a cluster info.
         cluster.update(store.get_config_info());
 
-        Ok(RaftImpl {
+        let result = RaftImpl {
             address: server.clone(),
             state: Arc::new(Mutex::new(RaftState {
                 options,
@@ -148,7 +169,9 @@ impl RaftImpl {
                 followers: HashMap::new(),
                 timer_guard: None,
             })),
-        })
+        };
+
+        Ok(result)
     }
 
     pub async fn start(&self) {
@@ -1214,7 +1237,6 @@ fn add_jitter(lower: i64) -> u64 {
 mod tests {
     use crate::raft::cluster::testing::create_local_client_for_testing;
     use crate::raft::raft_common_proto::Entry;
-    use crate::raft::raft_common_proto::entry::Data;
     use crate::raft::raft_service_proto::raft_server::RaftServer;
     use crate::raft::testing::FakeStateMachine;
     use crate::testing::TestRpcServer;
@@ -1476,7 +1498,7 @@ mod tests {
     fn entry(id: EntryId, payload: Vec<u8>) -> Entry {
         Entry {
             id: Some(id),
-            data: Some(Data::Payload(payload)),
+            data: Some(Payload(payload)),
         }
     }
 
@@ -1495,7 +1517,7 @@ mod tests {
             Arc::new(Mutex::new(FailureOptions::no_failures())),
         )
         .await
-        .unwrap()
+        .expect("create_raft")
     }
 
     fn create_config_for_testing() -> Options {
@@ -1507,6 +1529,7 @@ mod tests {
             leader_replicate_ms: 100000000,
             compaction_threshold_bytes: 1000,
             compaction_check_periods_ms: 10000000000,
+            persistence_options: PersistenceOptions::NoPersistenceForTesting,
         }
     }
 

@@ -145,12 +145,18 @@ impl LogSlice {
     // entries are replaced. Any existing entries with indexes higher than the
     // supplied entries are pruned.
     //
+    // If this returns true, the operation was performed as a "clean append",
+    // i.e., we appended every supplied entry to the end of the slice, and
+    // removed no entries.
+    //
     // TODO(dino): this is super dangerous if not called from "store" because
     // store keeps track of the latest config entry. Once our call to
     // "latest_config_entry" becomes cheap, store won't have to cache it anymore
     // and this becomes a lot safer.
-    pub fn append_all(&mut self, entries: &[Entry]) {
+    pub fn append_all(&mut self, entries: &[Entry]) -> bool {
         assert!(!entries.is_empty(), "append_all called with empty entries");
+
+        let mut clean_append = true;
 
         for entry in entries {
             let len_bytes = size_bytes(&entry);
@@ -163,6 +169,9 @@ impl LogSlice {
                 self.size_bytes -= size_bytes(&self.entries[local_index]);
                 self.entries[local_index] = entry.clone();
                 self.size_bytes += len_bytes;
+
+                // If we had to replace an entry, this wasn't a clean append.
+                clean_append = false;
             }
         }
 
@@ -171,7 +180,17 @@ impl LogSlice {
         let local_index = self.local_index(last.index);
         for entry in self.entries.drain((local_index + 1)..) {
             self.size_bytes -= size_bytes(&entry);
+
+            // If we had to remove trailing entries, this wasn't a clean append.
+            clean_append = false;
         }
+
+        clean_append
+    }
+
+    // Returns a reference to all entries present in this slice.
+    pub fn entries(&self) -> &Vec<Entry> {
+        &self.entries
     }
 
     // Returns the total size in bytes of all stored payloads. This is an

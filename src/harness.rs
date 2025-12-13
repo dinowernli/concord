@@ -5,7 +5,10 @@ use axum_tonic::NestTonic;
 use axum_tonic::RestGrpcService;
 use futures::Future;
 use futures::future::join_all;
+use std::env;
 use std::error::Error;
+use std::fs::remove_dir_all;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +36,7 @@ pub struct Harness {
     instances: Vec<Instance>,
     diagnostics: Arc<Mutex<Diagnostics>>,
     failures: Arc<Mutex<FailureOptions>>,
+    persistence_dir: String,
 }
 
 // Used to capture the intermediate state while building a harness. This is necessary
@@ -51,6 +55,7 @@ impl HarnessBuilder {
     // of the serving process for all instances managed by the harness.
     pub async fn build(
         self,
+        wipe_persistence: bool,
     ) -> Result<(Harness, Pin<Box<dyn Future<Output = ()> + Send>>), Box<dyn Error>> {
         let diag = Arc::new(Mutex::new(Diagnostics::new()));
         let failures = Arc::new(Mutex::new(self.failure.clone()));
@@ -60,14 +65,29 @@ impl HarnessBuilder {
         let mut instances = Vec::new();
 
         let raft_options = self.options;
+
+        // Persist at something like /tmp/concord/<cluster>
+        let cluster_dir: PathBuf = env::temp_dir()
+            .as_path()
+            .join("concord")
+            .join(&self.cluster_name);
+
         for bound in self.bound {
             let (address, listener) = (bound.server, bound.listener);
+
+            // Use <cluster-dir>/<server-name> for persistence
+            let instance_dir = cluster_dir.clone().join(&address.name);
+
+            let options = raft_options
+                .clone()
+                .with_persistence(instance_dir.to_str().unwrap().as_ref(), wipe_persistence);
+
             let (instance, future) = Instance::new(
                 &address,
                 listener,
                 &all,
                 diag.clone(),
-                raft_options.clone(),
+                options,
                 failures.clone(),
             )
             .await?;
@@ -85,6 +105,7 @@ impl HarnessBuilder {
             instances,
             diagnostics: diag,
             failures,
+            persistence_dir: cluster_dir.into_os_string().into_string().unwrap(),
         };
         Ok((harness, future))
     }
@@ -123,7 +144,7 @@ impl Harness {
         server_names: &[&str],
     ) -> Result<HarnessBuilder, Box<dyn Error>> {
         let mut bound = Vec::new();
-        for name in server_names {
+        for &name in server_names {
             let listener = TcpListener::bind("[::1]:0").await?;
             let port = listener.local_addr()?.port();
             let server = server("::1", port as i32, name);
@@ -133,7 +154,10 @@ impl Harness {
             cluster_name: cluster_name.to_string(),
             bound,
             failure: FailureOptions::no_failures(),
-            options: Options::default(),
+
+            // TODO - DONOTMERGE - figure out a better way to only allow in testing and reconcile
+            // with the fact that main() needs to support no persistence
+            options: Options::new_without_persistence_for_testing(),
         })
     }
 
@@ -210,6 +234,13 @@ impl Harness {
         for instance in &self.instances {
             instance.stop().await;
         }
+    }
+
+    // Removes the directory in which the cluster's state lives (and all children).
+    pub async fn wipe_persistence(&self) {
+        let dir = self.persistence_dir.clone();
+        assert!(!dir.is_empty());
+        remove_dir_all(dir).expect("remove_dir_all");
     }
 
     // Repeatedly makes KV requests until the supplied key has a value. Returns the result.

@@ -37,6 +37,11 @@ fn make_default_failure_options() -> FailureOptions {
     }
 }
 
+const CLUSTER_NAME: &str = "dev-cluster";
+
+// Simulate large values so that compaction occasionally kicks in.
+const VALUE_SIZE_BYES: i64 = 5 * 1000 * 100;
+
 #[derive(Debug, StructOpt, Copy, Clone)]
 struct Arguments {
     #[structopt(short = "p", long = "disable_preempt")]
@@ -50,6 +55,9 @@ struct Arguments {
 
     #[structopt(short = "r", long = "disable_reconfigure")]
     disable_reconfigure: bool,
+
+    #[structopt(short = "w", long = "wipe_persistence")]
+    wipe_persistence: bool,
 }
 
 // Starts a loop which periodically preempts the cluster leader, forcing the
@@ -132,10 +140,14 @@ async fn run_put_loop(
         return;
     }
 
+    let value = std::iter::repeat("X")
+        .take(VALUE_SIZE_BYES as usize)
+        .collect::<String>();
     let request = PutRequest {
         key: "foo".as_bytes().to_vec(),
-        value: "bar".as_bytes().to_vec(),
+        value: value.as_bytes().to_vec(),
     };
+
     let mut i = 0;
     loop {
         let body = async {
@@ -227,11 +239,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
     let arguments = Arc::new(Arguments::from_args());
 
-    let (harness, serving) = Harness::builder("dev-cluster", &["A", "B", "C", "D", "E"])
+    let (harness, serving) = Harness::builder(CLUSTER_NAME, &["A", "B", "C", "D", "E"])
         .await
         .expect("builder")
         .with_failure(make_default_failure_options())
-        .build()
+        .build(arguments.wipe_persistence)
         .await
         .expect("harness");
 
