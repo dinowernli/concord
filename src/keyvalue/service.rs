@@ -5,6 +5,7 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 use tracing::{debug, instrument, warn};
 
+use crate::context::{Context, RpcContextExt};
 use crate::keyvalue::keyvalue_proto;
 use crate::keyvalue::keyvalue_proto::key_value_server::KeyValue;
 use crate::keyvalue::keyvalue_proto::operation::Op;
@@ -39,9 +40,9 @@ impl KeyValueService {
         store: Arc<Mutex<dyn Store + Send>>,
     ) -> KeyValueService {
         KeyValueService {
-            name: name.into(),
+            name: name.to_string(),
             store,
-            raft: new_client(name.into(), raft_member),
+            raft: new_client(name, raft_member),
         }
     }
 
@@ -102,6 +103,7 @@ impl KeyValue for KeyValueService {
 
     #[instrument(fields(server=%self.name),skip(self,request))]
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
+        let ctx = request.ctx()?;
         let request = request.into_inner();
         debug!(?request, "handling request");
 
@@ -116,7 +118,7 @@ impl KeyValue for KeyValueService {
             KeyValueService::make_set_operation(&request.key.to_vec(), &request.value.to_vec());
         let serialized = op.encode_to_vec();
 
-        let commit = self.raft.commit(&serialized).await;
+        let commit = self.raft.commit(ctx, &serialized).await;
         let key_str = String::from_utf8_lossy(request.key.as_slice());
         match commit {
             Ok(id) => {
@@ -141,6 +143,17 @@ impl KeyValue for KeyValueService {
     }
 }
 
+#[async_trait]
+impl KeyValue for Arc<KeyValueService> {
+    async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        self.as_ref().get(request).await
+    }
+
+    async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
+        self.as_ref().put(request).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tonic::transport::Channel;
@@ -162,7 +175,7 @@ mod tests {
 
     #[async_trait]
     impl Client for FakeRaftClient {
-        async fn commit(&self, payload: &[u8]) -> Result<EntryId, Status> {
+        async fn commit(&self, _ctx: Context, payload: &[u8]) -> Result<EntryId, Status> {
             let copy = payload.to_vec();
             self.store
                 .lock()
@@ -172,11 +185,11 @@ mod tests {
             Ok(EntryId { term: 0, index: 0 })
         }
 
-        async fn preempt_leader(&self) -> Result<Server, Status> {
+        async fn preempt_leader(&self, _ctx: Context) -> Result<Server, Status> {
             unimplemented!();
         }
 
-        async fn change_config(&self, _members: Vec<Server>) -> Result<(), Status> {
+        async fn change_config(&self, _ctx: Context, _members: Vec<Server>) -> Result<(), Status> {
             unimplemented!();
         }
     }
@@ -185,7 +198,7 @@ mod tests {
     async fn test_get() {
         let service = create_service();
         let store = service.store.clone();
-        let server = TestRpcServer::run(KeyValueServer::new(service)).await;
+        let server = TestRpcServer::run(Context::new(), KeyValueServer::new(service)).await;
 
         store
             .lock()
@@ -213,7 +226,7 @@ mod tests {
     async fn test_put() {
         let service = create_service();
         let store = service.store.clone();
-        let server = TestRpcServer::run(KeyValueServer::new(service)).await;
+        let server = TestRpcServer::run(Context::new(), KeyValueServer::new(service)).await;
 
         let request = PutRequest {
             key: "foo".as_bytes().to_vec(),

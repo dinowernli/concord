@@ -97,6 +97,7 @@ impl Diagnostics {
         None
     }
 
+    // Returns information about the installed snapshots for the supplied server.
     pub fn get_snapshot_installs(&self, server_name: &str) -> Option<&BTreeMap<i64, SnapshotInfo>> {
         self.snapshot_installs.get(server_name)
     }

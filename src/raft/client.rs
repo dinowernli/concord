@@ -8,6 +8,7 @@ use tonic::Request;
 use tonic::transport::{Channel, Error};
 use tracing::debug;
 
+use crate::context::Context;
 use crate::raft::client::Outcome::{Failure, NewLeader, Success};
 use crate::raft::raft_common_proto::{EntryId, Server};
 use crate::raft::raft_service_proto::raft_client::RaftClient;
@@ -42,14 +43,14 @@ pub fn new_client(name: &str, member: &Server) -> Box<dyn Client + Sync + Send> 
 pub trait Client {
     // Adds the supplied payload as the next entry in the cluster's shared log.
     // Returns once the payload has been added (or the operation has failed).
-    async fn commit(&self, payload: &[u8]) -> Result<EntryId, tonic::Status>;
+    async fn commit(&self, ctx: Context, payload: &[u8]) -> Result<EntryId, tonic::Status>;
 
     // Asks the cluster leader to step down. Returns the address of
     // the leader which stepped down if successful.
-    async fn preempt_leader(&self) -> Result<Server, tonic::Status>;
+    async fn preempt_leader(&self, ctx: Context) -> Result<Server, tonic::Status>;
 
     // Modifies the cluster configuration with a new set of (voting) members.
-    async fn change_config(&self, members: Vec<Server>) -> Result<(), tonic::Status>;
+    async fn change_config(&self, ctx: Context, members: Vec<Server>) -> Result<(), tonic::Status>;
 }
 
 // The outcome of an individual operation sent to one server in the Raft cluster.
@@ -100,6 +101,7 @@ impl ClientImpl {
     // the operation failed entirely.
     async fn retry_helper<T, Fut>(
         &self,
+        ctx: Context,
         operation: impl Fn(Server) -> Fut,
     ) -> Result<T, tonic::Status>
     where
@@ -109,6 +111,9 @@ impl ClientImpl {
         let attempts = self.max_leader_follow_attempts;
 
         for _ in 0..attempts {
+            if ctx.is_done() {
+                return Err(tonic::Status::cancelled("context cancelled"));
+            }
             let outcome = operation(leader.clone()).await;
             let retry_wait_ms = match outcome {
                 Failure(status) => return Err(status),
@@ -132,20 +137,29 @@ impl ClientImpl {
     }
 
     // The body of an individual commit rpc sent to the (presumed) leader.
-    async fn commit_impl(leader: Server, payload: &[u8]) -> Outcome<EntryId> {
+    async fn commit_impl(ctx: Context, leader: Server, payload: &[u8]) -> Outcome<EntryId> {
         let mut request = Request::new(CommitRequest {
             payload: payload.to_vec(),
         });
         request.set_timeout(Duration::from_secs(3));
 
-        let client = ClientImpl::connect(&leader).await;
-        if let Err(status) = client {
-            return Failure(tonic::Status::internal(status.to_string()));
-        }
+        let result = ctx
+            .wrap(async move {
+                let client = ClientImpl::connect(&leader).await;
+                if let Err(status) = client {
+                    return Err(tonic::Status::internal(status.to_string()));
+                }
+                client.unwrap().commit(request).await
+            })
+            .await;
 
-        let result = client.unwrap().commit(request).await;
         match result {
-            Err(status) => return Failure(tonic::Status::internal(status.to_string())),
+            Err(crate::context::Error::ContextDone) => {
+                Failure(tonic::Status::cancelled("context cancelled"))
+            }
+            Err(crate::context::Error::Inner(status)) => {
+                Failure(tonic::Status::internal(status.to_string()))
+            }
             Ok(response) => {
                 let proto: CommitResponse = response.into_inner();
                 match Status::try_from(proto.status) {
@@ -158,18 +172,27 @@ impl ClientImpl {
     }
 
     // The body an individual step_down rpc to the (presumed) leader.
-    async fn preempt_leader_impl(leader: Server) -> Outcome<Server> {
+    async fn preempt_leader_impl(ctx: Context, leader: Server) -> Outcome<Server> {
         let mut request = Request::new(StepDownRequest {});
         request.set_timeout(Duration::from_millis(100));
 
-        let client = ClientImpl::connect(&leader).await;
-        if let Err(status) = client {
-            return Failure(tonic::Status::internal(status.to_string()));
-        }
+        let result = ctx
+            .wrap(async move {
+                let client = ClientImpl::connect(&leader).await;
+                if let Err(status) = client {
+                    return Err(tonic::Status::internal(status.to_string()));
+                }
+                client.unwrap().step_down(request).await
+            })
+            .await;
 
-        let result = client.unwrap().step_down(request).await;
         match result {
-            Err(status) => return Failure(tonic::Status::internal(status.to_string())),
+            Err(crate::context::Error::ContextDone) => {
+                Failure(tonic::Status::cancelled("context cancelled"))
+            }
+            Err(crate::context::Error::Inner(status)) => {
+                Failure(tonic::Status::internal(status.to_string()))
+            }
             Ok(response) => {
                 let proto: StepDownResponse = response.into_inner();
                 match Status::try_from(proto.status) {
@@ -181,20 +204,33 @@ impl ClientImpl {
         }
     }
 
-    async fn change_config_impl(leader: Server, members: &Vec<Server>) -> Outcome<()> {
+    async fn change_config_impl(
+        ctx: Context,
+        leader: Server,
+        members: &Vec<Server>,
+    ) -> Outcome<()> {
         let mut request = Request::new(ChangeConfigRequest {
             members: members.to_vec(),
         });
         request.set_timeout(Duration::from_millis(2000));
 
-        let client = ClientImpl::connect(&leader).await;
-        if let Err(status) = client {
-            return Failure(tonic::Status::internal(status.to_string()));
-        }
+        let result = ctx
+            .wrap(async move {
+                let client = ClientImpl::connect(&leader).await;
+                if let Err(status) = client {
+                    return Err(tonic::Status::internal(status.to_string()));
+                }
+                client.unwrap().change_config(request).await
+            })
+            .await;
 
-        let result = client.unwrap().change_config(request).await;
         match result {
-            Err(status) => return Failure(tonic::Status::internal(status.to_string())),
+            Err(crate::context::Error::ContextDone) => {
+                Failure(tonic::Status::cancelled("context cancelled"))
+            }
+            Err(crate::context::Error::Inner(status)) => {
+                Failure(tonic::Status::internal(status.to_string()))
+            }
             Ok(response) => {
                 let proto: ChangeConfigResponse = response.into_inner();
                 match Status::try_from(proto.status) {
@@ -209,20 +245,33 @@ impl ClientImpl {
 
 #[async_trait]
 impl Client for ClientImpl {
-    async fn commit(&self, payload: &[u8]) -> Result<EntryId, tonic::Status> {
-        let op = move |leader| async move { ClientImpl::commit_impl(leader, payload).await };
-        self.retry_helper(op).await
+    async fn commit(&self, ctx: Context, payload: &[u8]) -> Result<EntryId, tonic::Status> {
+        let op_ctx = ctx.clone();
+        let op = move |leader| {
+            let ctx = op_ctx.clone();
+            async move { ClientImpl::commit_impl(ctx, leader, payload).await }
+        };
+        self.retry_helper(ctx, op).await
     }
 
-    async fn preempt_leader(&self) -> Result<Server, tonic::Status> {
-        let op = async move |leader| ClientImpl::preempt_leader_impl(leader).await;
-        self.retry_helper(op).await
+    async fn preempt_leader(&self, ctx: Context) -> Result<Server, tonic::Status> {
+        let op_ctx = ctx.clone();
+        let op = move |leader| {
+            let ctx = op_ctx.clone();
+            async move { ClientImpl::preempt_leader_impl(ctx, leader).await }
+        };
+        self.retry_helper(ctx, op).await
     }
 
-    async fn change_config(&self, members: Vec<Server>) -> Result<(), tonic::Status> {
-        let members = &members;
-        let op = move |leader| async move { ClientImpl::change_config_impl(leader, members).await };
-        self.retry_helper(op).await
+    async fn change_config(&self, ctx: Context, members: Vec<Server>) -> Result<(), tonic::Status> {
+        let members_vec = members.to_vec();
+        let op_ctx = ctx.clone();
+        let op = move |leader| {
+            let members_vec = members_vec.clone();
+            let ctx = op_ctx.clone();
+            async move { ClientImpl::change_config_impl(ctx, leader, &members_vec).await }
+        };
+        self.retry_helper(ctx, op).await
     }
 }
 

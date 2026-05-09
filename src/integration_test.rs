@@ -1,3 +1,4 @@
+use crate::context::Context;
 use crate::harness::Harness;
 use crate::keyvalue::keyvalue_proto::PutRequest;
 use crate::raft::Options;
@@ -9,30 +10,33 @@ const NAMES: [&str; 3] = ["A", "B", "C"];
 
 #[tokio::test]
 async fn test_start_and_elect_leader() {
-    let harness = make_harness(&NAMES).await;
+    let ctx = Context::new();
+    let harness = make_harness(ctx.clone(), &NAMES).await;
 
     harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
 
     harness.validate().await;
-    harness.stop().await;
+    ctx.cancel();
 }
 
 #[tokio::test]
 async fn test_start_and_elect_leader_many_nodes() {
+    let ctx = Context::new();
     let n = 17;
     let owned: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
     let names: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
-    let harness = make_harness(&names).await;
+    let harness = make_harness(ctx.clone(), &names).await;
 
     harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
 
     harness.validate().await;
-    harness.stop().await;
+    ctx.cancel();
 }
 
 #[tokio::test]
 async fn test_disconnect_leader() {
-    let harness = make_harness(&NAMES).await;
+    let ctx = Context::new();
+    let harness = make_harness(ctx.clone(), &NAMES).await;
 
     // Wait for the initial leader and capture its term and server.
     let (term1, leader1) = harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
@@ -57,27 +61,29 @@ async fn test_disconnect_leader() {
     assert_ne!(leader3.name, leader2.name);
 
     harness.validate().await;
-    harness.stop().await;
+    ctx.cancel();
 }
 
 #[tokio::test]
 async fn test_commit() {
-    let harness = make_harness(&NAMES).await;
+    let ctx = Context::new();
+    let harness = make_harness(ctx.clone(), &NAMES).await;
     harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
     let client = harness.make_raft_client();
 
     let payload: &[u8] = "some-payload".as_bytes();
-    let result = client.commit(payload).await;
+    let result = client.commit(Context::new(), payload).await;
     assert!(result.is_ok());
 
     harness.validate().await;
-    harness.stop().await;
+    ctx.cancel();
 }
 
 #[tokio::test]
 async fn test_reconfigure_cluster() {
+    let ctx = Context::new();
     let names = vec!["A", "B", "C", "D", "E"];
-    let harness = make_harness(&names).await;
+    let harness = make_harness(ctx.clone(), &names).await;
 
     let (t1, leader1) = harness.wait_for_leader(TIMEOUT, term_greater(0)).await;
     let without_leader: Vec<&str> = names
@@ -98,12 +104,13 @@ async fn test_reconfigure_cluster() {
     assert!(new_members.contains(&leader2.name.as_str()));
 
     harness.validate().await;
-    harness.stop().await;
+    ctx.cancel();
 }
 
 #[tokio::test]
 async fn test_keyvalue() {
-    let harness = make_harness(&NAMES).await;
+    let ctx = Context::new();
+    let harness = make_harness(ctx.clone(), &NAMES).await;
     let mut kv = harness.make_kv_client().await;
 
     let k1 = "k1".as_bytes().to_vec();
@@ -120,12 +127,14 @@ async fn test_keyvalue() {
 
     assert_eq!(&entry.key, &k1);
     assert_eq!(&entry.value, &v1);
+    ctx.cancel();
 }
 
 #[tokio::test]
 async fn test_snapshotting() {
+    let ctx = Context::new();
     let raft_options = Options::default().with_compaction(5 * 1024 * 1024, 1000);
-    let harness = make_harness_with_options(&NAMES, Some(raft_options)).await;
+    let harness = make_harness_with_options(ctx.clone(), &NAMES, Some(raft_options)).await;
 
     // Disconnect a node that will later have to catch up.
     harness.failures().lock().await.disconnect("B");
@@ -155,7 +164,7 @@ async fn test_snapshotting() {
     assert!(snapshot_info.size_bytes < 10 * 1024 * 1024);
 
     harness.validate().await;
-    harness.stop().await;
+    ctx.cancel();
 }
 
 // Convenience method that returns a matcher for terms greater than a value.
@@ -163,11 +172,15 @@ fn term_greater(n: i64) -> Box<dyn Fn(&(i64, Server)) -> bool> {
     Box::new(move |(term, _)| *term > n)
 }
 
-async fn make_harness(nodes: &[&str]) -> Harness {
-    make_harness_with_options(nodes, None).await
+async fn make_harness(ctx: Context, nodes: &[&str]) -> Harness {
+    make_harness_with_options(ctx, nodes, None).await
 }
 
-async fn make_harness_with_options(nodes: &[&str], options: Option<Options>) -> Harness {
+async fn make_harness_with_options(
+    ctx: Context,
+    nodes: &[&str],
+    options: Option<Options>,
+) -> Harness {
     let mut builder = Harness::builder("test-cluster", nodes)
         .await
         .expect("builder");
@@ -176,8 +189,8 @@ async fn make_harness_with_options(nodes: &[&str], options: Option<Options>) -> 
         builder = builder.with_options(opts)
     }
 
-    let (harness, serving) = builder.build().await.expect("harness");
-    harness.start().await;
+    let (harness, serving) = builder.build(ctx.clone()).await.expect("harness");
+    harness.start(ctx.clone()).await;
     tokio::spawn(async { serving.await });
     harness
 }
