@@ -221,6 +221,7 @@ fn style() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::Context;
     use crate::keyvalue::MapStore;
     use crate::raft::raft_common_proto::Server;
     use crate::testing::TestHttpServer;
@@ -248,7 +249,7 @@ mod tests {
             .nest("/keyvalue", http.routes())
             .into_make_service();
 
-        TestHttpServer::run(web_service).await
+        TestHttpServer::run(Context::new(), web_service).await
     }
 
     async fn send_request(server: &TestHttpServer, path: &str) -> reqwest::Response {

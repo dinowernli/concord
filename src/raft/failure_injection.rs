@@ -264,7 +264,9 @@ mod tests {
     impl Fixture {
         async fn new() -> Self {
             let service = FakeKeyValue {};
-            let server = TestRpcServer::run(KeyValueServer::new(service)).await;
+            let server =
+                TestRpcServer::run(crate::context::Context::new(), KeyValueServer::new(service))
+                    .await;
             Self {
                 failure_options: Arc::new(Mutex::new(FailureOptions::no_failures())),
                 server,

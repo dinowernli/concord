@@ -1,4 +1,3 @@
-use async_std::channel;
 use async_std::sync::Mutex;
 use axum::Router;
 use axum_tonic::NestTonic;
@@ -10,12 +9,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::time::sleep;
 use tonic::Status;
 use tonic::transport::Channel;
 use tracing::{Instrument, error, info, info_span};
 
-use crate::keyvalue;
+use crate::context::Context;
 use crate::keyvalue::grpc::{KeyValueClient, KeyValueServer};
 use crate::keyvalue::keyvalue_proto::{GetRequest, GetResponse};
 use crate::keyvalue::{KeyValueService, MapStore};
@@ -24,6 +22,7 @@ use crate::raft::raft_service_proto::raft_server::RaftServer;
 use crate::raft::{
     Client, Diagnostics, FailureOptions, Options, RaftImpl, SnapshotInfo, new_client,
 };
+use crate::{context, keyvalue};
 
 // Represents a collection of participants that interact with each other. In a real
 // production deployment, these participants might be on different actual machines,
@@ -51,6 +50,7 @@ impl HarnessBuilder {
     // of the serving process for all instances managed by the harness.
     pub async fn build(
         self,
+        ctx: Context,
     ) -> Result<(Harness, Pin<Box<dyn Future<Output = ()> + Send>>), Box<dyn Error>> {
         let diag = Arc::new(Mutex::new(Diagnostics::new()));
         let failures = Arc::new(Mutex::new(self.failure.clone()));
@@ -63,6 +63,7 @@ impl HarnessBuilder {
         for bound in self.bound {
             let (address, listener) = (bound.server, bound.listener);
             let (instance, future) = Instance::new(
+                ctx.create_child(),
                 &address,
                 listener,
                 &all,
@@ -185,7 +186,7 @@ impl Harness {
             }
         }
 
-        client.change_config(new_members).await
+        client.change_config(Context::new(), new_members).await
     }
 
     // Validates all available diagnostics and panics on failure.
@@ -198,17 +199,12 @@ impl Harness {
             .expect("validate");
     }
 
-    // Starts the logic for this harness.
-    pub async fn start(&self) {
+    // Starts the logic for this harness. We give each instance its own child context
+    // so that they can be cancelled independently and to ensure that a local
+    // cancellation doesn't propagate "sideways" to other instances.
+    pub async fn start(&self, ctx: Context) {
         for instance in &self.instances {
-            instance.start().await;
-        }
-    }
-
-    // Stops all the instances of this harness.
-    pub async fn stop(&self) {
-        for instance in &self.instances {
-            instance.stop().await;
+            instance.start(ctx.create_child()).await;
         }
     }
 
@@ -305,7 +301,6 @@ impl Harness {
 struct Instance {
     address: Server,
     raft: Arc<RaftImpl>,
-    shutdown: channel::Sender<()>,
 }
 
 impl Instance {
@@ -313,6 +308,7 @@ impl Instance {
     // required objects. Callers still need to call start() on this instance once done.
     // The returned future completes once the server finishes serving.
     async fn new(
+        ctx: Context,
         address: &Server,
         listener: TcpListener,
         all: &Vec<Server>,
@@ -333,12 +329,12 @@ impl Instance {
 
         // Set up the keyvalue store, along with the web and grpc serving objects
         let kv_store = Arc::new(Mutex::new(MapStore::new()));
-        let kv_service = Arc::new(KeyValueService::new(
-            name.as_str(),
-            &address,
-            kv_store.clone(),
-        ));
-        let kv_grpc = KeyValueServer::from_arc(kv_service.clone());
+        let kv_service_impl = KeyValueService::new(name.as_str(), &address, kv_store.clone());
+        let kv_ctx = ctx.clone();
+        let kv_service = Arc::new(kv_service_impl);
+        let kv_grpc =
+            KeyValueServer::with_interceptor(kv_service.clone(), context::interceptor(kv_ctx));
+
         let kv_http = Arc::new(keyvalue::HttpHandler::new(
             path.to_string(),
             kv_service.clone(),
@@ -347,27 +343,28 @@ impl Instance {
 
         // Set up the grpc service for the raft participant. The first 3 server entries are active initially.
         let server_diagnostics = diagnostics.lock().await.get_server(&address);
-        let raft = Arc::new(
-            RaftImpl::new(
-                address,
-                &cluster,
-                kv_store.clone(), // The raft cluster participant is the one applying the KV writes.
-                Some(server_diagnostics),
-                raft_options,
-                failure_options,
-            )
-            .await
-            .map_err(|e| format!("Failed to create raft impl for '{}': {}", address.name, e))?,
-        );
-        let raft_grpc = RaftServer::from_arc(raft.clone());
+        let raft_impl = RaftImpl::new(
+            address,
+            &cluster,
+            kv_store.clone(), // The raft cluster participant is the one applying the KV writes.
+            Some(server_diagnostics),
+            raft_options,
+            failure_options,
+        )
+        .await
+        .map_err(|e| format!("Failed to create raft impl for '{}': {}", address.name, e))?;
+
+        let raft_ctx = ctx.clone();
+        let raft_grpc =
+            RaftServer::with_interceptor(raft_impl.clone(), context::interceptor(raft_ctx));
+        let raft = Arc::new(raft_impl);
 
         // Set up the top-level server
         let grpc = Router::new().nest_tonic(raft_grpc).nest_tonic(kv_grpc);
         let rest_grpc = RestGrpcService::new(web, grpc).into_make_service();
 
         // Wire up the shutdown
-        let (sender, receiver) = channel::unbounded::<()>();
-        let signal = async move { receiver.recv().await.unwrap_or(()) };
+        let signal = async move { ctx.done().await };
 
         // Start serving
         let serving_future = Box::pin(async {
@@ -384,7 +381,6 @@ impl Instance {
         let result = Instance {
             address: address.clone(),
             raft,
-            shutdown: sender,
         };
 
         info!(
@@ -395,13 +391,8 @@ impl Instance {
     }
 
     // Starts the background logic in service implementations (e.g., raft election loop).
-    async fn start(&self) {
-        self.raft.start().await;
-    }
-
-    // Sends the signal to shut down the server. Must only be called once.
-    async fn stop(&self) {
-        self.shutdown.send(()).await.expect("shutdown")
+    async fn start(&self, ctx: Context) {
+        self.raft.start(ctx).await;
     }
 }
 
@@ -420,6 +411,7 @@ fn server(host: &str, port: i32, name: &str) -> Server {
 
 /// Waits for a condition to become true, up to the given `timeout_duration`.
 /// Returns `Ok(T)` if the condition is met in time, or `Err(())` on timeout.
+#[cfg(test)]
 async fn wait_for<F, Fut, T>(timeout_duration: Duration, mut condition: F) -> Result<T, ()>
 where
     F: FnMut() -> Fut,
@@ -430,7 +422,7 @@ where
         if let Some(result) = condition().await {
             return Ok(result);
         }
-        sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
     Err(())
 }

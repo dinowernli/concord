@@ -1,14 +1,14 @@
 extern crate tokio_stream;
 
+use crate::context;
+use crate::context::Context;
 use crate::raft::raft_common_proto::Server;
 use std::convert::Infallible;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
-use tokio::sync::oneshot::Sender;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::body::BoxBody;
-use tonic::codegen::Service;
 use tonic::codegen::http::{Request, Response};
+use tonic::codegen::{InterceptedService, Service};
 use tonic::server::NamedService;
 
 // A helper struct which can be used to test grpc services. Runs a real server
@@ -17,14 +17,13 @@ use tonic::server::NamedService;
 // scope.
 pub struct TestRpcServer {
     port: Option<u16>,
-    shutdown: Option<Sender<()>>,
 }
 
 impl TestRpcServer {
     // One-stop-shop for running a single service on an arbitrary port. Returns
     // the instance of TestRpcServer which provides access to the port. Panics if
     // anything goes wrong during setup.
-    pub async fn run<S>(service: S) -> Self
+    pub async fn run<S>(ctx: Context, service: S) -> Self
     where
         S: Service<Request<BoxBody>, Response = Response<BoxBody>, Error = Infallible>
             + NamedService
@@ -34,15 +33,13 @@ impl TestRpcServer {
         S::Future: Send + 'static,
         S::Error: std::error::Error + Send + Sync,
     {
-        let mut server = TestRpcServer {
-            port: None,
-            shutdown: None,
-        };
-        server.start(service).await;
+        let mut server = TestRpcServer { port: None };
+
+        server.start(ctx, service).await;
         server
     }
 
-    async fn start<S>(&mut self, service: S)
+    async fn start<S>(&mut self, ctx: Context, service: S)
     where
         S: Service<Request<BoxBody>, Response = Response<BoxBody>, Error = Infallible>
             + NamedService
@@ -56,18 +53,18 @@ impl TestRpcServer {
         let listener = TcpListener::bind("[::1]:0").await.expect("bind");
         self.port = Some(listener.local_addr().expect("address").port());
 
-        // Create the shutdown channel for the server.
-        let (tx, rx) = oneshot::channel();
-        self.shutdown = Some(tx);
-
         // Run the server in the background.
-        tokio::spawn(async {
+        tokio::spawn(async move {
             let incoming = TcpListenerStream::new(listener);
             let shutdown = async {
-                rx.await.ok();
+                ctx.done().await;
             };
+
+            let intercepted_service =
+                InterceptedService::new(service, context::interceptor(ctx.clone()));
+
             tonic::transport::Server::builder()
-                .add_service(service)
+                .add_service(intercepted_service)
                 .serve_with_incoming_shutdown(incoming, shutdown)
                 .await
                 .expect("serve");
@@ -89,17 +86,5 @@ impl TestRpcServer {
                 name: "fake-rpc-server".to_string(),
             }),
         }
-    }
-
-    fn stop(&mut self) {
-        if self.shutdown.is_some() {
-            self.shutdown.take().unwrap().send(()).expect("shutdown");
-        }
-    }
-}
-
-impl Drop for TestRpcServer {
-    fn drop(&mut self) {
-        self.stop();
     }
 }
